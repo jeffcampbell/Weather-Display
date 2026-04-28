@@ -17,7 +17,9 @@ import base64
 from pathlib import Path
 
 PORT = 8000
-ENV_FILE = Path(__file__).parent / ".env"
+BASE_DIR = Path(__file__).parent
+DEVICE_DIR = BASE_DIR.parent / "device"
+ENV_FILE = BASE_DIR / ".env"
 
 
 def load_env():
@@ -180,7 +182,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             icao = qs.get("icao", [""])[0].strip().upper()
             result = {"icao": icao, "iata": icao[:2], "name": icao, "color": "0x00AA44"}
-            csv_path = Path(__file__).parent / "airlines.csv"
+            csv_path = DEVICE_DIR / "airlines.csv"
             if csv_path.exists():
                 for line in csv_path.read_text().splitlines()[1:]:
                     parts = line.strip().split(",")

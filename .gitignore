@@ -1,8 +1,15 @@
+# Secrets (both directories)
 .env
+device/secrets.py
+device/credentials.json
+
+# Python
 .venv/
 __pycache__/
+
+# System
 .DS_Store
 .claude/
+
+# Test output
 bugs/
-credentials.json
-secrets.py
