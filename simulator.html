@@ -310,10 +310,64 @@ const PLANE_ICON = [
   [_, _, _,PL, _, _, _, _],
 ];
 
+// Aircraft type mini-icons (shown next to type code)
+const TI = [100, 180, 220]; // type icon color (light steel blue)
+const TB = [140, 210, 255]; // brighter accent
+
+// Top-down jet (7x7) — classic planform view
+const ICON_JET = [
+  [_, _, _,TI, _, _, _],
+  [_, _, _,TI, _, _, _],
+  [_,TI,TI,TI,TI,TI, _],
+  [TI,TI,TI,TB,TI,TI,TI],
+  [_, _, _,TI, _, _, _],
+  [_, _,TI,TI,TI, _, _],
+  [_, _, _,TI, _, _, _],
+];
+
+const ICON_PROP = [
+  [_, _, _,TB, _, _, _],
+  [TI, _,TI,TI,TI, _,TI],
+  [TI,TI,TI,TI,TI,TI,TI],
+  [_, _, _,TI, _, _, _],
+  [_, _,TI,TI,TI, _, _],
+  [_, _, _,TI, _, _, _],
+];
+const ICON_HELI = [
+  [TI,TI,TI,TB,TI,TI,TI],
+  [_, _, _,TI, _, _, _],
+  [_, _,TI,TI,TI, _, _],
+  [_,TI,TI,TI,TI,TI, _],
+  [_, _, _,TI, _, _, _],
+  [_, _,TI, _,TI, _, _],
+];
+const ICON_SMALL = [
+  [_, _, _,TB, _, _, _],
+  [_, _,TI,TI,TI, _, _],
+  [TI,TI,TI,TI,TI,TI,TI],
+  [_, _, _,TI, _, _, _],
+  [_, _, _,TI, _, _, _],
+];
+
+// Map aircraft type code → icon
+function getAircraftIcon(typeCode, category) {
+  if (category === 8) return ICON_HELI;
+  if (!typeCode) return ICON_JET;
+  const t = typeCode.toUpperCase();
+  if (/^(R22|R44|R66|EC|BK|B06|B4[0-9]|H[0-9]|S[0-9][0-9]|A[SW]|MD[0-9]|EN[0-9])/.test(t)) return ICON_HELI;
+  if (/^(ATR|DH[0-9C]|SF3|B19|JS[0-9]|L41|PC[0-9]|E12|AN[0-9])/.test(t)) return ICON_PROP;
+  if (/^(C[0-9]{2,3}|PA[0-9]|SR[0-9]|DA[0-9]|BE[0-9]|M[0-9]{2}|TBM|P18)/.test(t)) return ICON_SMALL;
+  return ICON_JET;
+}
+
 // =========================================================================
 // Airline info (ICAO 3-letter prefix → name + color)
 // =========================================================================
-const AIRLINE_INFO = {
+// Airline lookup — fetched from airlines.csv via server, cached with limit
+// Mirrors the device's file-based lookup with same cache constraints
+const _airlineCache = {};   // ICAO -> {name, iata, color}
+const _AIRLINE_CACHE_MAX = 5; // match device limit
+const _AIRLINE_PREFETCH = {
   'UAL':{name:'United',       iata:'UA', color:0x0055A4},
   'DAL':{name:'Delta',        iata:'DL', color:0xCC2222},
   'SWA':{name:'SouthWst',     iata:'WN', color:0xF9A01B},
@@ -360,7 +414,30 @@ const AIRLINE_INFO = {
 
 function getAirlineInfo(callsign) {
   const prefix = callsign.substring(0, 3).toUpperCase();
-  return AIRLINE_INFO[prefix] || { name: prefix, iata: prefix.substring(0,2), color: 0x00AA44 };
+  if (_airlineCache[prefix]) return _airlineCache[prefix];
+  // Check prefetch for test data
+  if (_AIRLINE_PREFETCH[prefix]) return _AIRLINE_PREFETCH[prefix];
+  // Return fallback; async fetch updates cache for next render
+  fetchAirlineInfo(prefix);
+  return { name: prefix, iata: prefix.substring(0,2), color: 0x00AA44 };
+}
+
+async function fetchAirlineInfo(icao) {
+  if (_airlineCache[icao]) return;
+  try {
+    const resp = await fetch(`/api/airline?icao=${icao}`);
+    const data = await resp.json();
+    const info = {
+      name: (data.name || icao).substring(0, 8),
+      iata: data.iata || icao.substring(0, 2),
+      color: parseInt(data.color) || 0x00AA44,
+    };
+    // Evict oldest if cache full (mirrors device constraint)
+    const keys = Object.keys(_airlineCache);
+    if (keys.length >= _AIRLINE_CACHE_MAX) delete _airlineCache[keys[0]];
+    _airlineCache[icao] = info;
+    log(`Airline ${icao}: ${info.name} (${info.iata})`);
+  } catch (e) { /* silent — fallback used */ }
 }
 
 // =========================================================================
@@ -404,6 +481,7 @@ const MINI_PLANE = [
 // Route + aircraft type cache and fetching
 // =========================================================================
 const flightCache = {}; // callsign → { origin, dest, type }
+const _FLIGHT_CACHE_MAX = 10; // match device limit
 
 async function fetchFlightInfo(callsign, icao24) {
   if (flightCache[callsign]) return flightCache[callsign];
@@ -438,6 +516,9 @@ async function fetchFlightInfo(callsign, icao24) {
     }
   }
 
+  // Evict oldest if cache full (mirrors device constraint)
+  const keys = Object.keys(flightCache);
+  if (keys.length >= _FLIGHT_CACHE_MAX) delete flightCache[keys[0]];
   flightCache[callsign] = info;
   return info;
 }
@@ -849,6 +930,7 @@ async function fetchPlanes() {
         alt: Math.round(altM * 3.281),
         spd: Math.round((s[9] || 0) * 1.944),
         hdg: Math.round(s[10] || 0),
+        category: s[17] || 0,
       });
     }
     log(`Planes overhead: ${planes.length}`);
@@ -975,23 +1057,17 @@ function composePlaneScreen(plane, dt, timestamp) {
 
   drawHLine(16, x0, 63, accentDim);
 
-  // Row 3 (y=20): Aircraft type (light blue) or altitude
+  // Row 3 (y=20): Aircraft type with category icon
+  const typeIcon = getAircraftIcon(acType, plane.category);
+  drawIcon(typeIcon, x0, 18);
   if (acType) {
-    drawText(acType, x0, 20, 0x55AADD);
-  } else {
-    drawText(`${altK}Kft`, x0, 20, 0x44AA44);
+    drawText(acType, x0 + 9, 20, 0x55AADD);
   }
 
   drawHLine(24, x0, 63, accentDim);
 
-  // Row 4 (y=28): Altitude + callsign (or just callsign if alt already shown)
-  if (acType) {
-    drawText(`${altK}Kft`, x0, 28, 0x44AA44);
-    const callX = Math.max(x0 + (`${altK}Kft`).length * CHAR_W + CHAR_W, 64 - plane.call.length * CHAR_W);
-    drawTextClipped(plane.call, callX, 28, 0x555566, x0, 63);
-  } else {
-    drawText(plane.call, x0, 28, 0x555566);
-  }
+  // Row 4 (y=28): Altitude
+  drawText(`${altK}Kft`, x0, 28, 0x44AA44);
 
   setStatus(`${origin} \u2192 ${dest} | ${info.name} | ${acType || '?'} | ${altK}Kft | ${plane.call}`);
 }
@@ -1130,22 +1206,23 @@ function renderLoop(timestamp) {
 
 function injectTestPlane() {
   const testFlights = [
-    { call:'UAL1234', origin:'BOS', dest:'SFO', type:'B739', name:'United' },
-    { call:'DAL567',  origin:'BOS', dest:'ATL', type:'A321', name:'Delta' },
-    { call:'SWA890',  origin:'BOS', dest:'BWI', type:'B738', name:'Southwest' },
-    { call:'JBU42',   origin:'BOS', dest:'FLL', type:'A320', name:'JetBlue' },
-    { call:'AAL100',  origin:'BOS', dest:'DFW', type:'B738', name:'American' },
-    { call:'NKS77',   origin:'BOS', dest:'MCO', type:'A20N', name:'Spirit' },
-    { call:'FFT321',  origin:'BOS', dest:'DEN', type:'A21N', name:'Frontier' },
-    { call:'ASA55',   origin:'BOS', dest:'SEA', type:'B739', name:'Alaska' },
-    { call:'BAW213',  origin:'BOS', dest:'LHR', type:'B789', name:'British Air' },
-    { call:'RPA5162', origin:'BOS', dest:'ORD', type:'E75L', name:'Republic' },
+    { call:'UAL1234', origin:'BOS', dest:'SFO', type:'B739', cat:0 },
+    { call:'DAL567',  origin:'BOS', dest:'ATL', type:'A321', cat:0 },
+    { call:'SWA890',  origin:'BOS', dest:'BWI', type:'B738', cat:0 },
+    { call:'JBU42',   origin:'BOS', dest:'FLL', type:'A320', cat:0 },
+    { call:'AAL100',  origin:'BOS', dest:'DFW', type:'B738', cat:0 },
+    { call:'NKS77',   origin:'BOS', dest:'MCO', type:'A20N', cat:0 },
+    { call:'ASA55',   origin:'BOS', dest:'SEA', type:'B739', cat:0 },
+    { call:'BAW213',  origin:'BOS', dest:'LHR', type:'B789', cat:0 },
+    { call:'RPA5162', origin:'BOS', dest:'ORD', type:'E75L', cat:0 },
+    { call:'CAL101',  origin:'BOS', dest:'ACK', type:'ATR72',cat:0 },  // turboprop
+    { call:'LIF901',  origin:'BOS', dest:'MVY', type:'EC35', cat:8 },  // helicopter
   ];
   const t = testFlights[Math.floor(Math.random() * testFlights.length)];
   const alt = 5000 + Math.floor(Math.random() * 35000);
   const hdg = Math.floor(Math.random() * 360);
   const spd = 150 + Math.floor(Math.random() * 300);
-  planes.push({ call: t.call, icao24: '', alt, spd, hdg });
+  planes.push({ call: t.call, icao24: '', alt, spd, hdg, category: t.cat });
   // Pre-populate cache with test data
   flightCache[t.call] = { origin: t.origin, dest: t.dest, type: t.type };
   log(`Injected: ${t.call} (${t.name}) ${t.origin}→${t.dest} ${t.type} at ${alt}ft`);

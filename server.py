@@ -174,6 +174,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        # --- /api/airline?icao=XXX → lookup from airlines.csv ---
+        if self.path.startswith("/api/airline?"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            icao = qs.get("icao", [""])[0].strip().upper()
+            result = {"icao": icao, "iata": icao[:2], "name": icao, "color": "0x00AA44"}
+            csv_path = Path(__file__).parent / "airlines.csv"
+            if csv_path.exists():
+                for line in csv_path.read_text().splitlines()[1:]:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 4 and parts[0] == icao:
+                        result = {"icao": parts[0], "iata": parts[1],
+                                  "name": parts[2], "color": parts[3]}
+                        break
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # --- / → serve simulator.html ---
         if self.path == "/":
             self.path = "/simulator.html"

@@ -167,40 +167,38 @@ WEATHER_ICONS = {
     "Tornado": ICON_FOG,
 }
 
-# Airline ICAO prefix -> (name, IATA code, color)
-AIRLINE_INFO = {
-    "UAL": ("United",     "UA", 0x0055A4),
-    "DAL": ("Delta",      "DL", 0xCC2222),
-    "SWA": ("SouthWst",   "WN", 0xF9A01B),
-    "AAL": ("American",   "AA", 0xCC2222),
-    "JBU": ("JetBlue",    "B6", 0x0033CC),
-    "FFT": ("Frontier",   "F9", 0x008040),
-    "NKS": ("Spirit",     "NK", 0xF0CB00),
-    "SKW": ("SkyWest",    "OO", 0x6666AA),
-    "ASA": ("Alaska",     "AS", 0x01426A),
-    "RPA": ("Republic",   "YX", 0x3366BB),
-    "ENY": ("Envoy",      "MQ", 0xCC3333),
-    "EJA": ("NetJets",    "EJ", 0x999999),
-    "FDX": ("FedEx",      "FX", 0xFF6600),
-    "UPS": ("UPS",        "5X", 0x6B3600),
-    "BAW": ("British",    "BA", 0x1B3D6D),
-    "AFR": ("AirFrnce",   "AF", 0x002157),
-    "DLH": ("Lufthnsa",   "LH", 0x00337F),
-    "ACA": ("AirCanda",   "AC", 0xDD1122),
-    "UAE": ("Emirates",   "EK", 0xCC0000),
-    "EDV": ("Endeavor",   "9E", 0xCC3333),
-    "GJS": ("GoJet",      "G7", 0x4477AA),
-    "JIA": ("PSA",        "OH", 0x3366BB),
-    "PDT": ("Piedmont",   "PT", 0x3366BB),
-    "AAY": ("Allegiant",  "G4", 0xF68C1E),
-    "MXY": ("Breeze",     "MX", 0x44BBEE),
-    "HAL": ("Hawaiian",   "HA", 0x7722AA),
-    "QXE": ("Horizon",    "QX", 0x009DB0),
-}
+# Airline lookup — reads from airlines.csv on disk, caches only recent entries
+# Saves ~6 KB RAM vs inline dict on SAMD51
+_airline_cache = {}  # max 5 entries
+_AIRLINE_CACHE_MAX = 5
 
 def get_airline_info(callsign):
+    """Look up airline by ICAO prefix. Returns (name, iata, color)."""
     prefix = callsign[:3].upper()
-    return AIRLINE_INFO.get(prefix, (prefix, prefix[:2], 0x00AA44))
+    if prefix in _airline_cache:
+        return _airline_cache[prefix]
+    # Scan CSV file for matching ICAO code
+    try:
+        with open("airlines.csv", "r") as f:
+            f.readline()  # skip header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if parts[0] == prefix:
+                    name = parts[2][:8]
+                    iata = parts[1]
+                    color = int(parts[3], 16)
+                    result = (name, iata, color)
+                    # Evict oldest if cache full
+                    if len(_airline_cache) >= _AIRLINE_CACHE_MAX:
+                        _airline_cache.pop(next(iter(_airline_cache)))
+                    _airline_cache[prefix] = result
+                    return result
+    except Exception as e:
+        print("Airline CSV err:", e)
+    return (prefix, prefix[:2], 0x00AA44)
 
 def icao_to_display(icao):
     """Convert ICAO airport code to 3-letter display code."""
@@ -317,6 +315,7 @@ def update_plane_bg(airline_color):
 
 # Route cache: callsign -> {"origin": "BOS", "dest": "JFK"}
 flight_cache = {}
+_FLIGHT_CACHE_MAX = 10
 
 def fetch_route(callsign):
     """Fetch route info for a callsign from OpenSky. Caches results."""
@@ -346,6 +345,9 @@ def fetch_route(callsign):
         print("Route {}: {} -> {}".format(callsign, info["origin"], info["dest"]))
     except Exception as e:
         print("Route err for {}: {}".format(callsign, e))
+    # Evict oldest if cache full
+    if len(flight_cache) >= _FLIGHT_CACHE_MAX:
+        flight_cache.pop(next(iter(flight_cache)))
     flight_cache[callsign] = info
     gc.collect()
     return info
