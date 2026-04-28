@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.DS_Store
+.claude/
+bugs/
+credentials.json
+secrets.py

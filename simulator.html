@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Matrix Portal Simulator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    color: #888;
+  }
+  #wrapper {
+    position: relative;
+    padding: 18px 22px;
+    background: #111;
+    border-radius: 6px;
+    box-shadow: 0 0 40px rgba(0,0,0,0.8), inset 0 0 2px rgba(255,255,255,0.05);
+    border: 1px solid #222;
+  }
+  canvas { display: block; border-radius: 2px; }
+  #status {
+    margin-top: 16px;
+    font-size: 12px;
+    color: #555;
+    text-align: center;
+    max-width: 800px;
+  }
+  #log {
+    margin-top: 12px;
+    width: 800px;
+    max-height: 180px;
+    overflow-y: auto;
+    background: #0d0d0d;
+    border: 1px solid #222;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 11px;
+    color: #4a4;
+    line-height: 1.5;
+  }
+  #log .err { color: #a44; }
+  #controls {
+    margin-top: 12px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  button {
+    background: #222;
+    color: #888;
+    border: 1px solid #333;
+    padding: 5px 14px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button:hover { background: #2a2a2a; color: #aaa; }
+  h2 {
+    color: #444;
+    font-size: 13px;
+    font-weight: normal;
+    margin-bottom: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+
+<h2>Matrix Portal Simulator &mdash; 64&times;32 RGB LED</h2>
+<div id="wrapper">
+  <canvas id="matrix"></canvas>
+</div>
+<div id="status">Initializing...</div>
+<div id="controls">
+  <button onclick="injectTestPlane()">Inject Test Plane</button>
+  <button onclick="clearPlanes()">Clear Planes</button>
+  <button onclick="forceRefresh()">Force Refresh</button>
+</div>
+<div id="log"></div>
+
+<script src="config.js"></script>
+<script>
+// =========================================================================
+// Matrix Portal Simulator — enhanced display with icons, scrolling, colors
+// =========================================================================
+
+const WIDTH = 64, HEIGHT = 32;
+const BBOX = 0.1;
+const WEATHER_INTERVAL = 600;
+const OPENSKY_INTERVAL = 60;
+const PLANE_CYCLE_SECS = 5;
+
+const SCALE = 12;
+const LED_RADIUS = 3.2;
+const GLOW_BLUR = 6;
+const CANVAS_W = WIDTH * SCALE;
+const CANVAS_H = HEIGHT * SCALE;
+
+const LAT = CONFIG.latitude;
+const LON = CONFIG.longitude;
+const NOAA_STATION = CONFIG.noaa_station;
+
+const canvas = document.getElementById('matrix');
+canvas.width = CANVAS_W;
+canvas.height = CANVAS_H;
+const ctx = canvas.getContext('2d');
+
+// --- Framebuffer ---
+const fb = [];
+for (let y = 0; y < HEIGHT; y++) {
+  fb[y] = [];
+  for (let x = 0; x < WIDTH; x++) fb[y][x] = [0, 0, 0];
+}
+
+// =========================================================================
+// 5x7 Bitmap Font (Adafruit GFX / glcdfont compatible)
+// Each char = 5 columns, each column = 7 bits (bit 0 = top row)
+// =========================================================================
+const FONT_DATA = {
+  32:[0x00,0x00,0x00,0x00,0x00],33:[0x00,0x00,0x5F,0x00,0x00],
+  34:[0x00,0x07,0x00,0x07,0x00],35:[0x14,0x7F,0x14,0x7F,0x14],
+  36:[0x24,0x2A,0x7F,0x2A,0x12],37:[0x23,0x13,0x08,0x64,0x62],
+  38:[0x36,0x49,0x55,0x22,0x50],39:[0x00,0x05,0x03,0x00,0x00],
+  40:[0x00,0x1C,0x22,0x41,0x00],41:[0x00,0x41,0x22,0x1C,0x00],
+  42:[0x14,0x08,0x3E,0x08,0x14],43:[0x08,0x08,0x3E,0x08,0x08],
+  44:[0x00,0x50,0x30,0x00,0x00],45:[0x08,0x08,0x08,0x08,0x08],
+  46:[0x00,0x60,0x60,0x00,0x00],47:[0x20,0x10,0x08,0x04,0x02],
+  48:[0x3E,0x51,0x49,0x45,0x3E],49:[0x00,0x42,0x7F,0x40,0x00],
+  50:[0x42,0x61,0x51,0x49,0x46],51:[0x21,0x41,0x45,0x4B,0x31],
+  52:[0x18,0x14,0x12,0x7F,0x10],53:[0x27,0x45,0x45,0x45,0x39],
+  54:[0x3C,0x4A,0x49,0x49,0x30],55:[0x01,0x71,0x09,0x05,0x03],
+  56:[0x36,0x49,0x49,0x49,0x36],57:[0x06,0x49,0x49,0x29,0x1E],
+  58:[0x00,0x36,0x36,0x00,0x00],59:[0x00,0x56,0x36,0x00,0x00],
+  60:[0x08,0x14,0x22,0x41,0x00],61:[0x14,0x14,0x14,0x14,0x14],
+  62:[0x00,0x41,0x22,0x14,0x08],63:[0x02,0x01,0x51,0x09,0x06],
+  64:[0x32,0x49,0x79,0x41,0x3E],
+  65:[0x7E,0x11,0x11,0x11,0x7E],66:[0x7F,0x49,0x49,0x49,0x36],
+  67:[0x3E,0x41,0x41,0x41,0x22],68:[0x7F,0x41,0x41,0x22,0x1C],
+  69:[0x7F,0x49,0x49,0x49,0x41],70:[0x7F,0x09,0x09,0x09,0x01],
+  71:[0x3E,0x41,0x49,0x49,0x7A],72:[0x7F,0x08,0x08,0x08,0x7F],
+  73:[0x00,0x41,0x7F,0x41,0x00],74:[0x20,0x40,0x41,0x3F,0x01],
+  75:[0x7F,0x08,0x14,0x22,0x41],76:[0x7F,0x40,0x40,0x40,0x40],
+  77:[0x7F,0x02,0x0C,0x02,0x7F],78:[0x7F,0x04,0x08,0x10,0x7F],
+  79:[0x3E,0x41,0x41,0x41,0x3E],80:[0x7F,0x09,0x09,0x09,0x06],
+  81:[0x3E,0x41,0x51,0x21,0x5E],82:[0x7F,0x09,0x19,0x29,0x46],
+  83:[0x46,0x49,0x49,0x49,0x31],84:[0x01,0x01,0x7F,0x01,0x01],
+  85:[0x3F,0x40,0x40,0x40,0x3F],86:[0x1F,0x20,0x40,0x20,0x1F],
+  87:[0x3F,0x40,0x38,0x40,0x3F],88:[0x63,0x14,0x08,0x14,0x63],
+  89:[0x07,0x08,0x70,0x08,0x07],90:[0x61,0x51,0x49,0x45,0x43],
+  91:[0x00,0x7F,0x41,0x41,0x00],92:[0x02,0x04,0x08,0x10,0x20],
+  93:[0x00,0x41,0x41,0x7F,0x00],94:[0x04,0x02,0x01,0x02,0x04],
+  95:[0x40,0x40,0x40,0x40,0x40],96:[0x00,0x01,0x02,0x04,0x00],
+  97:[0x20,0x54,0x54,0x54,0x78],98:[0x7F,0x48,0x44,0x44,0x38],
+  99:[0x38,0x44,0x44,0x44,0x20],100:[0x38,0x44,0x44,0x48,0x7F],
+  101:[0x38,0x54,0x54,0x54,0x18],102:[0x08,0x7E,0x09,0x01,0x02],
+  103:[0x0C,0x52,0x52,0x52,0x3E],104:[0x7F,0x08,0x04,0x04,0x78],
+  105:[0x00,0x44,0x7D,0x40,0x00],106:[0x20,0x40,0x44,0x3D,0x00],
+  107:[0x7F,0x10,0x28,0x44,0x00],108:[0x00,0x41,0x7F,0x40,0x00],
+  109:[0x7C,0x04,0x18,0x04,0x78],110:[0x7C,0x08,0x04,0x04,0x78],
+  111:[0x38,0x44,0x44,0x44,0x38],112:[0x7C,0x14,0x14,0x14,0x08],
+  113:[0x08,0x14,0x14,0x18,0x7C],114:[0x7C,0x08,0x04,0x04,0x08],
+  115:[0x48,0x54,0x54,0x54,0x20],116:[0x04,0x3F,0x44,0x40,0x20],
+  117:[0x3C,0x40,0x40,0x20,0x7C],118:[0x1C,0x20,0x40,0x20,0x1C],
+  119:[0x3C,0x40,0x30,0x40,0x3C],120:[0x44,0x28,0x10,0x28,0x44],
+  121:[0x0C,0x50,0x50,0x50,0x3C],122:[0x44,0x64,0x54,0x4C,0x44],
+  // degree symbol + middle dot
+  176:[0x06,0x09,0x09,0x06,0x00],
+  183:[0x00,0x00,0x08,0x00,0x00],
+};
+const CHAR_W = 6;
+
+// =========================================================================
+// 8x8 Pixel Art Icons
+// Each icon = 8 rows, each row = array of 8 entries: null (off) or [r,g,b]
+// =========================================================================
+
+const Y = [255, 210, 0];    // yellow (sun)
+const YB = [255, 255, 80];  // bright yellow (sun center)
+const G = [160, 165, 170];  // gray (cloud)
+const GD = [110, 115, 120]; // dark gray (storm cloud)
+const B = [40, 120, 255];   // blue (rain)
+const W = [200, 210, 255];  // white-blue (snow)
+const LT = [255, 255, 50];  // lightning yellow
+const FG = [120, 125, 130]; // fog gray
+const CY = [0, 200, 255];   // cyan (tide)
+const PL = [180, 200, 180]; // plane body
+const _ = null;
+
+const ICONS = {
+  sun: [
+    [_, _, _, Y, _, _, _, _],
+    [Y, _, _, Y, _, _, Y, _],
+    [_, Y, _, _, _, Y, _, _],
+    [_, _,YB,YB,YB, _, _, _],
+    [Y, _,YB,YB,YB, _, Y, _],
+    [_, Y, _, _, _, Y, _, _],
+    [Y, _, _, Y, _, _, Y, _],
+    [_, _, _, Y, _, _, _, _],
+  ],
+  partly_cloudy: [
+    [_, _, _, Y, _, _, _, _],
+    [Y, _, _, Y, _, Y, _, _],
+    [_, _, _, _, _, _, _, _],
+    [_, _,YB,YB,YB, _, _, _],
+    [_, _, G, G, G, _, _, _],
+    [_, G, G, G, G, G, _, _],
+    [G, G, G, G, G, G, G, _],
+    [_, G, G, G, G, G, _, _],
+  ],
+  cloud: [
+    [_, _, _, _, _, _, _, _],
+    [_, _, G, G, _, _, _, _],
+    [_, G, G, G, G, _, _, _],
+    [_, G, G, G, G, G, _, _],
+    [G, G, G, G, G, G, G, _],
+    [G, G, G, G, G, G, G, _],
+    [_, G, G, G, G, G, _, _],
+    [_, _, _, _, _, _, _, _],
+  ],
+  rain: [
+    [_, _, G, G, _, _, _, _],
+    [_, G, G, G, G, _, _, _],
+    [G, G, G, G, G, G, _, _],
+    [G, G, G, G, G, G, G, _],
+    [_, G, G, G, G, G, _, _],
+    [_, B, _, B, _, B, _, _],
+    [B, _, B, _, B, _, _, _],
+    [_, _, _, B, _, _, _, _],
+  ],
+  snow: [
+    [_, _, G, G, _, _, _, _],
+    [_, G, G, G, G, _, _, _],
+    [G, G, G, G, G, G, _, _],
+    [G, G, G, G, G, G, G, _],
+    [_, G, G, G, G, G, _, _],
+    [_, W, _, _, W, _, _, _],
+    [_, _, _, W, _, _, W, _],
+    [_, _, W, _, _, W, _, _],
+  ],
+  storm: [
+    [_, _,GD,GD, _, _, _, _],
+    [_,GD,GD,GD,GD, _, _, _],
+    [GD,GD,GD,GD,GD,GD, _, _],
+    [GD,GD,GD,GD,GD,GD,GD, _],
+    [_, _, _,LT,LT, _, _, _],
+    [_, _,LT,LT, _, _, _, _],
+    [_, _, _,LT, _, _, _, _],
+    [_, _, _, _,LT, _, _, _],
+  ],
+  fog: [
+    [_, _, _, _, _, _, _, _],
+    [G, G, G, G, G, G, G, _],
+    [_, _, _, _, _, _, _, _],
+    [_, G, G, G, G, G, _, _],
+    [_, _, _, _, _, _, _, _],
+    [G, G, G, G, G, G, G, _],
+    [_, _, _, _, _, _, _, _],
+    [_, G, G, G, G, G, _, _],
+  ],
+  wind: [
+    [_, _, _, _, _, _, _, _],
+    [_, _, G, G, G, G, G, _],
+    [_, G, _, _, _, _, _, G],
+    [_, _, _, _, _, _, _, _],
+    [G, G, G, G, G, _, _, _],
+    [_, _, _, _, _, G, _, _],
+    [_, _, G, G, G, G, _, _],
+    [_, _, _, _, _, _, _, _],
+  ],
+};
+
+// Tide direction arrows (5 wide x 7 tall)
+const ARROW_UP = [
+  [_,_,CY,_,_],
+  [_,CY,CY,CY,_],
+  [CY,CY,CY,CY,CY],
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+];
+const ARROW_DOWN = [
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+  [_,_,CY,_,_],
+  [CY,CY,CY,CY,CY],
+  [_,CY,CY,CY,_],
+  [_,_,CY,_,_],
+];
+
+// Plane icon (8x8, top-down view)
+const PLANE_ICON = [
+  [_, _, _,PL, _, _, _, _],
+  [_, _, _,PL, _, _, _, _],
+  [_, _,PL,PL,PL, _, _, _],
+  [_,PL,PL,PL,PL,PL, _, _],
+  [PL,PL,PL,PL,PL,PL,PL, _],
+  [_, _, _,PL, _, _, _, _],
+  [_, _,PL,PL,PL, _, _, _],
+  [_, _, _,PL, _, _, _, _],
+];
+
+// =========================================================================
+// Airline info (ICAO 3-letter prefix → name + color)
+// =========================================================================
+const AIRLINE_INFO = {
+  'UAL':{name:'United',       iata:'UA', color:0x0055A4},
+  'DAL':{name:'Delta',        iata:'DL', color:0xCC2222},
+  'SWA':{name:'SouthWst',     iata:'WN', color:0xF9A01B},
+  'AAL':{name:'American',     iata:'AA', color:0xCC2222},
+  'JBU':{name:'JetBlue',      iata:'B6', color:0x0033CC},
+  'FFT':{name:'Frontier',     iata:'F9', color:0x008040},
+  'NKS':{name:'Spirit',       iata:'NK', color:0xF0CB00},
+  'SKW':{name:'SkyWest',      iata:'OO', color:0x6666AA},
+  'ASA':{name:'Alaska',       iata:'AS', color:0x01426A},
+  'RPA':{name:'Republic',     iata:'YX', color:0x3366BB},
+  'ENY':{name:'Envoy',        iata:'MQ', color:0xCC3333},
+  'EJA':{name:'NetJets',      iata:'EJ', color:0x999999},
+  'FDX':{name:'FedEx',        iata:'FX', color:0xFF6600},
+  'UPS':{name:'UPS',          iata:'5X', color:0x6B3600},
+  'BAW':{name:'British',       iata:'BA', color:0x1B3D6D},
+  'AFR':{name:'AirFrnce',     iata:'AF', color:0x002157},
+  'DLH':{name:'Lufthnsa',     iata:'LH', color:0x00337F},
+  'ACA':{name:'AirCanda',     iata:'AC', color:0xDD1122},
+  'UAE':{name:'Emirates',     iata:'EK', color:0xCC0000},
+  'ETD':{name:'Etihad',       iata:'EY', color:0xAA7722},
+  'THY':{name:'Turkish',      iata:'TK', color:0xCC0000},
+  'QTR':{name:'Qatar',        iata:'QR', color:0x5C0632},
+  'CPA':{name:'Cathay',        iata:'CX', color:0x006564},
+  'ANA':{name:'ANA',          iata:'NH', color:0x00468B},
+  'JAL':{name:'Japan Air',    iata:'JL', color:0xCC0000},
+  'KAL':{name:'Korean',        iata:'KE', color:0x003087},
+  'SIA':{name:'Singpore',     iata:'SQ', color:0x003366},
+  'TAP':{name:'TAP',          iata:'TP', color:0x00883E},
+  'IBE':{name:'Iberia',       iata:'IB', color:0xCC0000},
+  'EZY':{name:'easyJet',      iata:'U2', color:0xFF6600},
+  'RYR':{name:'Ryanair',      iata:'FR', color:0x003580},
+  'WJA':{name:'WestJet',      iata:'WS', color:0x003F72},
+  'VIR':{name:'Virgin Atl',   iata:'VS', color:0xCC0000},
+  'HAL':{name:'Hawaiian',     iata:'HA', color:0x7722AA},
+  'SCX':{name:'Sun Country',  iata:'SY', color:0xEE7700},
+  'PDT':{name:'Piedmont',     iata:'PT', color:0x3366BB},
+  'GJS':{name:'GoJet',        iata:'G7', color:0x4477AA},
+  'JIA':{name:'PSA',          iata:'OH', color:0x3366BB},
+  'EDV':{name:'Endeavor',     iata:'9E', color:0xCC3333},
+  'MXY':{name:'Breeze',       iata:'MX', color:0x44BBEE},
+  'AAY':{name:'Allegiant',    iata:'G4', color:0xF68C1E},
+  'QXE':{name:'Horizon',      iata:'QX', color:0x009DB0},
+};
+
+function getAirlineInfo(callsign) {
+  const prefix = callsign.substring(0, 3).toUpperCase();
+  return AIRLINE_INFO[prefix] || { name: prefix, iata: prefix.substring(0,2), color: 0x00AA44 };
+}
+
+// =========================================================================
+// ICAO → IATA airport code conversion
+// =========================================================================
+const ICAO_TO_IATA = {
+  'EGLL':'LHR','LFPG':'CDG','EDDF':'FRA','EHAM':'AMS','LEMD':'MAD',
+  'LEBL':'BCN','LIRF':'FCO','LSZH':'ZRH','EGKK':'LGW','EGLC':'LCY',
+  'EIDW':'DUB','EGCC':'MAN','LTFM':'IST','UUEE':'SVO','UUDD':'DME',
+  'OMDB':'DXB','OEJN':'JED','OTHH':'DOH','VHHH':'HKG','RJTT':'HND',
+  'RJAA':'NRT','RKSI':'ICN','WSSS':'SIN','VTBS':'BKK','WMKK':'KUL',
+  'YSSY':'SYD','YMML':'MEL','NZAA':'AKL','FAOR':'JNB','GOBD':'DSS',
+  'SBGR':'GRU','MMMX':'MEX','MMUN':'CUN','TNCM':'SXM','TIST':'STT',
+  'TJSJ':'SJU','MKJP':'KIN','MYNN':'NAS','LPPT':'LIS','BIKF':'KEF',
+  'MGGT':'GUA','MHTG':'TGU','MROC':'SJO','MPTO':'PTY','MSLP':'SAL',
+  'MMTJ':'TIJ','MMMY':'MTY','MMGL':'GDL','SKBO':'BOG','SEQM':'UIO',
+  'SPJC':'LIM','SCEL':'SCL','SAEZ':'EZE','SBGL':'GIG','SBBR':'BSB',
+  'TAPA':'ANU','TBPB':'BGI','TTPP':'POS',
+};
+
+function icaoToDisplay(icao) {
+  if (!icao) return '???';
+  // US: KJFK → JFK
+  if (icao.length === 4 && icao[0] === 'K') return icao.substring(1);
+  // Canada: CYYZ → YYZ
+  if (icao.length === 4 && icao.startsWith('CY')) return icao.substring(1);
+  // Lookup table
+  if (ICAO_TO_IATA[icao]) return ICAO_TO_IATA[icao];
+  // Fallback: trim to 3 chars to fit route display
+  return icao.substring(0, 3);
+}
+
+// Mini plane icon for route display (5x3, pointing right)
+const MINI_PLANE = [
+  [_, _,[220,220,220], _, _],
+  [[220,220,220],[220,220,220],[220,220,220],[220,220,220],[220,220,220]],
+  [_, _,[220,220,220], _, _],
+];
+
+// =========================================================================
+// Route + aircraft type cache and fetching
+// =========================================================================
+const flightCache = {}; // callsign → { origin, dest, type }
+
+async function fetchFlightInfo(callsign, icao24) {
+  if (flightCache[callsign]) return flightCache[callsign];
+
+  const info = { origin: '', dest: '', type: '' };
+
+  // Fetch route
+  try {
+    const resp = await fetch(`/api/route?callsign=${encodeURIComponent(callsign)}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const route = data.route || [];
+      info.origin = icaoToDisplay(route[0] || '');
+      info.dest = icaoToDisplay(route[route.length - 1] || '');
+      log(`Route for ${callsign}: ${info.origin} → ${info.dest}`);
+    }
+  } catch (e) {
+    log(`Route lookup failed for ${callsign}: ${e.message}`, true);
+  }
+
+  // Fetch aircraft type
+  if (icao24) {
+    try {
+      const resp = await fetch(`/api/aircraft?icao24=${encodeURIComponent(icao24)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        info.type = (data.typecode || data.model || '').substring(0, 8);
+        if (info.type) log(`Aircraft ${callsign}: ${info.type}`);
+      }
+    } catch (e) {
+      // Aircraft type is optional, fail silently
+    }
+  }
+
+  flightCache[callsign] = info;
+  return info;
+}
+
+// =========================================================================
+// Weather condition → icon mapping
+// =========================================================================
+function getWeatherIcon(condMain) {
+  const c = (condMain || '').toLowerCase();
+  if (c === 'clear') return 'sun';
+  if (c === 'clouds') return 'cloud';
+  if (c === 'rain' || c === 'drizzle') return 'rain';
+  if (c === 'snow') return 'snow';
+  if (c === 'thunderstorm') return 'storm';
+  if (['mist','smoke','haze','dust','fog','sand','ash'].includes(c)) return 'fog';
+  if (['squall','tornado'].includes(c)) return 'wind';
+  return 'cloud';
+}
+
+// =========================================================================
+// Heading → compass direction
+// =========================================================================
+function headingToCompass(hdg) {
+  const dirs = ['N','NE','E','SE','S','SW','W','NW'];
+  return dirs[Math.round(((hdg % 360) + 360) % 360 / 45) % 8];
+}
+
+// =========================================================================
+// Framebuffer drawing
+// =========================================================================
+
+function clearFB() {
+  for (let y = 0; y < HEIGHT; y++)
+    for (let x = 0; x < WIDTH; x++)
+      fb[y][x] = [0, 0, 0];
+}
+
+function hexToRGB(hex) {
+  return [(hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF];
+}
+
+function setPixel(x, y, rgb) {
+  if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+    fb[y][x] = rgb;
+  }
+}
+
+function drawChar(ch, x, yTop, rgb) {
+  const glyph = FONT_DATA[ch.charCodeAt(0)];
+  if (!glyph) return;
+  for (let col = 0; col < 5; col++) {
+    const bits = glyph[col];
+    for (let row = 0; row < 7; row++) {
+      if (bits & (1 << row)) setPixel(x + col, yTop + row, rgb);
+    }
+  }
+}
+
+function drawText(text, xStart, yCenter, colorHex) {
+  const rgb = hexToRGB(colorHex);
+  const yTop = yCenter - 3;
+  for (let i = 0; i < text.length; i++) {
+    drawChar(text[i], xStart + i * CHAR_W, yTop, rgb);
+  }
+}
+
+// Draw text with per-pixel clipping (for scrolling within a region)
+function drawTextClipped(text, xStart, yCenter, colorHex, clipX0, clipX1) {
+  const rgb = hexToRGB(colorHex);
+  const yTop = yCenter - 3;
+  for (let i = 0; i < text.length; i++) {
+    const cx = xStart + i * CHAR_W;
+    if (cx + 5 < clipX0 || cx > clipX1) continue; // skip entirely off-screen chars
+    const glyph = FONT_DATA[text.charCodeAt(i)];
+    if (!glyph) continue;
+    for (let col = 0; col < 5; col++) {
+      const px = cx + col;
+      if (px < clipX0 || px > clipX1) continue;
+      const bits = glyph[col];
+      for (let row = 0; row < 7; row++) {
+        if (bits & (1 << row)) setPixel(px, yTop + row, rgb);
+      }
+    }
+  }
+}
+
+function drawIcon(icon, x0, y0) {
+  for (let row = 0; row < icon.length; row++) {
+    for (let col = 0; col < icon[row].length; col++) {
+      const c = icon[row][col];
+      if (c) setPixel(x0 + col, y0 + row, c);
+    }
+  }
+}
+
+function drawHLine(y, x0, x1, rgb) {
+  for (let x = x0; x <= x1; x++) setPixel(x, y, rgb);
+}
+
+// Fill a rectangle with a solid color
+function fillRect(x0, y0, x1, y1, rgb) {
+  for (let y = y0; y <= y1; y++)
+    for (let x = x0; x <= x1; x++)
+      setPixel(x, y, rgb);
+}
+
+// Fill a rectangle with a vertical gradient between two colors
+function fillGradientV(x0, y0, x1, y1, rgbTop, rgbBot) {
+  const h = y1 - y0;
+  if (h <= 0) return;
+  for (let y = y0; y <= y1; y++) {
+    const t = (y - y0) / h;
+    const r = Math.round(rgbTop[0] + (rgbBot[0] - rgbTop[0]) * t);
+    const g = Math.round(rgbTop[1] + (rgbBot[1] - rgbTop[1]) * t);
+    const b = Math.round(rgbTop[2] + (rgbBot[2] - rgbTop[2]) * t);
+    for (let x = x0; x <= x1; x++) setPixel(x, y, [r, g, b]);
+  }
+}
+
+// Fill a rectangle with a horizontal gradient between two colors
+function fillGradientH(x0, y0, x1, y1, rgbLeft, rgbRight) {
+  const w = x1 - x0;
+  if (w <= 0) return;
+  for (let x = x0; x <= x1; x++) {
+    const t = (x - x0) / w;
+    const r = Math.round(rgbLeft[0] + (rgbRight[0] - rgbLeft[0]) * t);
+    const g = Math.round(rgbLeft[1] + (rgbRight[1] - rgbLeft[1]) * t);
+    const b = Math.round(rgbLeft[2] + (rgbRight[2] - rgbLeft[2]) * t);
+    for (let y = y0; y <= y1; y++) setPixel(x, y, [r, g, b]);
+  }
+}
+
+// Dim border frame (1px) around the full display
+function drawBorder(rgb) {
+  for (let x = 0; x < WIDTH; x++) { setPixel(x, 0, rgb); setPixel(x, HEIGHT-1, rgb); }
+  for (let y = 0; y < HEIGHT; y++) { setPixel(0, y, rgb); setPixel(WIDTH-1, y, rgb); }
+}
+
+// =========================================================================
+// Visual elements — airline logo box, scrolling marquee, wave animation
+// =========================================================================
+
+function drawAirlineLogo(iata, color, x0, y0, w, h) {
+  const rgb = hexToRGB(color);
+  const dark = [Math.floor(rgb[0]*0.3), Math.floor(rgb[1]*0.3), Math.floor(rgb[2]*0.3)];
+  const light = [Math.min(255,rgb[0]+40), Math.min(255,rgb[1]+40), Math.min(255,rgb[2]+40)];
+
+  // Fill with gradient (lighter at top)
+  for (let y = y0; y < y0 + h; y++) {
+    const t = (y - y0) / h;
+    const r = Math.floor(light[0] + (rgb[0] - light[0]) * t);
+    const g = Math.floor(light[1] + (rgb[1] - light[1]) * t);
+    const b = Math.floor(light[2] + (rgb[2] - light[2]) * t);
+    for (let x = x0; x < x0 + w; x++) setPixel(x, y, [r, g, b]);
+  }
+  // Border (darker shade)
+  for (let x = x0; x < x0+w; x++) { setPixel(x, y0, dark); setPixel(x, y0+h-1, dark); }
+  for (let y = y0; y < y0+h; y++) { setPixel(x0, y, dark); setPixel(x0+w-1, y, dark); }
+
+  // 2-letter IATA code centered — white or black for contrast
+  const brightness = rgb[0]*0.299 + rgb[1]*0.587 + rgb[2]*0.114;
+  const textRGB = brightness > 140 ? [10,10,10] : [255,255,255];
+  const textX = x0 + Math.floor((w - iata.length * CHAR_W + 1) / 2);
+  const textY = y0 + Math.floor((h - 7) / 2);
+  for (let i = 0; i < iata.length; i++) {
+    drawChar(iata[i], textX + i * CHAR_W, textY, textRGB);
+  }
+}
+
+function drawMarqueeSegments(segments, xOffset, yCenter, clipX0, clipX1) {
+  let x = xOffset;
+  const yTop = yCenter - 3;
+  for (const seg of segments) {
+    const rgb = hexToRGB(seg.color);
+    for (let i = 0; i < seg.text.length; i++) {
+      const charX = Math.floor(x) + i * CHAR_W;
+      if (charX + 5 < clipX0) { continue; }
+      if (charX > clipX1) { x += seg.text.length * CHAR_W; break; }
+      const glyph = FONT_DATA[seg.text.charCodeAt(i)];
+      if (!glyph) continue;
+      for (let col = 0; col < 5; col++) {
+        const px = charX + col;
+        if (px < clipX0 || px > clipX1) continue;
+        for (let row = 0; row < 7; row++) {
+          if (glyph[col] & (1 << row)) setPixel(px, yTop + row, rgb);
+        }
+      }
+    }
+    x += seg.text.length * CHAR_W;
+  }
+  return x - xOffset; // total width
+}
+
+function drawWaves(y0, y1, timestamp, tint) {
+  // Animated ocean waves filling a region
+  const t = timestamp * 0.001;
+  for (let x = 0; x < WIDTH; x++) {
+    const w1 = Math.sin(x * 0.14 + t * 1.2) * 2;
+    const w2 = Math.sin(x * 0.09 - t * 0.8 + 2.0) * 1.5;
+    const w3 = Math.sin(x * 0.22 + t * 0.5) * 0.8;
+    const surfaceY = y0 + 3 + w1 + w2;
+    const foamY = surfaceY + w3;
+
+    for (let y = y0; y <= y1; y++) {
+      if (y < surfaceY - 0.5) {
+        // Above surface: empty or very faint sky reflection
+        const skyV = Math.max(0, 3 - (surfaceY - y) * 1.5);
+        if (skyV > 0) setPixel(x, y, [0, Math.floor(skyV * tint[1]/20), Math.floor(skyV * tint[2]/12)]);
+      } else if (y < surfaceY + 1) {
+        // Wave crest: bright foam
+        const foam = 0.6 + Math.sin(x * 0.3 + t * 3) * 0.2;
+        setPixel(x, y, [Math.floor(tint[0]*foam), Math.floor(tint[1]*foam), Math.floor(tint[2]*foam)]);
+      } else {
+        // Below surface: darker with depth
+        const depth = (y - surfaceY) / (y1 - y0);
+        const fade = Math.max(0.15, 1 - depth * 1.2);
+        const shimmer = Math.sin(x * 0.2 + y * 0.5 + t * 2) * 0.08;
+        const f = fade + shimmer;
+        setPixel(x, y, [
+          Math.floor(Math.max(0, tint[0] * f * 0.4)),
+          Math.floor(Math.max(0, tint[1] * f * 0.6)),
+          Math.floor(Math.max(0, tint[2] * f * 0.8)),
+        ]);
+      }
+    }
+  }
+}
+
+function drawProgressBar(x0, y, x1, progress, colorLeft, colorRight) {
+  // Thin progress bar with gradient fill
+  const fillEnd = x0 + Math.floor((x1 - x0) * Math.max(0, Math.min(1, progress)));
+  for (let x = x0; x <= x1; x++) {
+    if (x <= fillEnd) {
+      setPixel(x, y, colorLeft);
+    } else {
+      setPixel(x, y, [Math.floor(colorRight[0]*0.3), Math.floor(colorRight[1]*0.3), Math.floor(colorRight[2]*0.3)]);
+    }
+  }
+}
+
+// Weather-condition-responsive background palette
+function getWeatherBG(condMain) {
+  const c = (condMain || '').toLowerCase();
+  if (c === 'clear')        return { top: [25, 15, 3],  bot: [8, 4, 1],    accent: [40, 25, 5],   sep: [50, 35, 10],  border: [35, 22, 5] };
+  if (c === 'clouds')       return { top: [8, 10, 18],  bot: [4, 5, 10],   accent: [12, 15, 25],  sep: [20, 25, 40],  border: [12, 15, 25] };
+  if (c === 'rain' || c === 'drizzle')
+                            return { top: [3, 6, 20],   bot: [1, 3, 12],   accent: [5, 10, 30],   sep: [10, 20, 50],  border: [5, 10, 28] };
+  if (c === 'snow')         return { top: [10, 12, 18], bot: [5, 6, 10],   accent: [15, 18, 25],  sep: [25, 28, 40],  border: [12, 14, 20] };
+  if (c === 'thunderstorm') return { top: [15, 5, 20],  bot: [6, 2, 10],   accent: [20, 8, 28],   sep: [35, 15, 45],  border: [18, 6, 25] };
+  // fog/mist/default
+  return { top: [8, 8, 10],  bot: [4, 4, 5],    accent: [12, 12, 15],  sep: [20, 20, 25],  border: [10, 10, 13] };
+}
+
+// =========================================================================
+// Canvas rendering — realistic LED matrix
+// =========================================================================
+
+function renderMatrix() {
+  ctx.fillStyle = '#0c0c0c';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const cx = x * SCALE + SCALE / 2;
+      const cy = y * SCALE + SCALE / 2;
+      const [r, g, b] = fb[y][x];
+      const isLit = r > 0 || g > 0 || b > 0;
+
+      if (isLit) {
+        ctx.save();
+        ctx.shadowBlur = GLOW_BLUR;
+        ctx.shadowColor = `rgb(${r},${g},${b})`;
+        // Outer glow
+        ctx.beginPath();
+        ctx.arc(cx, cy, LED_RADIUS + 0.5, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},0.3)`;
+        ctx.fill();
+        // Main LED dot with bright core
+        ctx.beginPath();
+        ctx.arc(cx, cy, LED_RADIUS, 0, Math.PI * 2);
+        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, LED_RADIUS);
+        grad.addColorStop(0, `rgb(${Math.min(255,r+80)},${Math.min(255,g+80)},${Math.min(255,b+80)})`);
+        grad.addColorStop(0.5, `rgb(${r},${g},${b})`);
+        grad.addColorStop(1, `rgba(${r},${g},${b},0.7)`);
+        ctx.fillStyle = grad;
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.beginPath();
+        ctx.arc(cx, cy, LED_RADIUS * 0.7, 0, Math.PI * 2);
+        ctx.fillStyle = '#151515';
+        ctx.fill();
+      }
+    }
+  }
+}
+
+// =========================================================================
+// Logging
+// =========================================================================
+
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(msg, isErr = false) {
+  const ts = new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  if (isErr) line.className = 'err';
+  line.textContent = `[${ts}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg);
+}
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// =========================================================================
+// State
+// =========================================================================
+
+let weather_str = "";       // e.g. "72\u00B0F"
+let weather_cond = "";      // full condition name e.g. "Partly Cloudy"
+let weather_condMain = "";  // OWM main category e.g. "Clouds"
+let tide_str = "";          // e.g. "HI 2:30P"
+let tide_type = "";         // "H" or "L"
+let planes = [];
+let showing_planes = false;
+let plane_idx = 0;
+let last_weather_fetch = -WEATHER_INTERVAL;
+let last_sky_fetch = -OPENSKY_INTERVAL;
+let last_plane_cycle = 0;
+let dataLoaded = false;
+
+// Scrolling state for condition text
+let scrollState = { offset: 0, phase: 'pause_start', timer: 0 };
+
+
+function monotonic() { return performance.now() / 1000; }
+
+// =========================================================================
+// API helpers
+// =========================================================================
+
+async function fetchWeather() {
+  log("Fetching weather...");
+  try {
+    const resp = await fetch('/api/weather');
+    const data = await resp.json();
+    const temp = Math.round(data.main.temp);
+    weather_condMain = data.weather[0].main;
+    weather_cond = data.weather[0].description;
+    // Capitalize each word
+    weather_cond = weather_cond.replace(/\b\w/g, c => c.toUpperCase());
+    weather_str = `${temp}\u00B0F`;
+    log(`Weather: ${weather_str} — ${weather_cond} (${weather_condMain})`);
+    // Reset scrolling when weather changes
+    scrollState = { offset: 0, phase: 'pause_start', timer: 0 };
+  } catch (e) {
+    log(`Weather err: ${e.message}`, true);
+    if (!weather_str) { weather_str = "N/A"; weather_cond = "No Data"; weather_condMain = ""; }
+  }
+}
+
+async function fetchTides() {
+  log("Fetching tides...");
+  try {
+    const resp = await fetch('/api/tides');
+    const data = await resp.json();
+    const preds = data.predictions || [];
+    const now = new Date();
+    const nowMins = now.getHours() * 60 + now.getMinutes();
+    let found = false;
+    for (const p of preds) {
+      const timePart = p.t.split(" ")[1];
+      const [hStr, mStr] = timePart.split(":");
+      const h = parseInt(hStr), m = parseInt(mStr);
+      if (h * 60 + m >= nowMins) {
+        tide_type = p.type;
+        const label = p.type === "H" ? "HI" : "LO";
+        const ampm = h < 12 ? "A" : "P";
+        const h12 = h % 12 || 12;
+        tide_str = `${label} ${h12}:${mStr}${ampm}`;
+        found = true;
+        log(`Tide: ${tide_str}`);
+        break;
+      }
+    }
+    if (!found) { tide_str = "DONE"; tide_type = ""; log("Tides done for today"); }
+  } catch (e) {
+    log(`Tide err: ${e.message}`, true);
+    if (!tide_str) { tide_str = "N/A"; tide_type = ""; }
+  }
+}
+
+async function fetchPlanes() {
+  log("Checking for planes...");
+  try {
+    const resp = await fetch('/api/planes');
+    const data = await resp.json();
+    const states = data.states || [];
+    planes = [];
+    for (const s of states) {
+      if (s[8]) continue;
+      const callsign = (s[1] || "").trim();
+      if (!callsign) continue;
+      const altM = s[7] || s[13] || 0;
+      planes.push({
+        call: callsign.substring(0, 8),
+        icao24: s[0] || '',
+        alt: Math.round(altM * 3.281),
+        spd: Math.round((s[9] || 0) * 1.944),
+        hdg: Math.round(s[10] || 0),
+      });
+    }
+    log(`Planes overhead: ${planes.length}`);
+    // Fetch route/aircraft info for new planes (non-blocking)
+    for (const p of planes) {
+      if (!flightCache[p.call]) {
+        fetchFlightInfo(p.call, p.icao24);
+      }
+    }
+  } catch (e) {
+    log(`OpenSky err: ${e.message}`, true);
+    planes = [];
+  }
+}
+
+// =========================================================================
+// Screen composition
+// =========================================================================
+
+// Layout constants:
+//   Weather: icon(0,0) + temp(11,4) | condition(1,14) scrolling | sep(19) | arrow(1,22) + tide(8,25)
+//   Plane:   icon(0,0) + callsign(10,4) | alt+hdg(1,15) | speed(1,25)
+//   Loading: animated
+
+function composeWeatherScreen(dt, timestamp) {
+  clearFB();
+  const bg = getWeatherBG(weather_condMain);
+
+  // --- Top section (rows 0-16): icon + temp + condition ---
+  fillGradientV(0, 0, 63, 16, bg.top, bg.bot);
+  drawBorder(bg.border);
+
+  // Weather icon (8x8) at top-left
+  const iconName = getWeatherIcon(weather_condMain);
+  const icon = ICONS[iconName];
+  if (icon) drawIcon(icon, 2, 1);
+
+  // Temperature next to icon
+  drawText(weather_str, 12, 5, 0xFFFF00);
+
+  // Condition text — full width, below icon with a 2px gap
+  const condY = 13;
+  const condPixelW = weather_cond.length * CHAR_W;
+  const availW = 62;
+  if (condPixelW <= availW) {
+    drawText(weather_cond, 1, condY, 0xAAAAAA);
+  } else {
+    const maxScroll = condPixelW - availW + CHAR_W;
+    scrollState.timer += dt;
+    if (scrollState.phase === 'pause_start') {
+      scrollState.offset = 0;
+      if (scrollState.timer > 2.0) { scrollState.phase = 'scrolling'; scrollState.timer = 0; }
+    } else if (scrollState.phase === 'scrolling') {
+      scrollState.offset += dt * 15;
+      if (scrollState.offset >= maxScroll) { scrollState.offset = maxScroll; scrollState.phase = 'pause_end'; scrollState.timer = 0; }
+    } else if (scrollState.phase === 'pause_end') {
+      if (scrollState.timer > 1.5) { scrollState.phase = 'pause_start'; scrollState.timer = 0; scrollState.offset = 0; }
+    }
+    drawTextClipped(weather_cond, 1 - Math.floor(scrollState.offset), condY, 0xAAAAAA, 1, 62);
+  }
+
+  // --- Separator (row 17) ---
+  drawHLine(17, 0, 63, bg.sep);
+
+  // --- Bottom section (rows 18-31): animated ocean waves + tide info ---
+  drawWaves(18, 31, timestamp, [30, 90, 160]);
+
+  // Darken a strip behind tide text for readability
+  const tideY = 25;
+  for (let y = tideY - 4; y <= tideY + 4; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const cur = fb[y]?.[x];
+      if (cur) {
+        fb[y][x] = [Math.floor(cur[0]*0.25), Math.floor(cur[1]*0.25), Math.floor(cur[2]*0.25)];
+      }
+    }
+  }
+
+  // Tide arrow + text
+  if (tide_type === 'H') {
+    drawIcon(ARROW_UP, 3, tideY - 3);
+  } else if (tide_type === 'L') {
+    drawIcon(ARROW_DOWN, 3, tideY - 3);
+  }
+  const tideX = tide_type ? 10 : 3;
+  drawText(tide_str, tideX, tideY, 0x00EEFF);
+
+  setStatus(`Weather: ${weather_str} ${weather_cond} | Tide: ${tide_str}`);
+}
+
+function composePlaneScreen(plane, dt, timestamp) {
+  clearFB();
+  const info = getAirlineInfo(plane.call);
+  const airRGB = hexToRGB(info.color);
+  const flight = flightCache[plane.call] || {};
+  const origin = flight.origin;
+  const dest = flight.dest;
+  const acType = flight.type || '';
+  const altK = Math.floor(plane.alt / 1000);
+
+  // Background: dark navy gradient
+  fillGradientV(0, 0, 63, 31, [3, 5, 16], [1, 2, 8]);
+
+  // --- Airline logo box (left column, 14x32) ---
+  drawAirlineLogo(info.iata, info.color, 0, 0, 14, 32);
+
+  // Vertical separator
+  const sepColor = [Math.floor(airRGB[0]*0.3), Math.floor(airRGB[1]*0.3), Math.floor(airRGB[2]*0.3)];
+  for (let y = 0; y < 32; y++) setPixel(14, y, sepColor);
+
+  const x0 = 16;
+  const accentDim = [Math.floor(airRGB[0]*0.15), Math.floor(airRGB[1]*0.15), Math.max(8, Math.floor(airRGB[2]*0.15))];
+
+  // Row 1 (y=4): Route — BOS ✈ SEA (bright white, most prominent)
+  drawText(origin, x0, 4, 0xFFFFFF);
+  const iconX = x0 + origin.length * CHAR_W + 1;
+  drawIcon(MINI_PLANE, iconX, 3);
+  drawText(dest, iconX + 7, 4, 0xFFFFFF);
+
+  drawHLine(8, x0, 63, accentDim);
+
+  // Row 2 (y=12): Airline name (branded color)
+  drawTextClipped(info.name, x0, 12, info.color, x0, 63);
+
+  drawHLine(16, x0, 63, accentDim);
+
+  // Row 3 (y=20): Aircraft type (light blue) or altitude
+  if (acType) {
+    drawText(acType, x0, 20, 0x55AADD);
+  } else {
+    drawText(`${altK}Kft`, x0, 20, 0x44AA44);
+  }
+
+  drawHLine(24, x0, 63, accentDim);
+
+  // Row 4 (y=28): Altitude + callsign (or just callsign if alt already shown)
+  if (acType) {
+    drawText(`${altK}Kft`, x0, 28, 0x44AA44);
+    const callX = Math.max(x0 + (`${altK}Kft`).length * CHAR_W + CHAR_W, 64 - plane.call.length * CHAR_W);
+    drawTextClipped(plane.call, callX, 28, 0x555566, x0, 63);
+  } else {
+    drawText(plane.call, x0, 28, 0x555566);
+  }
+
+  setStatus(`${origin} \u2192 ${dest} | ${info.name} | ${acType || '?'} | ${altK}Kft | ${plane.call}`);
+}
+
+function composeLoadingScreen(timestamp) {
+  clearFB();
+
+  // Animated dark background — subtle moving gradient
+  const phase = timestamp / 3000;
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const wave = Math.sin(x * 0.1 + phase) * Math.sin(y * 0.15 + phase * 0.7);
+      const v = Math.floor(3 + wave * 3);
+      setPixel(x, y, [v, Math.floor(v * 0.6), Math.floor(v * 1.5)]);
+    }
+  }
+
+  // Pulsing "LOADING" text
+  const pulse = Math.sin(timestamp / 1000 * 2) * 0.3 + 0.7;
+  const bright = Math.floor(255 * pulse);
+  const loadColor = (bright << 16) | (bright << 8);
+
+  const dotCount = (Math.floor(timestamp / 500) % 3) + 1;
+  const dots = '.'.repeat(dotCount);
+  drawText("LOADING" + dots, 4, 12, loadColor);
+
+  // Animated rainbow progress bar (rows 28-29, double-thick)
+  const barColors = [
+    [255, 0, 0], [255, 80, 0], [255, 180, 0], [255, 255, 0],
+    [0, 255, 0], [0, 200, 255], [80, 80, 255], [180, 50, 255],
+  ];
+  const barProgress = timestamp / 40;
+  for (let row = 28; row <= 29; row++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const pos = ((x + Math.floor(barProgress)) % WIDTH + WIDTH) % WIDTH;
+      const colorIdx = Math.floor(pos / (WIDTH / barColors.length)) % barColors.length;
+      const c = barColors[colorIdx];
+      const dim = row === 28 ? 0.7 : 0.5;
+      setPixel(x, row, [Math.floor(c[0]*dim), Math.floor(c[1]*dim), Math.floor(c[2]*dim)]);
+    }
+  }
+
+  // Border with slow color cycle
+  const hue = (timestamp / 20) % 360;
+  const br = hueToRGB(hue, 0.4, 0.12);
+  drawBorder(br);
+}
+
+// HSL-ish helper for border color cycling
+function hueToRGB(h, s, l) {
+  const c = s * (1 - Math.abs(2 * l - 1));
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r, g, b;
+  if (h < 60)       { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else              { r = c; g = 0; b = x; }
+  return [Math.floor((r+m)*255), Math.floor((g+m)*255), Math.floor((b+m)*255)];
+}
+
+// =========================================================================
+// Main loops — logic tick (1/sec) + render loop (RAF)
+// =========================================================================
+
+// Filter to only planes that have route data in the cache
+function getDisplayablePlanes() {
+  return planes.filter(p => {
+    const f = flightCache[p.call];
+    return f && f.origin && f.dest;
+  });
+}
+
+async function logicTick() {
+  const now = monotonic();
+
+  if (now - last_weather_fetch >= WEATHER_INTERVAL) {
+    await fetchWeather();
+    await fetchTides();
+    last_weather_fetch = now;
+    dataLoaded = true;
+  }
+
+  if (now - last_sky_fetch >= OPENSKY_INTERVAL) {
+    await fetchPlanes();
+    last_sky_fetch = now;
+  }
+
+  // Only show planes that have route data
+  const displayPlanes = getDisplayablePlanes();
+
+  if (displayPlanes.length > 0 && !showing_planes) {
+    showing_planes = true;
+    plane_idx = 0;
+    last_plane_cycle = now;
+  } else if (displayPlanes.length === 0 && showing_planes) {
+    showing_planes = false;
+  }
+
+  if (showing_planes && displayPlanes.length > 1) {
+    if (now - last_plane_cycle >= PLANE_CYCLE_SECS) {
+      plane_idx = (plane_idx + 1) % displayPlanes.length;
+      last_plane_cycle = now;
+    }
+  }
+}
+
+let lastFrameTime = 0;
+
+function renderLoop(timestamp) {
+  const dt = Math.min((timestamp - lastFrameTime) / 1000, 0.1); // cap dt
+  lastFrameTime = timestamp;
+
+  if (!dataLoaded) {
+    composeLoadingScreen(timestamp);
+  } else if (showing_planes) {
+    const dp = getDisplayablePlanes();
+    if (dp.length > 0) {
+      composePlaneScreen(dp[plane_idx % dp.length], dt, timestamp);
+    } else {
+      composeWeatherScreen(dt, timestamp);
+    }
+  } else {
+    composeWeatherScreen(dt, timestamp);
+  }
+
+  renderMatrix();
+  requestAnimationFrame(renderLoop);
+}
+
+// =========================================================================
+// Test controls
+// =========================================================================
+
+function injectTestPlane() {
+  const testFlights = [
+    { call:'UAL1234', origin:'BOS', dest:'SFO', type:'B739', name:'United' },
+    { call:'DAL567',  origin:'BOS', dest:'ATL', type:'A321', name:'Delta' },
+    { call:'SWA890',  origin:'BOS', dest:'BWI', type:'B738', name:'Southwest' },
+    { call:'JBU42',   origin:'BOS', dest:'FLL', type:'A320', name:'JetBlue' },
+    { call:'AAL100',  origin:'BOS', dest:'DFW', type:'B738', name:'American' },
+    { call:'NKS77',   origin:'BOS', dest:'MCO', type:'A20N', name:'Spirit' },
+    { call:'FFT321',  origin:'BOS', dest:'DEN', type:'A21N', name:'Frontier' },
+    { call:'ASA55',   origin:'BOS', dest:'SEA', type:'B739', name:'Alaska' },
+    { call:'BAW213',  origin:'BOS', dest:'LHR', type:'B789', name:'British Air' },
+    { call:'RPA5162', origin:'BOS', dest:'ORD', type:'E75L', name:'Republic' },
+  ];
+  const t = testFlights[Math.floor(Math.random() * testFlights.length)];
+  const alt = 5000 + Math.floor(Math.random() * 35000);
+  const hdg = Math.floor(Math.random() * 360);
+  const spd = 150 + Math.floor(Math.random() * 300);
+  planes.push({ call: t.call, icao24: '', alt, spd, hdg });
+  // Pre-populate cache with test data
+  flightCache[t.call] = { origin: t.origin, dest: t.dest, type: t.type };
+  log(`Injected: ${t.call} (${t.name}) ${t.origin}→${t.dest} ${t.type} at ${alt}ft`);
+  if (!showing_planes) {
+    showing_planes = true;
+    plane_idx = planes.length - 1;
+    last_plane_cycle = monotonic();
+  }
+}
+
+function clearPlanes() {
+  planes = [];
+  showing_planes = false;
+  log("Cleared all planes");
+}
+
+function forceRefresh() {
+  last_weather_fetch = -WEATHER_INTERVAL;
+  last_sky_fetch = -OPENSKY_INTERVAL;
+  log("Forcing refresh on next tick");
+}
+
+// =========================================================================
+// Boot
+// =========================================================================
+
+(async function boot() {
+  log("Starting Matrix Portal Simulator");
+  log(`Location: ${LAT}, ${LON} | Station: ${NOAA_STATION}`);
+
+  last_weather_fetch = -WEATHER_INTERVAL;
+  last_sky_fetch = -OPENSKY_INTERVAL;
+
+  // Start render loop (smooth animation)
+  requestAnimationFrame(renderLoop);
+
+  // Start logic tick (1/sec, matches code.py)
+  setInterval(logicTick, 1000);
+
+  // First tick immediately
+  await logicTick();
+})();
+
+</script>
+</body>
+</html>
