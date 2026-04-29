@@ -18,6 +18,7 @@ import terminalio
 import displayio
 from adafruit_matrixportal.matrixportal import MatrixPortal
 from adafruit_display_text.label import Label
+from adafruit_bitmap_font import bitmap_font
 
 try:
     from secrets import secrets
@@ -72,11 +73,12 @@ def inject_test_plane():
     tp = TEST_PLANES[_test_idx % len(TEST_PLANES)]
     _test_idx += 1
     planes.append({
-        "call": tp["call"], "alt": tp["alt"],
-        "spd": tp["spd"], "hdg": tp["hdg"],
+        "call": tp["call"], "icao24": "", "alt": tp["alt"],
+        "spd": tp["spd"], "hdg": tp["hdg"], "vrate": 5,
     })
     flight_cache[tp["call"]] = {
-        "origin": tp["origin"], "dest": tp["dest"], "type": tp["type"],
+        "origin": tp["origin"], "dest": tp["dest"],
+        "type": tp["type"], "reg": tp.get("reg", "N12345"),
     }
     showing_planes = True
     plane_idx = len(planes) - 1
@@ -104,6 +106,7 @@ while len(root) > 0:
 
 display = mp.display
 FONT = terminalio.FONT
+FONT_SMALL = bitmap_font.load_font("tom-thumb.bdf")
 
 # ---------------------------------------------------------------------------
 # Icon bitmaps (8x8, 2 colors: transparent + icon color)
@@ -393,7 +396,7 @@ def fetch_route(callsign, icao24=""):
     url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
     if icao24:
         url += "&icao24={}".format(icao24)
-    info = {"origin": "???", "dest": "???", "type": ""}
+    info = {"origin": "???", "dest": "???", "type": "", "reg": ""}
     try:
         resp = mp.network.fetch(url)
         data = resp.json()
@@ -403,6 +406,7 @@ def fetch_route(callsign, icao24=""):
             info["origin"] = icao_to_display(route[0])
             info["dest"] = icao_to_display(route[-1])
         info["type"] = data.get("typecode", "")
+        info["reg"] = data.get("registration", "")
         print("Route {}: {} -> {} ({})".format(
             callsign, info["origin"], info["dest"], info["type"]))
     except Exception as e:
@@ -453,31 +457,22 @@ plane_group.append(pl_bg_tg)
 logo_label = Label(FONT, text="", color=0xFFFFFF, x=2, y=16)
 plane_group.append(logo_label)
 
-# Mini plane icon between origin and dest (5x3, built as 1-bit bitmap)
-ICON_MINI_PLANE = bytes([0b00100000, 0b11111000, 0b00100000])
-mini_plane_tg, _, _ = make_icon_tg(ICON_MINI_PLANE, 5, 3, 0xCCCCCC, x=0, y=0)
-mini_plane_tg.hidden = True
-plane_group.append(mini_plane_tg)
-
-# Row 1: Route (right of logo area)
+# Row 1: Route — LARGE font
 route_label = Label(FONT, text="", color=0xFFFFFF, x=16, y=4)
 plane_group.append(route_label)
 
-# Row 2: Airline name
-airline_label = Label(FONT, text="", color=0x00FF00, x=16, y=12)
+# Row 2: Airline + type — small font
+airline_label = Label(FONT_SMALL, text="", color=0x00FF00, x=16, y=13)
 plane_group.append(airline_label)
 
-# Aircraft type icon (8x8, reused for jet/prop/heli)
-ac_icon_tg, ac_icon_bmp, ac_icon_pal = make_icon_tg(ICON_PLANE, 8, 8, 0x66AACC, x=16, y=17)
-plane_group.append(ac_icon_tg)
-
-# Row 3: Aircraft type text (after icon)
-type_label = Label(FONT, text="", color=0x55AADD, x=25, y=20)
-plane_group.append(type_label)
-
-# Row 4: Altitude
-alt_label = Label(FONT, text="", color=0x44AA44, x=16, y=28)
+# Row 3: Altitude + heading — small font
+alt_label = Label(FONT_SMALL, text="", color=0x44AA44, x=16, y=20)
 plane_group.append(alt_label)
+
+# Row 4: Registration (tail number) — small font
+reg_label = Label(FONT_SMALL, text="", color=0x667788, x=16, y=27)
+plane_group.append(reg_label)
+
 
 # --- Loading screen group ---
 loading_group = displayio.Group()
@@ -671,12 +666,14 @@ def fetch_planes():
             alt_ft = int(alt_m * 3.281)
             vel_kt = int((s[9] or 0) * 1.944)
             hdg = int(s[10] or 0)
+            vrate = s[11] or 0  # vertical rate m/s
             planes.append({
                 "call": callsign[:8],
                 "icao24": s[0] or "",
                 "alt": alt_ft,
                 "spd": vel_kt,
                 "hdg": hdg,
+                "vrate": int(vrate),
             })
         print("Planes overhead:", len(planes))
     except MemoryError:
@@ -739,40 +736,37 @@ def show_plane(plane):
 
     # Logo: IATA code centered in logo box
     logo_label.text = iata
-    # Center 2 chars (12px) in 14px box
     logo_label.x = 1 + (14 - len(iata) * 6) // 2
-    # Contrast: white or black text based on color brightness
     bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
     logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
 
     route = flight_cache.get(callsign, {})
     origin = route.get("origin", "")
     dest = route.get("dest", "")
+    ac_type = route.get("type", "")
+    reg = route.get("reg", "")
 
-    # Row 1: Route with mini plane icon
-    route_label.text = origin
-    route_label.x = 16
-    # Position mini plane after origin text
-    icon_x = 16 + len(origin) * 6 + 1
-    mini_plane_tg.x = icon_x
-    mini_plane_tg.y = 3
-    mini_plane_tg.hidden = False
-    # Dest label reuses airline_label... no, we need a separate label
-    # Use a combined string approach instead
+    # Row 1: Route — LARGE, next to plane icon
     route_label.text = "{}>{}".format(origin, dest)
-    mini_plane_tg.hidden = True  # text ">" is simpler for now
 
-    # Row 2: Airline name
-    airline_label.text = name[:8]
+    # Row 2: Airline + aircraft type — small
+    if ac_type:
+        airline_label.text = "{}  {}".format(name[:8], ac_type)
+    else:
+        airline_label.text = name[:8]
     airline_label.color = color
 
-    # Row 3: Aircraft type (if available)
-    ac_type = route.get("type", "")
-    type_label.text = ac_type if ac_type else ""
-
-    # Row 4: Altitude (hide if invalid/ground level)
+    # Row 3: Altitude + climb/descend arrow + heading — small
     alt_k = plane["alt"] // 1000
-    alt_label.text = "{}Kft".format(alt_k) if alt_k > 0 else ""
+    compass = heading_to_compass(plane["hdg"])
+    if alt_k > 0:
+        alt_label.text = "Alt: {}k ft {}".format(alt_k, compass)
+    else:
+        alt_label.text = ""
+
+    # Row 4: Registration (tail number) — small, dim
+    reg_label.text = "Reg: {}".format(reg) if reg else ""
+
 
 
 # ---------------------------------------------------------------------------

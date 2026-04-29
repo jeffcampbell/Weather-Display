@@ -138,7 +138,7 @@ def handle_route(params):
     if cached:
         return 200, cached
 
-    result = {"callsign": callsign, "route": [], "typecode": ""}
+    result = {"callsign": callsign, "route": [], "typecode": "", "registration": ""}
 
     # Fetch route
     url = f"https://opensky-network.org/api/routes?callsign={callsign}"
@@ -159,6 +159,7 @@ def handle_route(params):
             try:
                 ac_data = json.loads(ac_cached)
                 result["typecode"] = ac_data.get("ICAOTypeCode", "")
+                result["registration"] = ac_data.get("Registration", "")
             except Exception:
                 pass
         else:
@@ -169,6 +170,7 @@ def handle_route(params):
                 try:
                     ac_parsed = json.loads(ac_data)
                     result["typecode"] = ac_parsed.get("ICAOTypeCode", "")
+                    result["registration"] = ac_parsed.get("Registration", "")
                 except Exception:
                     pass
 
