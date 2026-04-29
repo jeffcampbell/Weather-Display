@@ -851,8 +851,6 @@ let last_sky_fetch = -OPENSKY_INTERVAL;
 let last_plane_cycle = 0;
 let dataLoaded = false;
 
-// Scrolling state for condition text
-let scrollState = { offset: 0, phase: 'pause_start', timer: 0 };
 
 
 function monotonic() { return performance.now() / 1000; }
@@ -861,6 +859,34 @@ function monotonic() { return performance.now() / 1000; }
 // API helpers
 // =========================================================================
 
+// OWM condition ID → short display string (max 10 chars to fit 64px)
+const COND_SHORT = {
+  200:'Thndr Rain',201:'Thndr Rain',202:'Thndr Rain',
+  210:'Lt Thndrs',211:'Thndrstm',212:'Hvy Thndrs',
+  221:'Thndrstm',
+  230:'Thndr Drzl',231:'Thndr Drzl',232:'Thndr Drzl',
+  300:'Lt Drizzle',301:'Drizzle',302:'Hvy Drzzle',
+  310:'Drzzl Rain',311:'Drzzl Rain',312:'Drzzl Rain',
+  313:'Shwr Drzzl',314:'Shwr Drzzl',321:'Shwr Drzzl',
+  500:'Light Rain',501:'Mod Rain',502:'Heavy Rain',
+  503:'Heavy Rain',504:'Extrm Rain',
+  511:'Frzng Rain',
+  520:'Lt Showers',521:'Showers',522:'Hvy Shwrs',531:'Showers',
+  600:'Light Snow',601:'Snow',602:'Heavy Snow',
+  611:'Sleet',612:'Lt Sleet',613:'Shwr Sleet',
+  615:'Rain+Snow',616:'Rain+Snow',
+  620:'Lt Sn Shwr',621:'Snow Shwr',622:'Hvy Sn Shr',
+  701:'Mist',711:'Smoke',721:'Haze',
+  731:'Dust Swirl',741:'Fog',751:'Sand',761:'Dust',
+  762:'Volc. Ash',771:'Squalls',781:'Tornado',
+  800:'Clear Sky',
+  801:'Few Clouds',802:'Sctd Cloud',803:'Brkn Cloud',804:'Overcast',
+};
+
+function getConditionText(id, fallback) {
+  return COND_SHORT[id] || fallback.substring(0, 10);
+}
+
 async function fetchWeather() {
   log("Fetching weather...");
   try {
@@ -868,13 +894,11 @@ async function fetchWeather() {
     const data = await resp.json();
     const temp = Math.round(data.main.temp);
     weather_condMain = data.weather[0].main;
-    weather_cond = data.weather[0].description;
-    // Capitalize each word
-    weather_cond = weather_cond.replace(/\b\w/g, c => c.toUpperCase());
+    const condId = data.weather[0].id;
+    const rawDesc = data.weather[0].description;
+    weather_cond = getConditionText(condId, rawDesc);
     weather_str = `${temp}\u00B0F`;
-    log(`Weather: ${weather_str} — ${weather_cond} (${weather_condMain})`);
-    // Reset scrolling when weather changes
-    scrollState = { offset: 0, phase: 'pause_start', timer: 0 };
+    log(`Weather: ${weather_str} — ${weather_cond} (id:${condId}, raw:"${rawDesc}")`);
   } catch (e) {
     log(`Weather err: ${e.message}`, true);
     if (!weather_str) { weather_str = "N/A"; weather_cond = "No Data"; weather_condMain = ""; }
@@ -971,26 +995,8 @@ function composeWeatherScreen(dt, timestamp) {
   // Temperature next to icon
   drawText(weather_str, 12, 5, 0xFFFF00);
 
-  // Condition text — full width, below icon with a 2px gap
-  const condY = 13;
-  const condPixelW = weather_cond.length * CHAR_W;
-  const availW = 62;
-  if (condPixelW <= availW) {
-    drawText(weather_cond, 1, condY, 0xAAAAAA);
-  } else {
-    const maxScroll = condPixelW - availW + CHAR_W;
-    scrollState.timer += dt;
-    if (scrollState.phase === 'pause_start') {
-      scrollState.offset = 0;
-      if (scrollState.timer > 2.0) { scrollState.phase = 'scrolling'; scrollState.timer = 0; }
-    } else if (scrollState.phase === 'scrolling') {
-      scrollState.offset += dt * 15;
-      if (scrollState.offset >= maxScroll) { scrollState.offset = maxScroll; scrollState.phase = 'pause_end'; scrollState.timer = 0; }
-    } else if (scrollState.phase === 'pause_end') {
-      if (scrollState.timer > 1.5) { scrollState.phase = 'pause_start'; scrollState.timer = 0; scrollState.offset = 0; }
-    }
-    drawTextClipped(weather_cond, 1 - Math.floor(scrollState.offset), condY, 0xAAAAAA, 1, 62);
-  }
+  // Condition text — always fits (max 10 chars via COND_SHORT lookup)
+  drawText(weather_cond, 1, 13, 0xAAAAAA);
 
   // --- Separator (row 17) ---
   drawHLine(17, 0, 63, bg.sep);

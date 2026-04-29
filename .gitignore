@@ -1,7 +1,8 @@
-# Secrets (both directories)
+# Secrets (all directories)
 .env
 device/secrets.py
 device/credentials.json
+proxy/config.json
 
 # Python
 .venv/

@@ -13,6 +13,7 @@
 import time
 import gc
 import board
+import digitalio
 import terminalio
 import displayio
 from adafruit_matrixportal.matrixportal import MatrixPortal
@@ -39,14 +40,67 @@ WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 PLANE_CYCLE_SECS = 5
 
+# HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
+PROXY_HOST = "http://YOUR_PROXY_HOST:6590"
+
+# ---------------------------------------------------------------------------
+# Buttons — UP and DOWN on the Matrix Portal M4
+# ---------------------------------------------------------------------------
+btn_up = digitalio.DigitalInOut(board.BUTTON_UP)
+btn_up.switch_to_input(pull=digitalio.Pull.UP)
+btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
+btn_down.switch_to_input(pull=digitalio.Pull.UP)
+
+# Test plane data for button injection
+TEST_PLANES = [
+    {"call": "UAL1234", "alt": 35000, "spd": 450, "hdg": 270,
+     "origin": "BOS", "dest": "SFO", "type": "B739"},
+    {"call": "DAL567",  "alt": 28000, "spd": 420, "hdg": 180,
+     "origin": "BOS", "dest": "ATL", "type": "A321"},
+    {"call": "JBU42",   "alt": 18000, "spd": 380, "hdg": 90,
+     "origin": "BOS", "dest": "FLL", "type": "A320"},
+    {"call": "BAW213",  "alt": 38000, "spd": 490, "hdg": 45,
+     "origin": "BOS", "dest": "LHR", "type": "B789"},
+    {"call": "AAL100",  "alt": 32000, "spd": 440, "hdg": 250,
+     "origin": "BOS", "dest": "DFW", "type": "B738"},
+]
+_test_idx = 0
+
+def inject_test_plane():
+    """Inject a test plane via button press."""
+    global _test_idx, planes, showing_planes, plane_idx, last_plane_cycle
+    tp = TEST_PLANES[_test_idx % len(TEST_PLANES)]
+    _test_idx += 1
+    planes.append({
+        "call": tp["call"], "alt": tp["alt"],
+        "spd": tp["spd"], "hdg": tp["hdg"],
+    })
+    flight_cache[tp["call"]] = {
+        "origin": tp["origin"], "dest": tp["dest"], "type": tp["type"],
+    }
+    showing_planes = True
+    plane_idx = len(planes) - 1
+    last_plane_cycle = time.monotonic()
+    show_plane(planes[plane_idx])
+    print("Injected test plane:", tp["call"], tp["origin"], ">", tp["dest"])
+
+def clear_test_planes():
+    """Clear all planes and return to weather."""
+    global planes, showing_planes
+    planes = []
+    showing_planes = False
+    show_weather_tides()
+    print("Cleared planes — back to weather")
+
 # ---------------------------------------------------------------------------
 # Display setup — 64x32, using displayio directly for icons + text
 # ---------------------------------------------------------------------------
 mp = MatrixPortal(status_neopixel=board.NEOPIXEL, bit_depth=4, debug=False)
 
 # Clear MatrixPortal's default group so we manage our own layout
-while len(mp.splash) > 0:
-    mp.splash.pop()
+root = mp.display.root_group
+while len(root) > 0:
+    root.pop()
 
 display = mp.display
 FONT = terminalio.FONT
@@ -204,11 +258,23 @@ def icao_to_display(icao):
     """Convert ICAO airport code to 3-letter display code."""
     if not icao:
         return "???"
+    # US airports: KJFK → JFK
     if len(icao) == 4 and icao[0] == "K":
         return icao[1:]
+    # Canadian: CYYZ → YYZ
     if len(icao) == 4 and icao[:2] == "CY":
         return icao[1:]
-    return icao[:4]
+    # Lookup from airports.csv on disk
+    try:
+        with open("airports.csv", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(icao + ","):
+                    return line.split(",")[1]
+    except Exception:
+        pass
+    # Fallback: truncate to 3 chars
+    return icao[:3]
 
 COMPASS_DIRS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
@@ -241,108 +307,104 @@ def make_icon_tg(icon_data, width, height, color, x=0, y=0):
 # ---------------------------------------------------------------------------
 
 # Weather background palette: zone colors updated per-condition
-wx_bg_bmp = displayio.Bitmap(64, 32, 5)
-wx_bg_pal = displayio.Palette(5)
-wx_bg_pal[0] = 0x000000   # border
-wx_bg_pal[1] = 0x0A0503   # top zone (warm default)
-wx_bg_pal[2] = 0x080808   # condition zone
-wx_bg_pal[3] = 0x101820   # separator
-wx_bg_pal[4] = 0x050301   # tide zone
+# Weather background — black everywhere except tide zone for waves
+wx_bg_bmp = displayio.Bitmap(64, 32, 2)
+wx_bg_pal = displayio.Palette(2)
+wx_bg_pal[0] = 0x000000   # black
+wx_bg_pal[1] = 0x020608   # tide zone (dark blue, behind waves)
 
-# Paint the weather background zones
 for y in range(32):
     for x in range(64):
-        if x == 0 or x == 63 or y == 0 or y == 31:
-            wx_bg_bmp[x, y] = 0  # border
-        elif y <= 9:
-            wx_bg_bmp[x, y] = 1  # top zone
-        elif y <= 18:
-            wx_bg_bmp[x, y] = 2  # condition zone
-        elif y == 19:
-            wx_bg_bmp[x, y] = 3  # separator
-        else:
-            wx_bg_bmp[x, y] = 4  # tide zone
+        wx_bg_bmp[x, y] = 1 if y >= 18 else 0
 
 wx_bg_tg = displayio.TileGrid(wx_bg_bmp, pixel_shader=wx_bg_pal, x=0, y=0)
 
-# Plane background palette
-pl_bg_bmp = displayio.Bitmap(64, 32, 5)
-pl_bg_pal = displayio.Palette(5)
-pl_bg_pal[0] = 0x050810   # border
-pl_bg_pal[1] = 0x020412   # callsign zone
-pl_bg_pal[2] = 0x08101E   # separator lines
-pl_bg_pal[3] = 0x02060E   # alt zone
-pl_bg_pal[4] = 0x01030A   # speed zone
+# Wave overlay: 128px wide bitmap that scrolls horizontally for animation
+# Only covers the tide zone (rows 18-30, mapped to wave bitmap rows 0-12)
+import math
+WAVE_W = 128  # wider than display so we can scroll
+WAVE_H = 13   # rows 18-30
+wave_bmp = displayio.Bitmap(WAVE_W, WAVE_H, 4)
+wave_pal = displayio.Palette(4)
+wave_pal[0] = 0x000000
+wave_pal.make_transparent(0)
+wave_pal[1] = 0x0E2840   # wave crest
+wave_pal[2] = 0x061830   # wave body
+wave_pal[3] = 0x030C18   # wave deep
+
+for x in range(WAVE_W):
+    wave = math.sin(x * 0.14) * 2 + math.sin(x * 0.09 + 2.0) * 1.5
+    surface = 3 + wave  # relative to wave bitmap top
+    for y in range(WAVE_H):
+        if 3 <= y <= 11:
+            # Darkened strip for tide text — skip wave drawing
+            wave_bmp[x, y] = 0  # transparent (shows bg color beneath)
+        elif y < surface:
+            wave_bmp[x, y] = 1  # crest
+        elif y < surface + 2:
+            wave_bmp[x, y] = 2  # body
+        else:
+            wave_bmp[x, y] = 3  # deep
+
+wave_tg = displayio.TileGrid(wave_bmp, pixel_shader=wave_pal, x=0, y=18)
+_wave_offset = 0
+
+# Plane background palette — includes logo box zone + content zones
+# Palette: 0=navy dark, 1=logo fill (updated per airline), 2=logo border,
+#          3=separator, 4=content zone, 5=accent bar
+# Plane background — logo box on left, black everywhere else
+pl_bg_bmp = displayio.Bitmap(64, 32, 3)
+pl_bg_pal = displayio.Palette(3)
+pl_bg_pal[0] = 0x000000   # black background
+pl_bg_pal[1] = 0x0055A4   # logo fill (updated per airline)
+pl_bg_pal[2] = 0x002244   # logo border (updated per airline)
 
 for y in range(32):
     for x in range(64):
-        if x == 0 or x == 63 or y == 0 or y == 31:
-            pl_bg_bmp[x, y] = 0
-        elif y <= 9:
-            pl_bg_bmp[x, y] = 1
-        elif y == 10 or y == 21:
-            pl_bg_bmp[x, y] = 2
-        elif y <= 20:
-            pl_bg_bmp[x, y] = 3
+        if x < 14:
+            # Logo box
+            if x == 0 or x == 13 or y == 0 or y == 31:
+                pl_bg_bmp[x, y] = 2  # border
+            else:
+                pl_bg_bmp[x, y] = 1  # fill
         else:
-            pl_bg_bmp[x, y] = 4
+            pl_bg_bmp[x, y] = 0  # black
 
 pl_bg_tg = displayio.TileGrid(pl_bg_bmp, pixel_shader=pl_bg_pal, x=0, y=0)
 
-# Weather condition -> background color palette mapping
-WEATHER_BG = {
-    "Clear":        (0x191003, 0x0D0A05, 0x140E05, 0x32230A, 0x191003),
-    "Clouds":       (0x080A12, 0x04050A, 0x0C0F19, 0x141928, 0x080A12),
-    "Rain":         (0x030614, 0x01030C, 0x050A1E, 0x0A1432, 0x030614),
-    "Drizzle":      (0x030614, 0x01030C, 0x050A1E, 0x0A1432, 0x030614),
-    "Snow":         (0x0A0C12, 0x05060A, 0x0F1219, 0x191C28, 0x0A0C12),
-    "Thunderstorm": (0x0F0514, 0x06020A, 0x14081C, 0x230F2D, 0x0F0514),
-}
-
-def update_weather_bg(cond_main):
-    """Update weather background palette colors for the condition."""
-    colors = WEATHER_BG.get(cond_main, (0x080808, 0x040405, 0x0C0C0F, 0x141419, 0x080808))
-    for i in range(5):
-        wx_bg_pal[i] = colors[i]
 
 def update_plane_bg(airline_color):
-    """Tint the plane background with a dim version of the airline color."""
+    """Update plane background with airline branding."""
     r = ((airline_color >> 16) & 0xFF)
     g = ((airline_color >> 8) & 0xFF)
     b = (airline_color & 0xFF)
-    # Very dim tint for airline zone
-    pl_bg_pal[1] = ((r >> 4) << 16) | ((g >> 4) << 8) | (b >> 4)
+    pl_bg_pal[1] = airline_color
+    pl_bg_pal[2] = ((r >> 2) << 16) | ((g >> 2) << 8) | (b >> 2)
 
 # Route cache: callsign -> {"origin": "BOS", "dest": "JFK"}
 flight_cache = {}
 _FLIGHT_CACHE_MAX = 10
 
-def fetch_route(callsign):
-    """Fetch route info for a callsign from OpenSky. Caches results."""
+def fetch_route(callsign, icao24=""):
+    """Fetch route + aircraft type via proxy. Caches results."""
     if callsign in flight_cache:
         return flight_cache[callsign]
     gc.collect()
-    url = "https://opensky-network.org/api/routes?callsign={}".format(callsign)
-    headers = {}
-    if OPENSKY_USER and OPENSKY_PASS:
-        import binascii
-        cred = binascii.b2a_base64(
-            "{}:{}".format(OPENSKY_USER, OPENSKY_PASS).encode()
-        ).decode().strip()
-        headers["Authorization"] = "Basic " + cred
-    info = {"origin": "???", "dest": "???"}
+    url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
+    if icao24:
+        url += "&icao24={}".format(icao24)
+    info = {"origin": "???", "dest": "???", "type": ""}
     try:
-        if headers:
-            resp = mp.network.fetch(url, headers=headers)
-        else:
-            resp = mp.network.fetch(url)
+        resp = mp.network.fetch(url)
         data = resp.json()
         resp.close()
         route = data.get("route", [])
         if route:
             info["origin"] = icao_to_display(route[0])
             info["dest"] = icao_to_display(route[-1])
-        print("Route {}: {} -> {}".format(callsign, info["origin"], info["dest"]))
+        info["type"] = data.get("typecode", "")
+        print("Route {}: {} -> {} ({})".format(
+            callsign, info["origin"], info["dest"], info["type"]))
     except Exception as e:
         print("Route err for {}: {}".format(callsign, e))
     # Evict oldest if cache full
@@ -358,31 +420,44 @@ weather_group = displayio.Group()
 # Background first (behind everything)
 weather_group.append(wx_bg_tg)
 
+# Wave overlay (tide zone animation)
+weather_group.append(wave_tg)
+
 # Weather icon (8x8, will be rebuilt when condition changes)
-wx_icon_tg, wx_icon_bmp, wx_icon_pal = make_icon_tg(ICON_SUN, 8, 8, 0xFFCC00, x=1, y=1)
+wx_icon_tg, wx_icon_bmp, wx_icon_pal = make_icon_tg(ICON_SUN, 8, 8, 0xFFCC00, x=2, y=1)
 weather_group.append(wx_icon_tg)
 
 # Temperature label
-temp_label = Label(FONT, text="", color=0xFFFF00, x=11, y=5)
+temp_label = Label(FONT, text="", color=0xFFFF00, x=12, y=5)
 weather_group.append(temp_label)
 
-# Condition label (scrolling handled manually)
-cond_label = Label(FONT, text="", color=0xBBBBBB, x=1, y=14)
+# Condition label
+cond_label = Label(FONT, text="", color=0xAAAAAA, x=1, y=13)
 weather_group.append(cond_label)
 
-# Tide arrow (5x7)
-tide_arrow_tg, tide_arrow_bmp, tide_arrow_pal = make_icon_tg(ARROW_UP, 5, 7, 0x00CCFF, x=2, y=22)
+# Tide arrow (5x7) — positioned in wave zone
+tide_arrow_tg, tide_arrow_bmp, tide_arrow_pal = make_icon_tg(ARROW_UP, 5, 7, 0x00EEFF, x=3, y=22)
 weather_group.append(tide_arrow_tg)
 
-# Tide label
-tide_label = Label(FONT, text="", color=0x00CCFF, x=9, y=25)
+# Tide label — in wave zone
+tide_label = Label(FONT, text="", color=0x00EEFF, x=10, y=25)
 weather_group.append(tide_label)
 
 # --- Plane screen group ---
 plane_group = displayio.Group()
 
-# Background first
+# Background first (includes logo box)
 plane_group.append(pl_bg_tg)
+
+# IATA code label inside logo box (centered in 14x32 area)
+logo_label = Label(FONT, text="", color=0xFFFFFF, x=2, y=16)
+plane_group.append(logo_label)
+
+# Mini plane icon between origin and dest (5x3, built as 1-bit bitmap)
+ICON_MINI_PLANE = bytes([0b00100000, 0b11111000, 0b00100000])
+mini_plane_tg, _, _ = make_icon_tg(ICON_MINI_PLANE, 5, 3, 0xCCCCCC, x=0, y=0)
+mini_plane_tg.hidden = True
+plane_group.append(mini_plane_tg)
 
 # Row 1: Route (right of logo area)
 route_label = Label(FONT, text="", color=0xFFFFFF, x=16, y=4)
@@ -392,16 +467,17 @@ plane_group.append(route_label)
 airline_label = Label(FONT, text="", color=0x00FF00, x=16, y=12)
 plane_group.append(airline_label)
 
-# Row 3: Aircraft type
-type_label = Label(FONT, text="", color=0x55AADD, x=16, y=20)
+# Aircraft type icon (8x8, reused for jet/prop/heli)
+ac_icon_tg, ac_icon_bmp, ac_icon_pal = make_icon_tg(ICON_PLANE, 8, 8, 0x66AACC, x=16, y=17)
+plane_group.append(ac_icon_tg)
+
+# Row 3: Aircraft type text (after icon)
+type_label = Label(FONT, text="", color=0x55AADD, x=25, y=20)
 plane_group.append(type_label)
 
-# Row 4: Altitude (left) + Callsign (right)
+# Row 4: Altitude
 alt_label = Label(FONT, text="", color=0x44AA44, x=16, y=28)
 plane_group.append(alt_label)
-
-call_label = Label(FONT, text="", color=0x555566, x=40, y=28)
-plane_group.append(call_label)
 
 # --- Loading screen group ---
 loading_group = displayio.Group()
@@ -437,10 +513,6 @@ last_sky_fetch = -OPENSKY_INTERVAL
 last_plane_cycle = 0
 current_screen = "loading"  # "loading", "weather", "plane"
 
-# Scrolling state for condition text
-scroll_offset = 0
-scroll_phase = "pause_start"
-scroll_timer = 0.0
 
 # ---------------------------------------------------------------------------
 # Icon update helper
@@ -461,7 +533,7 @@ def update_weather_icon(cond_main):
     elif cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"):
         color = 0x888888
     else:
-        color = 0xAAAAAAA
+        color = 0xAAAAAA
     wx_icon_pal[1] = color
     for row in range(8):
         byte = icon_data[row]
@@ -494,8 +566,22 @@ def switch_screen(name):
 # API helpers
 # ---------------------------------------------------------------------------
 
+def get_condition_text(cond_id, fallback):
+    """Look up short condition text from conditions.csv on disk."""
+    cid = str(cond_id)
+    try:
+        with open("conditions.csv", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(cid + ","):
+                    return line.split(",", 1)[1]
+    except Exception:
+        pass
+    return fallback[:10]
+
+
 def fetch_weather():
-    global weather_str, weather_cond, weather_cond_main, scroll_offset, scroll_phase, scroll_timer
+    global weather_str, weather_cond, weather_cond_main
     gc.collect()
     url = (
         "https://api.openweathermap.org/data/2.5/weather"
@@ -507,15 +593,11 @@ def fetch_weather():
         resp.close()
         temp = int(round(data["main"]["temp"]))
         weather_cond_main = data["weather"][0]["main"]
-        weather_cond = data["weather"][0].get("description", weather_cond_main)
-        # Capitalize words
-        weather_cond = " ".join(w.capitalize() for w in weather_cond.split())
+        cond_id = data["weather"][0].get("id", 0)
+        raw_desc = data["weather"][0].get("description", weather_cond_main)
+        weather_cond = get_condition_text(cond_id, raw_desc)
         weather_str = "{}{}F".format(temp, chr(176))  # degree symbol
         print("Weather:", weather_str, "-", weather_cond)
-        # Reset scrolling
-        scroll_offset = 0
-        scroll_phase = "pause_start"
-        scroll_timer = 0.0
     except Exception as e:
         print("Weather err:", e)
         if not weather_str:
@@ -572,22 +654,9 @@ def fetch_planes():
     lamax = LAT + BBOX
     lomin = LON - BBOX
     lomax = LON + BBOX
-    url = (
-        "https://opensky-network.org/api/states/all"
-        "?lamin={}&lomin={}&lamax={}&lomax={}"
-    ).format(lamin, lomin, lamax, lomax)
-    headers = {}
-    if OPENSKY_USER and OPENSKY_PASS:
-        import binascii
-        cred = binascii.b2a_base64(
-            "{}:{}".format(OPENSKY_USER, OPENSKY_PASS).encode()
-        ).decode().strip()
-        headers["Authorization"] = "Basic " + cred
+    url = "{}/api/planes".format(PROXY_HOST)
     try:
-        if headers:
-            resp = mp.network.fetch(url, headers=headers)
-        else:
-            resp = mp.network.fetch(url)
+        resp = mp.network.fetch(url)
         data = resp.json()
         resp.close()
         states = data.get("states") or []
@@ -604,6 +673,7 @@ def fetch_planes():
             hdg = int(s[10] or 0)
             planes.append({
                 "call": callsign[:8],
+                "icao24": s[0] or "",
                 "alt": alt_ft,
                 "spd": vel_kt,
                 "hdg": hdg,
@@ -624,17 +694,12 @@ def fetch_planes():
 
 def show_weather_tides():
     switch_screen("weather")
-    # Update background colors for weather condition
-    update_weather_bg(weather_cond_main)
     # Update icon
     update_weather_icon(weather_cond_main)
     # Update temp
     temp_label.text = weather_str
-    # Update condition (truncate for now; scrolling handled in main loop)
-    if len(weather_cond) <= 10:
-        cond_label.text = weather_cond
-    else:
-        cond_label.text = weather_cond[:10]
+    # Condition text always fits (max 10 chars from conditions.csv)
+    cond_label.text = weather_cond
     # Update tide
     if tide_type_val:
         update_tide_arrow(tide_type_val)
@@ -658,7 +723,7 @@ def get_displayable_planes():
     for p in planes:
         # Try fetching route if not cached
         if p["call"] not in flight_cache:
-            fetch_route(p["call"])
+            fetch_route(p["call"], p.get("icao24", ""))
         if has_route(p["call"]):
             result.append(p)
     return result
@@ -669,30 +734,45 @@ def show_plane(plane):
     callsign = plane["call"]
     name, iata, color = get_airline_info(callsign)
 
-    # Tint background
+    # Update background with airline branding
     update_plane_bg(color)
+
+    # Logo: IATA code centered in logo box
+    logo_label.text = iata
+    # Center 2 chars (12px) in 14px box
+    logo_label.x = 1 + (14 - len(iata) * 6) // 2
+    # Contrast: white or black text based on color brightness
+    bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
+    logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
 
     route = flight_cache.get(callsign, {})
     origin = route.get("origin", "")
     dest = route.get("dest", "")
 
-    # Row 1: Route
-    route_label.text = "{} > {}".format(origin, dest)
-    route_label.color = 0xFFFFFF
+    # Row 1: Route with mini plane icon
+    route_label.text = origin
+    route_label.x = 16
+    # Position mini plane after origin text
+    icon_x = 16 + len(origin) * 6 + 1
+    mini_plane_tg.x = icon_x
+    mini_plane_tg.y = 3
+    mini_plane_tg.hidden = False
+    # Dest label reuses airline_label... no, we need a separate label
+    # Use a combined string approach instead
+    route_label.text = "{}>{}".format(origin, dest)
+    mini_plane_tg.hidden = True  # text ">" is simpler for now
 
     # Row 2: Airline name
     airline_label.text = name[:8]
     airline_label.color = color
 
-    # Row 3: Altitude + heading
-    alt_k = plane["alt"] // 1000
-    compass = heading_to_compass(plane["hdg"])
-    type_label.text = "{}Kft {}".format(alt_k, compass)
+    # Row 3: Aircraft type (if available)
+    ac_type = route.get("type", "")
+    type_label.text = ac_type if ac_type else ""
 
-    # Row 4: Callsign
-    alt_label.text = ""
-    call_label.text = callsign
-    call_label.x = max(16, 64 - len(callsign) * 6)
+    # Row 4: Altitude (hide if invalid/ground level)
+    alt_k = plane["alt"] // 1000
+    alt_label.text = "{}Kft".format(alt_k) if alt_k > 0 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -735,25 +815,17 @@ while True:
             show_plane(display_planes[plane_idx])
             last_plane_cycle = now
 
-    # --- Scroll condition text (weather screen only) ---
-    if not showing_planes and len(weather_cond) > 10:
-        scroll_timer += 1.0  # ~1 sec per tick
-        max_scroll = len(weather_cond) - 10
-        if scroll_phase == "pause_start":
-            cond_label.text = weather_cond[:10]
-            if scroll_timer > 2:
-                scroll_phase = "scrolling"
-                scroll_timer = 0
-        elif scroll_phase == "scrolling":
-            scroll_offset = min(scroll_offset + 1, max_scroll)
-            cond_label.text = weather_cond[scroll_offset:scroll_offset + 10]
-            if scroll_offset >= max_scroll:
-                scroll_phase = "pause_end"
-                scroll_timer = 0
-        elif scroll_phase == "pause_end":
-            if scroll_timer > 2:
-                scroll_phase = "pause_start"
-                scroll_timer = 0
-                scroll_offset = 0
+    # Animate wave scroll on weather screen (shift 1px every tick)
+    if not showing_planes:
+        _wave_offset = (_wave_offset + 1) % (WAVE_W - 64)
+        wave_tg.x = -_wave_offset
+
+    # --- Button handling ---
+    if not btn_down.value:  # pressed (active low)
+        inject_test_plane()
+        time.sleep(0.3)  # debounce
+    if not btn_up.value:
+        clear_test_planes()
+        time.sleep(0.3)
 
     time.sleep(1)
