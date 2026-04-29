@@ -40,6 +40,7 @@ if CONFIG_FILE.exists():
 
 OPENSKY_USER = _config.get("opensky_user", "")
 OPENSKY_PASS = _config.get("opensky_pass", "")
+OWM_KEY = _config.get("openweather_key", "")
 LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
@@ -202,6 +203,78 @@ def handle_aircraft(params):
     return 404, json.dumps({"error": "aircraft not found", "icao24": icao24}).encode()
 
 
+def handle_forecast(params):
+    """Fetch tomorrow's weather from OpenWeatherMap 5-day forecast.
+    Groups 3-hour intervals by date, returns tomorrow's hi/lo/condition.
+    Cached for 1 hour."""
+
+    cache_key = "forecast"
+    cached = cache_get(cache_key, max_age_sec=3600)
+    if cached:
+        return 200, cached
+
+    if not OWM_KEY:
+        return 500, json.dumps({"error": "no openweather_key configured"}).encode()
+
+    lat = float(params.get("lat", [LATITUDE])[0])
+    lon = float(params.get("lon", [LONGITUDE])[0])
+    url = (
+        f"https://api.openweathermap.org/data/2.5/forecast"
+        f"?lat={lat}&lon={lon}&appid={OWM_KEY}&units=imperial"
+    )
+    status, data = fetch(url)
+    if status != 200 or not data:
+        return status, data or json.dumps({"error": "forecast fetch failed"}).encode()
+
+    try:
+        forecast = json.loads(data)
+        items = forecast.get("list", [])
+
+        # Find tomorrow's date
+        import datetime
+        today = datetime.date.today()
+        tomorrow = today + datetime.timedelta(days=1)
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+
+        hi = -999
+        lo = 999
+        conditions = {}
+        cond_id = 800  # default clear
+
+        for item in items:
+            dt_txt = item.get("dt_txt", "")
+            if dt_txt.startswith(tomorrow_str):
+                temp = item["main"]["temp"]
+                if temp > hi:
+                    hi = temp
+                if temp < lo:
+                    lo = temp
+                # Track most common condition
+                cid = item["weather"][0]["id"]
+                cmain = item["weather"][0]["main"]
+                conditions[cmain] = conditions.get(cmain, 0) + 1
+                cond_id = cid  # use last one, or most severe
+
+        if hi == -999:
+            return 404, json.dumps({"error": "no forecast data for tomorrow"}).encode()
+
+        # Pick most common condition
+        most_common = max(conditions, key=conditions.get) if conditions else "Clear"
+
+        result = {
+            "hi": round(hi),
+            "lo": round(lo),
+            "cond": most_common,
+            "cond_id": cond_id,
+            "date": tomorrow_str,
+        }
+        body = json.dumps(result).encode()
+        cache_set(cache_key, body)
+        return 200, body
+    except Exception as e:
+        return 500, json.dumps({"error": str(e)}).encode()
+
+
 def handle_health(params):
     """Health check endpoint."""
     return 200, json.dumps({
@@ -219,6 +292,7 @@ ROUTES = {
     "/api/planes":    handle_planes,
     "/api/route":     handle_route,
     "/api/aircraft":  handle_aircraft,
+    "/api/forecast":  handle_forecast,
     "/api/health":    handle_health,
 }
 
