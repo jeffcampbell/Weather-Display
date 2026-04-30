@@ -12,6 +12,7 @@
 
 import time
 import gc
+import math
 import board
 import digitalio
 import terminalio
@@ -58,86 +59,17 @@ btn_up.switch_to_input(pull=digitalio.Pull.UP)
 btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
 btn_down.switch_to_input(pull=digitalio.Pull.UP)
 
-# Test plane data for button injection
-# Debug weather presets — cycle with DOWN button when PLANES_ENABLED=False
-TEST_WEATHER = [
-    {"temp": "72°F", "cond": "Clear Sky", "main": "Clear",
-     "wind": "5mph SW", "wind_spd": 5, "tide_level": 0.8},
-    {"temp": "55°F", "cond": "Heavy Rain", "main": "Rain",
-     "wind": "22mph NE", "wind_spd": 22, "tide_level": 0.3},
-    {"temp": "28°F", "cond": "Snow", "main": "Snow",
-     "wind": "12mph N", "wind_spd": 12, "tide_level": 0.5},
-    {"temp": "65°F", "cond": "Sctd Cloud", "main": "Clouds",
-     "wind": "8mph E", "wind_spd": 8, "tide_level": 0.9},
-    {"temp": "80°F", "cond": "Thndrstm", "main": "Thunderstorm",
-     "wind": "25mph S", "wind_spd": 25, "tide_level": 0.1},
-    {"temp": "60°F", "cond": "Fog", "main": "Fog",
-     "wind": "2mph W", "wind_spd": 2, "tide_level": 0.6},
-]
-_test_wx_idx = 0
-
-def inject_test_weather():
-    """Cycle through test weather presets."""
-    global _test_wx_idx, weather_str, weather_cond, weather_cond_main
-    global wind_str, _wind_speed, _tide_level
-    tw = TEST_WEATHER[_test_wx_idx % len(TEST_WEATHER)]
-    _test_wx_idx += 1
-    weather_str = tw["temp"]
-    weather_cond = tw["cond"]
-    weather_cond_main = tw["main"]
-    wind_str = tw["wind"]
-    _wind_speed = tw["wind_spd"]
-    _tide_level = tw["tide_level"]
-    show_weather_tides()
-    print("Test weather:", tw["temp"], tw["cond"], "wind:", tw["wind"],
-          "tide:", tw["tide_level"])
-
+# Button handlers — no-ops in production, saves ~3KB RAM
+def inject_test_weather(): pass
+def inject_test_plane(): pass
 def reset_to_live():
-    """Force a live data refresh."""
     global last_weather_fetch
     last_weather_fetch = -WEATHER_INTERVAL
-    print("Reset to live data — will refresh next tick")
-
-TEST_PLANES = [
-    {"call": "UAL1234", "alt": 35000, "spd": 450, "hdg": 270,
-     "origin": "BOS", "dest": "SFO", "type": "B739"},
-    {"call": "DAL567",  "alt": 28000, "spd": 420, "hdg": 180,
-     "origin": "BOS", "dest": "ATL", "type": "A321"},
-    {"call": "JBU42",   "alt": 18000, "spd": 380, "hdg": 90,
-     "origin": "BOS", "dest": "FLL", "type": "A320"},
-    {"call": "BAW213",  "alt": 38000, "spd": 490, "hdg": 45,
-     "origin": "BOS", "dest": "LHR", "type": "B789"},
-    {"call": "AAL100",  "alt": 32000, "spd": 440, "hdg": 250,
-     "origin": "BOS", "dest": "DFW", "type": "B738"},
-]
-_test_idx = 0
-
-def inject_test_plane():
-    """Inject a test plane via button press."""
-    global _test_idx, planes, showing_planes, plane_idx, last_plane_cycle
-    tp = TEST_PLANES[_test_idx % len(TEST_PLANES)]
-    _test_idx += 1
-    planes.append({
-        "call": tp["call"], "icao24": "", "alt": tp["alt"],
-        "spd": tp["spd"], "hdg": tp["hdg"], "vrate": 5,
-    })
-    flight_cache[tp["call"]] = {
-        "origin": tp["origin"], "dest": tp["dest"],
-        "type": tp["type"], "reg": tp.get("reg", "N12345"),
-    }
-    showing_planes = True
-    plane_idx = len(planes) - 1
-    last_plane_cycle = time.monotonic()
-    show_plane(planes[plane_idx])
-    print("Injected test plane:", tp["call"], tp["origin"], ">", tp["dest"])
-
 def clear_test_planes():
-    """Clear all planes and return to weather."""
     global planes, showing_planes
     planes = []
     showing_planes = False
     show_weather_tides()
-    print("Cleared planes — back to weather")
 
 # ---------------------------------------------------------------------------
 # Display setup — 64x32, using displayio directly for icons + text
@@ -220,16 +152,6 @@ ICON_FOG = bytes([
     0b00000000,
     0b01111100,
 ])
-ICON_PLANE = bytes([
-    0b00010000,
-    0b00010000,
-    0b00111000,
-    0b01111100,
-    0b11111110,
-    0b00010000,
-    0b00111000,
-    0b00010000,
-])
 # Arrow bitmaps (5 wide in 8-bit byte, left-aligned)
 ARROW_UP = bytes([
     0b00100000,
@@ -252,23 +174,13 @@ ARROW_DOWN = bytes([
 # fmt: on
 
 # Weather condition -> icon mapping
-WEATHER_ICONS = {
-    "Clear": ICON_SUN,
-    "Clouds": ICON_CLOUD,
-    "Rain": ICON_RAIN,
-    "Drizzle": ICON_RAIN,
-    "Snow": ICON_SNOW,
-    "Thunderstorm": ICON_STORM,
-    "Mist": ICON_FOG,
-    "Smoke": ICON_FOG,
-    "Haze": ICON_FOG,
-    "Dust": ICON_FOG,
-    "Fog": ICON_FOG,
-    "Sand": ICON_FOG,
-    "Ash": ICON_FOG,
-    "Squall": ICON_FOG,
-    "Tornado": ICON_FOG,
-}
+def _get_icon_for(cond):
+    if cond == "Clear": return ICON_SUN
+    if cond == "Clouds": return ICON_CLOUD
+    if cond in ("Rain", "Drizzle"): return ICON_RAIN
+    if cond == "Snow": return ICON_SNOW
+    if cond == "Thunderstorm": return ICON_STORM
+    return ICON_FOG
 
 # Airline lookup — reads from airlines.csv on disk, caches only recent entries
 # Saves ~6 KB RAM vs inline dict on SAMD51
@@ -359,8 +271,6 @@ def make_icon_tg(icon_data, width, height, color, x=0, y=0):
 # Tide water column (x=0-13, full height y=0-31)
 # Water fills from bottom based on tide level, no border/walls
 # ---------------------------------------------------------------------------
-import math
-
 BASIN_W = 20   # full left column width
 BASIN_H = 32   # full display height
 # Palette: 0=black, 1=water deep, 2=water mid, 3=water surface, 4=arrow(white)
@@ -451,7 +361,7 @@ def interpolate_tide_level():
     prev_tide = None
     next_tide = None
     for i, p in enumerate(_tide_predictions):
-        if p["mins"] >= now_mins:
+        if p[0] >= now_mins:
             next_tide = p
             if i > 0:
                 prev_tide = _tide_predictions[i - 1]
@@ -463,16 +373,16 @@ def interpolate_tide_level():
         return
 
     # Progress between previous and next tide
-    span = next_tide["mins"] - prev_tide["mins"]
+    span = next_tide[0] - prev_tide[0]
     if span <= 0:
         _tide_level = 0.5
         return
-    progress = (now_mins - prev_tide["mins"]) / span
+    progress = (now_mins - prev_tide[0]) / span
 
     # Rising (prev=L, next=H) or falling (prev=H, next=L)
-    if prev_tide["type"] == "L" and next_tide["type"] == "H":
+    if prev_tide[1] == "L" and next_tide[1] == "H":
         _tide_level = progress  # 0→1
-    elif prev_tide["type"] == "H" and next_tide["type"] == "L":
+    elif prev_tide[1] == "H" and next_tide[1] == "L":
         _tide_level = 1.0 - progress  # 1→0
     else:
         _tide_level = 0.5
@@ -481,22 +391,18 @@ def interpolate_tide_level():
 # Palette: 0=navy dark, 1=logo fill (updated per airline), 2=logo border,
 #          3=separator, 4=content zone, 5=accent bar
 # Plane background — logo box on left, black everywhere else
-pl_bg_bmp = displayio.Bitmap(64, 32, 3)
+pl_bg_bmp = displayio.Bitmap(14, 32, 3)
 pl_bg_pal = displayio.Palette(3)
-pl_bg_pal[0] = 0x000000   # black background
+pl_bg_pal[0] = 0x000000
 pl_bg_pal[1] = 0x0055A4   # logo fill (updated per airline)
 pl_bg_pal[2] = 0x002244   # logo border (updated per airline)
 
 for y in range(32):
-    for x in range(64):
-        if x < 14:
-            # Logo box
-            if x == 0 or x == 13 or y == 0 or y == 31:
-                pl_bg_bmp[x, y] = 2  # border
-            else:
-                pl_bg_bmp[x, y] = 1  # fill
+    for x in range(14):
+        if x == 0 or x == 13 or y == 0 or y == 31:
+            pl_bg_bmp[x, y] = 2
         else:
-            pl_bg_bmp[x, y] = 0  # black
+            pl_bg_bmp[x, y] = 1
 
 pl_bg_tg = displayio.TileGrid(pl_bg_bmp, pixel_shader=pl_bg_pal, x=0, y=0)
 
@@ -648,9 +554,6 @@ wind_str = ""
 _wind_speed = 0  # mph, drives wave animation intensity
 _sunrise_mins = 5 * 60 + 30   # default 5:30 AM
 _sunset_mins = 19 * 60 + 30   # default 7:30 PM
-forecast_hi = ""
-forecast_lo = ""
-forecast_cond = ""
 ships = []
 ship_idx = 0
 last_ship_fetch = -SHIP_INTERVAL
@@ -671,7 +574,7 @@ current_screen = "loading"  # "loading", "weather", "plane"
 
 def update_weather_icon(cond_main):
     """Rebuild the weather icon bitmap for the given condition."""
-    icon_data = WEATHER_ICONS.get(cond_main, ICON_CLOUD)
+    icon_data = _get_icon_for(cond_main)
     # Determine icon color based on condition
     if cond_main == "Clear":
         color = 0xFFCC00
@@ -795,21 +698,15 @@ def fetch_tides():
             time_part = p["t"].split(" ")[1]
             h_str, m_str = time_part.split(":")
             h, m = int(h_str), int(m_str)
-            _tide_predictions.append({
-                "mins": h * 60 + m,
-                "type": p.get("type", ""),
-                "h": h, "m_str": m_str,
-            })
+            _tide_predictions.append((h * 60 + m, p.get("type", ""), h, m_str))
 
         # Find next upcoming tide
         found = False
         for p in _tide_predictions:
-            if p["mins"] >= now_mins:
-                tide_type_val = p["type"]
-                label = "HI" if tide_type_val == "H" else "LO"
-                ampm = "A" if p["h"] < 12 else "P"
-                h12 = p["h"] % 12 or 12
-                tide_str = "{}:{}".format(h12, p["m_str"])
+            if p[0] >= now_mins:
+                tide_type_val = p[1]
+                h12 = p[2] % 12 or 12
+                tide_str = "{}:{}".format(h12, p[3])
                 found = True
                 print("Tide:", label, tide_str)
                 break
@@ -825,26 +722,6 @@ def fetch_tides():
             tide_type_val = ""
     gc.collect()
 
-
-def fetch_forecast():
-    """Fetch tomorrow's forecast from proxy."""
-    global forecast_hi, forecast_lo, forecast_cond
-    gc.collect()
-    url = "{}/api/forecast".format(PROXY_HOST)
-    try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
-        forecast_hi = str(data.get("hi", ""))
-        forecast_lo = str(data.get("lo", ""))
-        forecast_cond = get_condition_text(
-            data.get("cond_id", 0),
-            data.get("cond", "")
-        )
-        print("Forecast:", forecast_hi, "/", forecast_lo, forecast_cond)
-    except Exception as e:
-        print("Forecast err:", e)
-    gc.collect()
 
 
 def fetch_planes():
@@ -904,6 +781,10 @@ def _center_mid(label, text):
     tw = len(text) * 5
     label.x = _RIGHT_START + (_RIGHT_W - tw) // 2
 
+def _center_ship(label, text):
+    label.text = text
+    label.x = 16 + (48 - len(text) * 4) // 2
+
 def _center_small(label, text):
     """Center a small-font label (4px/char) in the right panel."""
     label.text = text
@@ -926,15 +807,6 @@ SHIP_TYPE_COLORS = {
 def get_ship_type_color(type_code):
     decade = type_code // 10 if type_code else 0
     return SHIP_TYPE_COLORS.get(decade, 0x666688)
-
-def get_ship_type_abbrev(type_name):
-    """Short abbreviation for left column."""
-    abbrevs = {
-        "Fishing": "FSH", "HighSpeed": "HSC", "Special": "SPL",
-        "Passenger": "PAX", "Cargo": "CGO", "Tanker": "TNK",
-        "Other": "OTH", "Vessel": "VES",
-    }
-    return abbrevs.get(type_name, "VES")
 
 
 def fetch_ships():
@@ -974,26 +846,20 @@ def show_ship(ship):
     # Clear large-font label
     route_label.text = ""
 
-    # Center helper for ship panel (x=16 to x=63, 48px wide, small font 4px/char)
-    def _ship_center(label, text):
-        label.text = text
-        tw = len(text) * 4
-        label.x = 16 + (48 - tw) // 2
-
     # Row 1: Ship name (small font, centered)
     logo_label.text = ""
-    _ship_center(airline_label, name[:12])
+    _center_ship(airline_label, name[:12])
     airline_label.color = 0xFFFFFF
     airline_label.y = 5
 
     # Row 2: Vessel type (centered)
-    _ship_center(reg_label, type_name)
+    _center_ship(reg_label, type_name)
     reg_label.color = color
     reg_label.y = 12
 
     # Row 3: Destination (centered)
     if dest:
-        _ship_center(alt_label, dest[:12])
+        _center_ship(alt_label, dest[:12])
     else:
         alt_label.text = ""
     alt_label.color = 0x888899
@@ -1009,7 +875,7 @@ def show_ship(ship):
         info = compass
     route_label.text = ""
     # Row 4: distance + heading (small font, centered)
-    _ship_center(actype_label, info)
+    _center_ship(actype_label, info)
     actype_label.color = 0x6699AA
     actype_label.y = 26
 
@@ -1136,13 +1002,13 @@ if SHIPS_TEST:
     print("SHIPS_TEST: injected", len(ships), "test ships, showing first")
 
 while True:
+    gc.collect()
     now = time.monotonic()
 
     # --- Weather + Tides + Forecast refresh ---
     if now - last_weather_fetch >= WEATHER_INTERVAL:
         fetch_weather()
         fetch_tides()
-        fetch_forecast()
         last_weather_fetch = now
         if not showing_planes:
             show_weather_tides()
@@ -1153,7 +1019,7 @@ while True:
         last_sky_fetch = now
 
     # Only show planes that have route data
-    display_planes = get_displayable_planes()
+    display_planes = get_displayable_planes() if PLANES_ENABLED else []
 
     if display_planes and not showing_planes:
         showing_planes = True
