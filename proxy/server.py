@@ -17,6 +17,8 @@ Usage:
 import json
 import os
 import time
+import asyncio
+import threading
 import urllib.request
 import urllib.error
 import base64
@@ -41,6 +43,7 @@ if CONFIG_FILE.exists():
 OPENSKY_USER = _config.get("opensky_user", "")
 OPENSKY_PASS = _config.get("opensky_pass", "")
 OWM_KEY = _config.get("openweather_key", "")
+AISSTREAM_KEY = _config.get("aisstream_key", "")
 LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
@@ -275,11 +278,158 @@ def handle_forecast(params):
         return 500, json.dumps({"error": str(e)}).encode()
 
 
+# ---------------------------------------------------------------------------
+# AIS Ship Tracking — WebSocket listener + HTTP endpoint
+# ---------------------------------------------------------------------------
+
+_ships = {}         # MMSI -> ship info dict
+_ships_lock = Lock()
+SHIP_STALE_SECS = 600  # remove ships not seen in 10 min
+SHIP_MIN_LENGTH = 30   # meters — filter out small vessels
+SHIP_CENTER_LAT = 42.142039  # center point for distance filter
+SHIP_CENTER_LON = -70.693353
+SHIP_MAX_MILES = 10    # only show ships within this radius
+
+AIS_TYPE_NAMES = {
+    3: "Fishing", 4: "HighSpeed", 5: "Special",
+    6: "Passenger", 7: "Cargo", 8: "Tanker", 9: "Other",
+}
+
+def get_ship_type(ais_type):
+    """Map AIS type integer (0-99) to category name."""
+    decade = ais_type // 10 if ais_type else 0
+    return AIS_TYPE_NAMES.get(decade, "Vessel")
+
+def _distance_miles(lat1, lon1, lat2, lon2):
+    """Approximate distance in miles between two lat/lon points."""
+    import math
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat/2)**2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon/2)**2)
+    return 3959 * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def _ais_listener():
+    """Background async loop: connect to AISStream WebSocket and track ships."""
+    import websockets
+
+    async def _listen():
+        while True:
+            try:
+                url = "wss://stream.aisstream.io/v0/stream"
+                subscribe = {
+                    "APIKey": AISSTREAM_KEY,
+                    "BoundingBoxes": [
+                        [[LATITUDE - 1.0, LONGITUDE - 1.0],
+                         [LATITUDE + 1.0, LONGITUDE + 1.0]]
+                    ],
+                    "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+                }
+                print(f"AIS: connecting to {url}...")
+                async with websockets.connect(url) as ws:
+                    await ws.send(json.dumps(subscribe))
+                    print("AIS: subscribed, listening for ships")
+                    async for msg_json in ws:
+                        try:
+                            msg = json.loads(msg_json)
+                            _process_ais_message(msg)
+                        except Exception as e:
+                            print(f"AIS parse err: {e}")
+            except Exception as e:
+                print(f"AIS connection err: {e}, reconnecting in 10s...")
+                await asyncio.sleep(10)
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(_listen())
+
+
+def _process_ais_message(msg):
+    """Process an AIS message and update the ships dict."""
+    msg_type = msg.get("MessageType", "")
+    meta = msg.get("MetaData", {})
+    message = msg.get("Message", {})
+
+    if msg_type == "PositionReport":
+        pos = message.get("PositionReport", {})
+        mmsi = str(pos.get("UserID", ""))
+        if not mmsi:
+            return
+        with _ships_lock:
+            ship = _ships.setdefault(mmsi, {"mmsi": mmsi})
+            ship["lat"] = pos.get("Latitude", 0)
+            ship["lon"] = pos.get("Longitude", 0)
+            ship["speed"] = round(pos.get("Sog", 0), 1)
+            ship["heading"] = int(pos.get("Cog", 0))
+            ship["last_seen"] = time.time()
+            # MetaData often has ship name
+            if meta.get("ShipName") and meta["ShipName"].strip():
+                ship["name"] = meta["ShipName"].strip()
+
+    elif msg_type == "ShipStaticData":
+        static = message.get("ShipStaticData", {})
+        mmsi = str(static.get("UserID", ""))
+        if not mmsi:
+            return
+        with _ships_lock:
+            ship = _ships.setdefault(mmsi, {"mmsi": mmsi})
+            name = static.get("Name", "").strip()
+            if name:
+                ship["name"] = name
+            ship["type"] = static.get("Type", 0)
+            ship["type_name"] = get_ship_type(static.get("Type", 0))
+            dest = static.get("Destination", "").strip()
+            if dest:
+                ship["destination"] = dest
+            ship["callsign"] = static.get("CallSign", "").strip()
+            dim = static.get("Dimension", {})
+            ship["length"] = (dim.get("A", 0) or 0) + (dim.get("B", 0) or 0)
+            ship["last_seen"] = time.time()
+
+
+def _prune_stale_ships():
+    """Remove ships not seen recently."""
+    now = time.time()
+    with _ships_lock:
+        stale = [k for k, v in _ships.items()
+                 if now - v.get("last_seen", 0) > SHIP_STALE_SECS]
+        for k in stale:
+            del _ships[k]
+
+
+def handle_ships(params):
+    """Return list of nearby ships — filtered by size and distance."""
+    _prune_stale_ships()
+    with _ships_lock:
+        ship_list = []
+        for s in _ships.values():
+            if not s.get("name"):
+                continue
+            # Minimum length filter
+            if s.get("length", 0) < SHIP_MIN_LENGTH:
+                continue
+            # Distance filter
+            lat = s.get("lat", 0)
+            lon = s.get("lon", 0)
+            if lat and lon:
+                dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
+                if dist > SHIP_MAX_MILES:
+                    continue
+                s["distance_mi"] = round(dist, 1)
+            ship_list.append(s)
+        # Sort by distance
+        ship_list.sort(key=lambda s: s.get("distance_mi", 999))
+    body = json.dumps({"ships": ship_list}).encode()
+    return 200, body
+
+
 def handle_health(params):
     """Health check endpoint."""
     return 200, json.dumps({
         "status": "ok",
         "cache_entries": len(_cache),
+        "ships_tracked": len(_ships),
         "uptime_approx": "use /api/health to verify proxy is reachable",
     }).encode()
 
@@ -293,6 +443,7 @@ ROUTES = {
     "/api/route":     handle_route,
     "/api/aircraft":  handle_aircraft,
     "/api/forecast":  handle_forecast,
+    "/api/ships":     handle_ships,
     "/api/health":    handle_health,
 }
 
@@ -336,6 +487,15 @@ if __name__ == "__main__":
     print(f"Config: {CONFIG_FILE}")
     print(f"Routes: {', '.join(ROUTES.keys())}")
     print(f"Location: {LATITUDE}, {LONGITUDE} (bbox {BBOX})")
+
+    # Start AIS WebSocket listener in background thread
+    if AISSTREAM_KEY:
+        ais_thread = threading.Thread(target=_ais_listener, daemon=True)
+        ais_thread.start()
+        print("AIS: WebSocket listener started")
+    else:
+        print("AIS: No aisstream_key configured, ship tracking disabled")
+
     server = HTTPServer(("", PORT), ProxyHandler)
     try:
         server.serve_forever()

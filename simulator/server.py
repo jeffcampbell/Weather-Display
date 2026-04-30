@@ -197,6 +197,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # --- /api/ships → proxy to Pi's ship endpoint ---
+        if self.path == "/api/ships":
+            status, data = proxy_get("http://YOUR_PROXY_HOST:6590/api/ships")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         # --- / → serve simulator.html ---
         if self.path == "/":
             self.path = "/simulator.html"

@@ -28,9 +28,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-NOAA_STATION = secrets.get("noaa_station", "8443970")
-LAT = float(secrets.get("latitude", 42.36))
-LON = float(secrets.get("longitude", -71.06))
+NOAA_STATION = secrets.get("noaa_station", "8445425")
+LAT = float(secrets.get("latitude", 42.142039))
+LON = float(secrets.get("longitude", -70.693353))
 OWM_KEY = secrets["openweather_key"]
 TIMEZONE = secrets.get("timezone", "America/New_York")
 OPENSKY_USER = secrets.get("opensky_user", "")
@@ -41,6 +41,11 @@ WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 PLANE_CYCLE_SECS = 5
 PLANES_ENABLED = False  # Set True to enable flight tracking
+SHIPS_ENABLED = True    # Set True to enable ship tracking
+SHIPS_TEST = True       # Set True to show a fake ship immediately
+SHIP_INTERVAL = 30      # poll for ships every 30 sec
+SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
+SHIP_DISPLAY_SECS = 10  # show ship for 10s in cycle
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
 PROXY_HOST = "http://YOUR_PROXY_HOST:6590"
@@ -146,7 +151,7 @@ while len(root) > 0:
 
 display = mp.display
 FONT = terminalio.FONT
-FONT_SMALL = bitmap_font.load_font("tom-thumb.bdf")
+FONT_SMALL = bitmap_font.load_font("4x6.bdf")
 FONT_MID = bitmap_font.load_font("5x8.bdf")
 
 # ---------------------------------------------------------------------------
@@ -356,7 +361,7 @@ def make_icon_tg(icon_data, width, height, color, x=0, y=0):
 # ---------------------------------------------------------------------------
 import math
 
-BASIN_W = 16   # full left column width
+BASIN_W = 20   # full left column width
 BASIN_H = 32   # full display height
 # Palette: 0=black, 1=water deep, 2=water mid, 3=water surface, 4=arrow(white)
 basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 5)
@@ -556,28 +561,28 @@ vsep_pal.make_transparent(0)
 vsep_pal[1] = 0x222233
 for r in range(32):
     vsep_bmp[0, r] = 1
-vsep_tg = displayio.TileGrid(vsep_bmp, pixel_shader=vsep_pal, x=16, y=0)
+vsep_tg = displayio.TileGrid(vsep_bmp, pixel_shader=vsep_pal, x=20, y=0)
 weather_group.append(vsep_tg)
 
 # RIGHT SIDE — 4 rows
 
 # Row 1 (y=4): Clock — mid font, white, prominent
-clock_label = Label(FONT_MID, text="", color=0xFFFFFF, x=18, y=4)
+clock_label = Label(FONT_MID, text="", color=0xFFFFFF, x=22, y=4)
 weather_group.append(clock_label)
 
 # Row 2 (y=12): Weather icon + temperature — mid font, bright yellow
-wx_icon_tg, wx_icon_bmp, wx_icon_pal = make_icon_tg(ICON_SUN, 8, 8, 0xFFCC00, x=18, y=9)
+wx_icon_tg, wx_icon_bmp, wx_icon_pal = make_icon_tg(ICON_SUN, 8, 8, 0xFFCC00, x=22, y=9)
 weather_group.append(wx_icon_tg)
 
-temp_label = Label(FONT_MID, text="", color=0xFFDD00, x=28, y=12)
+temp_label = Label(FONT_MID, text="", color=0xFFDD00, x=32, y=12)
 weather_group.append(temp_label)
 
 # Row 3 (y=20): Condition — small font, gray
-cond_label = Label(FONT_SMALL, text="", color=0x888899, x=18, y=20)
+cond_label = Label(FONT_SMALL, text="", color=0x888899, x=22, y=20)
 weather_group.append(cond_label)
 
 # Row 4 (y=28): Wind — small font, light blue
-wind_label = Label(FONT_SMALL, text="", color=0x6699AA, x=18, y=28)
+wind_label = Label(FONT_SMALL, text="", color=0x6699AA, x=22, y=28)
 weather_group.append(wind_label)
 
 # --- Plane screen group ---
@@ -609,6 +614,9 @@ plane_group.append(alt_label)
 reg_label = Label(FONT_SMALL, text="", color=0x667788, x=16, y=27)
 plane_group.append(reg_label)
 
+
+# Ship screen: reuses plane_group and its labels to save RAM
+# show_ship() switches to "plane" screen and repurposes the labels
 
 # --- Loading screen group ---
 loading_group = displayio.Group()
@@ -643,6 +651,11 @@ _sunset_mins = 19 * 60 + 30   # default 7:30 PM
 forecast_hi = ""
 forecast_lo = ""
 forecast_cond = ""
+ships = []
+ship_idx = 0
+last_ship_fetch = -SHIP_INTERVAL
+_ship_cycle_start = 0
+_showing_ship = False
 planes = []
 showing_planes = False
 plane_idx = 0
@@ -882,8 +895,8 @@ def fetch_planes():
 # ---------------------------------------------------------------------------
 
 # Centering helpers for the right panel (x=17 to x=63, 47px wide)
-_RIGHT_START = 17
-_RIGHT_W = 47
+_RIGHT_START = 21
+_RIGHT_W = 43
 
 def _center_mid(label, text):
     """Center a mid-font label (5px/char) in the right panel."""
@@ -896,6 +909,111 @@ def _center_small(label, text):
     label.text = text
     tw = len(text) * 4
     label.x = _RIGHT_START + (_RIGHT_W - tw) // 2
+
+# ---------------------------------------------------------------------------
+# Ship type colors and display
+# ---------------------------------------------------------------------------
+SHIP_TYPE_COLORS = {
+    3: 0x44AA44,   # Fishing — green
+    4: 0xFF8800,   # High-speed — orange
+    5: 0xAAAA00,   # Special (tugs, pilots) — olive
+    6: 0x44AAFF,   # Passenger — blue
+    7: 0xCC8844,   # Cargo — brown
+    8: 0xFF4444,   # Tanker — red
+    9: 0x888888,   # Other — gray
+}
+
+def get_ship_type_color(type_code):
+    decade = type_code // 10 if type_code else 0
+    return SHIP_TYPE_COLORS.get(decade, 0x666688)
+
+def get_ship_type_abbrev(type_name):
+    """Short abbreviation for left column."""
+    abbrevs = {
+        "Fishing": "FSH", "HighSpeed": "HSC", "Special": "SPL",
+        "Passenger": "PAX", "Cargo": "CGO", "Tanker": "TNK",
+        "Other": "OTH", "Vessel": "VES",
+    }
+    return abbrevs.get(type_name, "VES")
+
+
+def fetch_ships():
+    """Fetch nearby ships from proxy."""
+    global ships
+    gc.collect()
+    url = "{}/api/ships".format(PROXY_HOST)
+    try:
+        resp = mp.network.fetch(url)
+        data = resp.json()
+        resp.close()
+        ships = data.get("ships", [])
+        print("Ships nearby:", len(ships))
+    except Exception as e:
+        print("Ships err:", e)
+        ships = []
+    gc.collect()
+
+
+def show_ship(ship):
+    """Display a ship — reuses the plane screen group to save RAM."""
+    gc.collect()
+    switch_screen("plane")
+    name = ship.get("name", "UNKNOWN")
+    type_name = ship.get("type_name", "Vessel")
+    type_code = ship.get("type", 0)
+    dest = ship.get("destination", "")
+
+    # Update left column color with ship type
+    color = get_ship_type_color(type_code)
+    update_plane_bg(color)
+
+    # Left column: empty for now
+    actype_label.text = ""
+    logo_label.text = ""
+
+    # Clear large-font label
+    route_label.text = ""
+
+    # Center helper for ship panel (x=16 to x=63, 48px wide, small font 4px/char)
+    def _ship_center(label, text):
+        label.text = text
+        tw = len(text) * 4
+        label.x = 16 + (48 - tw) // 2
+
+    # Row 1: Ship name (small font, centered)
+    logo_label.text = ""
+    _ship_center(airline_label, name[:12])
+    airline_label.color = 0xFFFFFF
+    airline_label.y = 5
+
+    # Row 2: Vessel type (centered)
+    _ship_center(reg_label, type_name)
+    reg_label.color = color
+    reg_label.y = 12
+
+    # Row 3: Destination (centered)
+    if dest:
+        _ship_center(alt_label, dest[:12])
+    else:
+        alt_label.text = ""
+    alt_label.color = 0x888899
+    alt_label.y = 19
+
+    # Row 4: Distance + heading (centered, reuse route_label but keep short)
+    dist = ship.get("distance_mi", 0)
+    hdg = ship.get("heading", 0)
+    compass = heading_to_compass(hdg)
+    if dist:
+        info = "{}mi {}".format(dist, compass)
+    else:
+        info = compass
+    route_label.text = ""
+    # Row 4: distance + heading (small font, centered)
+    _ship_center(actype_label, info)
+    actype_label.color = 0x6699AA
+    actype_label.y = 26
+
+
 
 def show_weather_tides():
     switch_screen("weather")
@@ -1001,6 +1119,22 @@ def show_plane(plane):
 # ---------------------------------------------------------------------------
 print("Starting main loop")
 
+if SHIPS_TEST:
+    ships = [
+        {"name": "IYANOUGH", "type": 40, "type_name": "HighSpeed",
+         "destination": "NANTUCKET", "length": 47, "distance_mi": 2.3, "heading": 135},
+        {"name": "MSC FLORA", "type": 70, "type_name": "Cargo",
+         "destination": "NEW YORK", "length": 280, "distance_mi": 8.1, "heading": 220},
+        {"name": "SEA TITAN", "type": 80, "type_name": "Tanker",
+         "destination": "HOUSTON", "length": 220, "distance_mi": 5.7, "heading": 45},
+    ]
+    _ship_cycle_start = time.monotonic() - SHIP_WEATHER_SECS  # skip to ship phase
+    gc.collect()
+    print("Free mem:", gc.mem_free())
+    show_ship(ships[0])
+    display.brightness = 1.0
+    print("SHIPS_TEST: injected", len(ships), "test ships, showing first")
+
 while True:
     now = time.monotonic()
 
@@ -1037,8 +1171,37 @@ while True:
             show_plane(display_planes[plane_idx])
             last_plane_cycle = now
 
+    # --- Ship tracking ---
+    if SHIPS_ENABLED and not showing_planes:
+        if not SHIPS_TEST and now - last_ship_fetch >= SHIP_INTERVAL:
+            fetch_ships()
+            last_ship_fetch = now
+            if ships and _ship_cycle_start == 0:
+                _ship_cycle_start = now
+
+        # Weather/ship cycling: 30s weather, 10s ship, repeat
+        if ships:
+            cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + SHIP_DISPLAY_SECS)
+            if cycle_pos < SHIP_WEATHER_SECS:
+                # Weather phase
+                if _showing_ship:
+                    _showing_ship = False
+                    show_weather_tides()
+            else:
+                # Ship phase
+                if not _showing_ship:
+                    _showing_ship = True
+                    ship_idx = 0
+                    show_ship(ships[ship_idx])
+                elif len(ships) > 1:
+                    ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
+                    expected_idx = int(ship_phase_elapsed / 5) % len(ships)
+                    if expected_idx != ship_idx:
+                        ship_idx = expected_idx
+                        show_ship(ships[ship_idx])
+
     # Weather screen per-tick updates: clock + basin animation
-    if not showing_planes:
+    if not showing_planes and not _showing_ship:
         t = time.localtime()
         h12 = t.tm_hour % 12 or 12
         ampm = "A" if t.tm_hour < 12 else "P"
