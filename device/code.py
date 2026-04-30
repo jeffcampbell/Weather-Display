@@ -708,7 +708,7 @@ def fetch_tides():
                 h12 = p[2] % 12 or 12
                 tide_str = "{}:{}".format(h12, p[3])
                 found = True
-                print("Tide:", label, tide_str)
+                print("Tide:", tide_type_val, tide_str)
                 break
         if not found:
             tide_str = "DONE"
