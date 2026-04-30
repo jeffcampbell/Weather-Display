@@ -41,12 +41,11 @@ BBOX = 0.1
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 PLANE_CYCLE_SECS = 5
-PLANES_ENABLED = False  # Set True to enable flight tracking
+PLANES_ENABLED = True
 SHIPS_ENABLED = True    # Set True to enable ship tracking
-SHIPS_TEST = True       # Set True to show a fake ship immediately
+SHIPS_TEST = False
 SHIP_INTERVAL = 30      # poll for ships every 30 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
-SHIP_DISPLAY_SECS = 10  # show ship for 10s in cycle
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
 PROXY_HOST = "http://YOUR_PROXY_HOST:6590"
@@ -273,20 +272,25 @@ def make_icon_tg(icon_data, width, height, color, x=0, y=0):
 # ---------------------------------------------------------------------------
 BASIN_W = 20   # full left column width
 BASIN_H = 32   # full display height
-# Palette: 0=black, 1=water deep, 2=water mid, 3=water surface, 4=arrow(white)
-basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 5)
-basin_pal = displayio.Palette(5)
+# Tide current particles: (x, y_phase_offset) — staggered so they never clump
+_TIDE_PARTICLES = ((3, 0), (11, 11), (17, 22))
+# Palette: 0=black, 1=water deep, 2=water mid, 3=water surface,
+#          4=ship hull (gray), 5=ship superstructure (amber)
+basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 6)
+basin_pal = displayio.Palette(6)
 basin_pal[0] = 0x000000
 basin_pal[1] = 0x031420   # water deep
 basin_pal[2] = 0x062838   # water mid
 basin_pal[3] = 0x0C3850   # water surface/crest
-basin_pal[4] = 0xFFFFFF   # arrow (white, visible above and below water)
+basin_pal[4] = 0xBBBBBB   # ship hull (light gray)
+basin_pal[5] = 0xFF8822   # ship superstructure (amber)
 
 basin_tg = displayio.TileGrid(basin_bmp, pixel_shader=basin_pal, x=0, y=0)
 
 _tide_level = 0.5      # 0.0 = empty, 1.0 = full
 _basin_anim_tick = 0    # for surface wave animation
 _tide_predictions = []  # store all today's predictions for interpolation
+_sep_pixel_y = 16       # current y of the tide direction indicator pixel
 
 BRIGHTNESS_MAX = 1.0
 BRIGHTNESS_MIN = 0.08   # dimmest without going off
@@ -324,29 +328,77 @@ def update_basin_water(level, tick):
     water_top = max(8, min(30, water_top))
 
     # Wind → wave parameters
-    # 0-5mph: gentle ripple, 10-15mph: moderate, 20+mph: choppy
+    # <5mph: flat calm, 5-15mph: moderate, 15+mph: choppy
     w = min(_wind_speed, 25)
-    amplitude = 0.3 + w * 0.06      # 0.3 (calm) to 1.8 (stormy)
-    speed = 0.3 + w * 0.02          # animation speed
-    chop = 0.5 + w * 0.03           # frequency (higher = choppier)
-    threshold = 0.2 - w * 0.02      # surface visibility threshold
-    extra_rows = 1 if w >= 15 else 0 # extra row of surface foam in high wind
+    calm = w < 5
+
+    if not calm:
+        amplitude = 0.3 + w * 0.06
+        speed = 0.3 + w * 0.02
+        chop = 0.5 + w * 0.03
+        threshold = 0.2 - w * 0.02
+    extra_rows = 1 if w >= 15 else 0
+
+    # Precompute ship row spans so they can be drawn in a single pass,
+    # avoiding a two-pass blink where water briefly overwrites the ship.
+    # Each entry: (abs_row, x1_inclusive, x2_inclusive, palette_idx)
+    if ships:
+        cx = BASIN_W // 2  # = 10
+        ship_spans = (
+            (water_top - 3, cx - 1, cx,     5),  # funnel  2px  amber
+            (water_top - 2, cx - 3, cx + 2, 5),  # bridge  6px  amber
+            (water_top - 1, cx - 5, cx + 5, 4),  # deck   11px  gray
+            (water_top,     cx - 5, cx + 5, 4),  # hull   11px  gray
+            (water_top + 1, cx - 4, cx + 4, 4),  # keel    9px  gray
+        )
+    else:
+        ship_spans = ()
 
     for row in range(BASIN_H):
+        # Find ship span for this row (if any)
+        ship_x1 = ship_x2 = -1
+        ship_pal = 0
+        for sr, sx1, sx2, sp in ship_spans:
+            if sr == row:
+                ship_x1 = max(0, sx1)
+                ship_x2 = min(BASIN_W - 1, sx2)
+                ship_pal = sp
+                break
+
         for col in range(BASIN_W):
-            if row < water_top - extra_rows:
+            if ship_x1 <= col <= ship_x2:
+                basin_bmp[col, row] = ship_pal
+            elif row < water_top - extra_rows:
                 basin_bmp[col, row] = 0  # air
             elif row <= water_top:
-                # Surface zone — wave shape driven by wind
-                wave = math.sin(col * chop + tick * speed) * amplitude
-                if w >= 10:
-                    wave += math.sin(col * 1.3 + tick * speed * 1.7) * amplitude * 0.4
-                basin_bmp[col, row] = 3 if wave > threshold else 0
+                if calm:
+                    basin_bmp[col, row] = 3  # flat surface line
+                else:
+                    wave = math.sin(col * chop + tick * speed) * amplitude
+                    if w >= 10:
+                        wave += math.sin(col * 1.3 + tick * speed * 1.7) * amplitude * 0.4
+                    basin_bmp[col, row] = 3 if wave > threshold else 0
             elif row == water_top + 1:
-                wave = math.sin(col * chop + tick * speed + 1.0)
-                basin_bmp[col, row] = 3 if wave > 0 else 2
+                if calm:
+                    basin_bmp[col, row] = 2  # flat sub-surface
+                else:
+                    wave = math.sin(col * chop + tick * speed + 1.0)
+                    basin_bmp[col, row] = 3 if wave > 0 else 2
             else:
                 basin_bmp[col, row] = 1  # deep
+
+    # Tide current particles — mid-tone pixels drifting up (making) or down (ebbing)
+    # through the water column to suggest current direction
+    if tide_type_val:
+        water_depth = BASIN_H - water_top - 2  # stay below surface rows
+        if water_depth > 2:
+            for px, py_off in _TIDE_PARTICLES:
+                if tide_type_val == "H":
+                    py = water_top + 2 + (py_off - tick) % water_depth
+                else:
+                    py = water_top + 2 + (py_off + tick) % water_depth
+                if 0 <= py < BASIN_H:
+                    basin_bmp[px, py] = 2  # mid-water tone — subtle against deep
 
 def interpolate_tide_level():
     """Calculate current tide basin fill (0.0-1.0) from predictions."""
@@ -469,6 +521,17 @@ for r in range(32):
     vsep_bmp[0, r] = 1
 vsep_tg = displayio.TileGrid(vsep_bmp, pixel_shader=vsep_pal, x=20, y=0)
 weather_group.append(vsep_tg)
+
+# Tide direction indicator — white pixel sliding up (rising) or down (ebbing)
+# along the separator line
+sep_pixel_bmp = displayio.Bitmap(1, 1, 2)
+sep_pixel_pal = displayio.Palette(2)
+sep_pixel_pal[0] = 0x000000
+sep_pixel_pal.make_transparent(0)
+sep_pixel_pal[1] = 0xFFFFFF
+sep_pixel_bmp[0, 0] = 1
+sep_pixel_tg = displayio.TileGrid(sep_pixel_bmp, pixel_shader=sep_pixel_pal, x=20, y=16)
+weather_group.append(sep_pixel_tg)
 
 # RIGHT SIDE — 4 rows
 
@@ -837,9 +900,44 @@ def show_ship(ship):
 
     # Update left column color with ship type
     color = get_ship_type_color(type_code)
-    update_plane_bg(color)
+    length = ship.get("length", 50)
 
-    # Left column: empty for now
+    # Draw ship silhouette in left column, scaled by length
+    # Map 30-300m → 10-28px tall, centered vertically
+    ship_h = max(10, min(28, int(10 + (length - 30) * 18 / 270)))
+    ship_w = max(4, min(10, ship_h // 3 + 2))  # width proportional
+    y_start = (32 - ship_h) // 2
+    bow_len = max(2, ship_h // 5)  # pointed bow section
+    cx = 7  # center x of 14px column
+
+    r = ((color >> 16) & 0xFF)
+    g = ((color >> 8) & 0xFF)
+    b = (color & 0xFF)
+    fill_c = color
+    border_c = ((r >> 2) << 16) | ((g >> 2) << 8) | (b >> 2)
+
+    # Fill column with ocean blue
+    pl_bg_pal[1] = 0x0A2A40  # ocean blue
+    pl_bg_pal[2] = 0xDDDDDD  # ship hull (white/light gray)
+    for y in range(32):
+        for x in range(14):
+            pl_bg_bmp[x, y] = 1  # ocean
+
+    # Draw white ship hull
+    for i in range(ship_h):
+        y = y_start + i
+        if y < 0 or y > 31:
+            continue
+        if i < bow_len:
+            hw = max(1, ship_w * (i + 1) // (bow_len + 1) // 2)
+        elif i >= ship_h - 2:
+            hw = ship_w // 2 - 1
+        else:
+            hw = ship_w // 2
+        for x in range(cx - hw, cx + hw + 1):
+            if 0 <= x < 14:
+                pl_bg_bmp[x, y] = 2  # white hull
+
     actype_label.text = ""
     logo_label.text = ""
 
@@ -914,8 +1012,16 @@ def show_weather_tides():
     # Wind — centered (small font)
     _center_small(wind_label, wind_str)
     # Tide time at bottom of left column
-    tide_time_label.text = tide_str
-    tide_time_label.color = 0xFFFFFF if _tide_level < 0.2 else 0x00CCDD
+    # Show "HIGH" or "LOW" when within 15 min of slack tide
+    now_m = time.localtime()
+    now_mins = now_m.tm_hour * 60 + now_m.tm_min
+    slack_label = ""
+    for p in _tide_predictions:
+        if abs(p[0] - now_mins) <= 15:
+            slack_label = "HIGH" if p[1] == "H" else "LOW"
+            break
+    tide_time_label.text = slack_label if slack_label else tide_str
+    tide_time_label.color = 0xFFFFFF if (slack_label or _tide_level < 0.2) else 0x00CCDD
     # Basin + clock updated in main loop
 
 
@@ -929,7 +1035,6 @@ def get_displayable_planes():
     """Return only planes that have route data."""
     result = []
     for p in planes:
-        # Try fetching route if not cached
         if p["call"] not in flight_cache:
             fetch_route(p["call"], p.get("icao24", ""))
         if has_route(p["call"]):
@@ -939,6 +1044,23 @@ def get_displayable_planes():
 
 def show_plane(plane):
     switch_screen("plane")
+    # Reset pl_bg_bmp to plane border layout (show_ship rewrites every pixel)
+    for _y in range(32):
+        for _x in range(14):
+            pl_bg_bmp[_x, _y] = 2 if (_x == 0 or _x == 13 or _y == 0 or _y == 31) else 1
+    # Reset label positions/colors to plane layout (show_ship mutates these)
+    airline_label.y = 13
+    airline_label.x = 16
+    actype_label.y = 13
+    actype_label.x = 48
+    alt_label.y = 20
+    alt_label.x = 16
+    alt_label.color = 0x44AA44
+    reg_label.y = 27
+    reg_label.x = 16
+    reg_label.color = 0x667788
+    logo_label.y = 16
+    logo_label.x = 2
     callsign = plane["call"]
     name, iata, color = get_airline_info(callsign)
 
@@ -1045,9 +1167,10 @@ while True:
             if ships and _ship_cycle_start == 0:
                 _ship_cycle_start = now
 
-        # Weather/ship cycling: 30s weather, 10s ship, repeat
+        # Weather/ship cycling: 30s weather, 5s per ship, repeat
         if ships:
-            cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + SHIP_DISPLAY_SECS)
+            ship_display_total = len(ships) * 15
+            cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + ship_display_total)
             if cycle_pos < SHIP_WEATHER_SECS:
                 # Weather phase
                 if _showing_ship:
@@ -1061,7 +1184,7 @@ while True:
                     show_ship(ships[ship_idx])
                 elif len(ships) > 1:
                     ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
-                    expected_idx = int(ship_phase_elapsed / 5) % len(ships)
+                    expected_idx = int(ship_phase_elapsed / 15) % len(ships)
                     if expected_idx != ship_idx:
                         ship_idx = expected_idx
                         show_ship(ships[ship_idx])
@@ -1075,6 +1198,12 @@ while True:
         # Animate tide basin surface
         _basin_anim_tick += 1
         update_basin_water(_tide_level, _basin_anim_tick)
+        # Slide tide direction pixel up (rising) or down (ebbing) along separator
+        if tide_type_val == "H":
+            _sep_pixel_y = (_sep_pixel_y - 1) % 32
+        elif tide_type_val == "L":
+            _sep_pixel_y = (_sep_pixel_y + 1) % 32
+        sep_pixel_tg.y = _sep_pixel_y
         # Adjust brightness based on sunrise/sunset
         update_brightness()
 

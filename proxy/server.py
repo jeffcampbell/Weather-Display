@@ -144,7 +144,7 @@ def handle_route(params):
 
     result = {"callsign": callsign, "route": [], "typecode": "", "registration": ""}
 
-    # Fetch route
+    # Fetch route — try OpenSky first, fall back to adsbdb
     url = f"https://opensky-network.org/api/routes?callsign={callsign}"
     status, data = fetch(url, headers=opensky_headers())
     if status == 200 and data:
@@ -154,6 +154,21 @@ def handle_route(params):
             result["operatorIata"] = route_data.get("operatorIata", "")
         except Exception:
             pass
+
+    if not result["route"]:
+        # OpenSky had nothing — try adsbdb
+        ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
+        ads_status, ads_data = fetch(ads_url)
+        if ads_status == 200 and ads_data:
+            try:
+                ads = json.loads(ads_data)
+                fr = ads.get("response", {}).get("flightroute", {})
+                origin_icao = fr.get("origin", {}).get("icao_code", "")
+                dest_icao = fr.get("destination", {}).get("icao_code", "")
+                if origin_icao and dest_icao:
+                    result["route"] = [origin_icao, dest_icao]
+            except Exception:
+                pass
 
     # Fetch aircraft type from hexdb.io (free, no auth, reliable)
     if icao24:
@@ -409,14 +424,15 @@ def handle_ships(params):
             # Minimum length filter
             if s.get("length", 0) < SHIP_MIN_LENGTH:
                 continue
-            # Distance filter
+            # Require a valid position fix before including
             lat = s.get("lat", 0)
             lon = s.get("lon", 0)
-            if lat and lon:
-                dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
-                if dist > SHIP_MAX_MILES:
-                    continue
-                s["distance_mi"] = round(dist, 1)
+            if not lat or not lon:
+                continue
+            dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
+            if dist > SHIP_MAX_MILES:
+                continue
+            s["distance_mi"] = round(dist, 1)
             ship_list.append(s)
         # Sort by distance
         ship_list.sort(key=lambda s: s.get("distance_mi", 999))
