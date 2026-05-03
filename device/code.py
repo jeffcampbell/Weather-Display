@@ -41,6 +41,10 @@ BBOX = 0.1
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 PLANE_CYCLE_SECS = 5
+PLANE_MAX_SECS = 600          # max continuous time on plane screen
+PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
+PLANE_QUIET_START_HR = 1      # local hour to stop fetching planes (saves API)
+PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
 PLANES_ENABLED = True
 SHIPS_ENABLED = True    # Set True to enable ship tracking
 SHIPS_TEST = False
@@ -487,11 +491,11 @@ def fetch_route(callsign, icao24=""):
     if callsign in flight_cache:
         return flight_cache[callsign]
     gc.collect()
-    url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
-    if icao24:
-        url += "&icao24={}".format(icao24)
     info = {"origin": "???", "dest": "???", "type": "", "reg": ""}
     try:
+        url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
+        if icao24:
+            url += "&icao24={}".format(icao24)
         data = fetch_json(url)
         route = data.get("route", [])
         if route:
@@ -634,6 +638,8 @@ _ship_cycle_start = 0
 _showing_ship = False
 planes = []
 showing_planes = False
+plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
+plane_cooldown_until = 0      # don't re-show plane screen before this ts
 plane_idx = 0
 last_weather_fetch = -WEATHER_INTERVAL
 last_sky_fetch = -OPENSKY_INTERVAL
@@ -688,11 +694,11 @@ def get_condition_text(cond_id, fallback):
 def fetch_weather():
     global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed, _sunrise_mins, _sunset_mins
     gc.collect()
-    url = (
-        "https://api.openweathermap.org/data/2.5/weather"
-        "?lat={}&lon={}&appid={}&units=imperial"
-    ).format(LAT, LON, OWM_KEY)
     try:
+        url = (
+            "https://api.openweathermap.org/data/2.5/weather"
+            "?lat={}&lon={}&appid={}&units=imperial"
+        ).format(LAT, LON, OWM_KEY)
         data = fetch_json(url)
         temp = int(round(data["main"]["temp"]))
         weather_cond_main = data["weather"][0]["main"]
@@ -728,12 +734,12 @@ def fetch_weather():
 def fetch_tides():
     global tide_str, tide_type_val, _tide_predictions
     gc.collect()
-    url = (
-        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-        "?date=today&station={}&product=predictions&datum=MLLW"
-        "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
-    ).format(NOAA_STATION)
     try:
+        url = (
+            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+            "?date=today&station={}&product=predictions&datum=MLLW"
+            "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
+        ).format(NOAA_STATION)
         data = fetch_json(url)
         preds = data.get("predictions", [])
         now = time.localtime()
@@ -774,8 +780,8 @@ def fetch_tides():
 def fetch_planes():
     global planes
     gc.collect()
-    url = "{}/api/planes".format(PROXY_HOST)
     try:
+        url = "{}/api/planes".format(PROXY_HOST)
         data = fetch_json(url)
         states = data.get("states") or []
         planes = []
@@ -854,8 +860,8 @@ def fetch_ships():
     """Fetch nearby ships from proxy."""
     global ships
     gc.collect()
-    url = "{}/api/ships".format(PROXY_HOST)
     try:
+        url = "{}/api/ships".format(PROXY_HOST)
         data = fetch_json(url)
         ships = data.get("ships", [])
         print("Ships nearby:", len(ships))
@@ -1121,17 +1127,33 @@ while True:
             show_weather_tides()
 
     # --- OpenSky check ---
-    if PLANES_ENABLED and now - last_sky_fetch >= OPENSKY_INTERVAL:
+    # Skip plane fetches during quiet hours to save FlightAware API calls.
+    # Clears any cached planes so the display falls back to weather/tides.
+    _hr = time.localtime().tm_hour
+    _quiet = PLANE_QUIET_START_HR <= _hr < PLANE_QUIET_END_HR
+    if PLANES_ENABLED and not _quiet and now - last_sky_fetch >= OPENSKY_INTERVAL:
         fetch_planes()
         last_sky_fetch = now
+    elif _quiet and planes:
+        planes = []
 
     # Only show planes that have route data
     display_planes = get_displayable_planes() if PLANES_ENABLED else []
 
-    if display_planes and not showing_planes:
+    # Safeguard: if a plane has been on screen for PLANE_MAX_SECS straight
+    # (e.g. fetch issue, hovering aircraft, stale ADS-B data), force a
+    # weather break so the user is never permanently stuck on a plane.
+    if showing_planes and now - plane_screen_started_at >= PLANE_MAX_SECS:
+        print("Plane screen max duration reached, weather break")
+        showing_planes = False
+        plane_cooldown_until = now + PLANE_COOLDOWN_SECS
+        show_weather_tides()
+
+    if display_planes and not showing_planes and now >= plane_cooldown_until:
         showing_planes = True
         plane_idx = 0
         last_plane_cycle = now
+        plane_screen_started_at = now
         show_plane(display_planes[0])
     elif not display_planes and showing_planes:
         showing_planes = False

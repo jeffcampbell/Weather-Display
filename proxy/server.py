@@ -44,6 +44,7 @@ OPENSKY_USER = _config.get("opensky_user", "")
 OPENSKY_PASS = _config.get("opensky_pass", "")
 OWM_KEY = _config.get("openweather_key", "")
 AISSTREAM_KEY = _config.get("aisstream_key", "")
+FLIGHTAWARE_KEY = _config.get("flightaware_key", "")
 LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
@@ -128,9 +129,12 @@ def handle_planes(params):
 
 
 def handle_route(params):
-    """Proxy OpenSky route + aircraft type lookup.
-    Pass callsign (required) and icao24 (optional) to get both route
-    and aircraft type in one response. Cached for 1 hour."""
+    """Proxy route + aircraft type lookup. Falls through:
+        FlightAware (real-time, paid)  ->  OpenSky routes  ->  adsbdb
+    FlightAware data reflects what the aircraft is *actually* doing right now,
+    whereas the OpenSky/adsbdb route DBs return scheduled-callsign data which
+    can be stale or wrong (e.g. callsign reused later in the day for a
+    different leg). Cached for 1 hour per callsign+icao24 pair."""
 
     callsign = params.get("callsign", [""])[0].strip()
     icao24 = params.get("icao24", [""])[0].strip()
@@ -144,18 +148,51 @@ def handle_route(params):
 
     result = {"callsign": callsign, "route": [], "typecode": "", "registration": ""}
 
-    # Fetch route — try OpenSky first, fall back to adsbdb
-    url = f"https://opensky-network.org/api/routes?callsign={callsign}"
-    status, data = fetch(url, headers=opensky_headers())
-    if status == 200 and data:
-        try:
-            route_data = json.loads(data)
-            result["route"] = route_data.get("route", [])
-        except Exception:
-            pass
+    # 1. FlightAware AeroAPI — real-time flight data. Best accuracy.
+    if FLIGHTAWARE_KEY:
+        fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
+        fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
+        if fa_status == 200 and fa_data:
+            try:
+                fa = json.loads(fa_data)
+                # Pick the in-progress flight, else the most recent one.
+                flights = fa.get("flights", []) or []
+                pick = None
+                for f in flights:
+                    if f.get("status", "").lower().startswith("en route") or f.get("actual_off"):
+                        if not f.get("actual_on"):
+                            pick = f
+                            break
+                if pick is None and flights:
+                    pick = flights[0]
+                if pick:
+                    o_icao = (pick.get("origin") or {}).get("code_icao", "")
+                    d_icao = (pick.get("destination") or {}).get("code_icao", "")
+                    if o_icao and d_icao:
+                        result["route"] = [o_icao, d_icao]
+                    # FlightAware also gives aircraft type — use it if present
+                    ac_type = pick.get("aircraft_type", "")
+                    if ac_type and not result["typecode"]:
+                        result["typecode"] = ac_type
+                    reg = pick.get("registration", "")
+                    if reg and not result["registration"]:
+                        result["registration"] = reg
+            except Exception as e:
+                print(f"FlightAware parse err for {callsign}: {e}")
 
+    # 2. OpenSky route DB (scheduled)
     if not result["route"]:
-        # OpenSky had nothing — try adsbdb
+        url = f"https://opensky-network.org/api/routes?callsign={callsign}"
+        status, data = fetch(url, headers=opensky_headers())
+        if status == 200 and data:
+            try:
+                route_data = json.loads(data)
+                result["route"] = route_data.get("route", [])
+            except Exception:
+                pass
+
+    # 3. adsbdb (scheduled, alt source)
+    if not result["route"]:
         ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
         ads_status, ads_data = fetch(ads_url)
         if ads_status == 200 and ads_data:
