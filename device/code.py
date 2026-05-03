@@ -8,7 +8,7 @@
 # Required libs (copy from Adafruit CircuitPython Bundle to CIRCUITPY/lib):
 #   adafruit_matrixportal, adafruit_portalbase, adafruit_esp32spi,
 #   adafruit_bus_device, adafruit_requests, adafruit_connection_manager,
-#   adafruit_display_text, adafruit_io, adafruit_fakerequests, neopixel
+#   adafruit_display_text, adafruit_io, adafruit_fakerequests, neopixel,
 
 import time
 import gc
@@ -151,25 +151,6 @@ ICON_FOG = bytes([
     0b00000000,
     0b01111100,
 ])
-# Arrow bitmaps (5 wide in 8-bit byte, left-aligned)
-ARROW_UP = bytes([
-    0b00100000,
-    0b01110000,
-    0b11111000,
-    0b00100000,
-    0b00100000,
-    0b00100000,
-    0b00100000,
-])
-ARROW_DOWN = bytes([
-    0b00100000,
-    0b00100000,
-    0b00100000,
-    0b00100000,
-    0b11111000,
-    0b01110000,
-    0b00100000,
-])
 # fmt: on
 
 # Weather condition -> icon mapping
@@ -237,6 +218,24 @@ def icao_to_display(icao):
     return icao[:3]
 
 COMPASS_DIRS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+def temp_color(t):
+    """Return display color for a temperature value (°F)."""
+    if t >= 90: return 0xFF2222
+    if t >= 80: return 0xFF8800
+    if t >= 60: return 0xFFDD00
+    if t >= 40: return 0x88FFCC
+    if t >= 20: return 0x44AAFF
+    return 0x2255CC
+
+def _icon_color_for(cond_main):
+    """Return icon color for a weather condition string."""
+    if cond_main == "Clear":       return 0xFFCC00
+    if cond_main in ("Rain", "Drizzle"): return 0x4488FF
+    if cond_main == "Snow":        return 0xCCDDFF
+    if cond_main == "Thunderstorm": return 0xAAAA00
+    if cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"): return 0x888888
+    return 0xAAAAAA
 
 def heading_to_compass(hdg):
     return COMPASS_DIRS[round(hdg / 45) % 8]
@@ -471,6 +470,18 @@ def update_plane_bg(airline_color):
 flight_cache = {}
 _FLIGHT_CACHE_MAX = 10
 
+
+def fetch_json(url):
+    """Fetch a URL and return parsed JSON. Always closes the socket — without
+    try/finally, a MemoryError mid-parse leaks the socket and the next fetch
+    fails with 'existing socket already connected' until reboot."""
+    resp = mp.network.fetch(url)
+    try:
+        return resp.json()
+    finally:
+        resp.close()
+
+
 def fetch_route(callsign, icao24=""):
     """Fetch route + aircraft type via proxy. Caches results."""
     if callsign in flight_cache:
@@ -481,15 +492,14 @@ def fetch_route(callsign, icao24=""):
         url += "&icao24={}".format(icao24)
     info = {"origin": "???", "dest": "???", "type": "", "reg": ""}
     try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
+        data = fetch_json(url)
         route = data.get("route", [])
         if route:
             info["origin"] = icao_to_display(route[0])
             info["dest"] = icao_to_display(route[-1])
         info["type"] = data.get("typecode", "")
         info["reg"] = data.get("registration", "")
+        # operatorIata intentionally not stored — device never uses it
         print("Route {}: {} -> {} ({})".format(
             callsign, info["origin"], info["dest"], info["type"]))
     except Exception as e:
@@ -614,9 +624,9 @@ weather_cond_main = ""
 tide_str = ""
 tide_type_val = ""
 wind_str = ""
-_wind_speed = 0  # mph, drives wave animation intensity
-_sunrise_mins = 5 * 60 + 30   # default 5:30 AM
-_sunset_mins = 19 * 60 + 30   # default 7:30 PM
+_wind_speed = 0
+_sunrise_mins = 5 * 60 + 30
+_sunset_mins = 19 * 60 + 30
 ships = []
 ship_idx = 0
 last_ship_fetch = -SHIP_INTERVAL
@@ -628,7 +638,7 @@ plane_idx = 0
 last_weather_fetch = -WEATHER_INTERVAL
 last_sky_fetch = -OPENSKY_INTERVAL
 last_plane_cycle = 0
-current_screen = "loading"  # "loading", "weather", "plane"
+current_screen = "loading"
 
 
 # ---------------------------------------------------------------------------
@@ -638,33 +648,11 @@ current_screen = "loading"  # "loading", "weather", "plane"
 def update_weather_icon(cond_main):
     """Rebuild the weather icon bitmap for the given condition."""
     icon_data = _get_icon_for(cond_main)
-    # Determine icon color based on condition
-    if cond_main == "Clear":
-        color = 0xFFCC00
-    elif cond_main in ("Rain", "Drizzle"):
-        color = 0x4488FF
-    elif cond_main == "Snow":
-        color = 0xCCDDFF
-    elif cond_main == "Thunderstorm":
-        color = 0xAAAA00
-    elif cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"):
-        color = 0x888888
-    else:
-        color = 0xAAAAAA
-    wx_icon_pal[1] = color
+    wx_icon_pal[1] = _icon_color_for(cond_main)
     for row in range(8):
         byte = icon_data[row]
         for col in range(8):
             wx_icon_bmp[col, row] = 1 if (byte & (1 << (7 - col))) else 0
-
-def update_tide_arrow(t_type):
-    """Update tide arrow to up or down."""
-    arrow_data = ARROW_UP if t_type == "H" else ARROW_DOWN
-    tide_arrow_pal[1] = 0x00CCFF
-    for row in range(7):
-        byte = arrow_data[row]
-        for col in range(5):
-            tide_arrow_bmp[col, row] = 1 if (byte & (1 << (7 - col))) else 0
 
 def switch_screen(name):
     """Switch which display group is shown."""
@@ -694,7 +682,7 @@ def get_condition_text(cond_id, fallback):
                     return line.split(",", 1)[1]
     except Exception:
         pass
-    return fallback[:10]
+    return fallback[:8]
 
 
 def fetch_weather():
@@ -705,9 +693,7 @@ def fetch_weather():
         "?lat={}&lon={}&appid={}&units=imperial"
     ).format(LAT, LON, OWM_KEY)
     try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
+        data = fetch_json(url)
         temp = int(round(data["main"]["temp"]))
         weather_cond_main = data["weather"][0]["main"]
         cond_id = data["weather"][0].get("id", 0)
@@ -748,9 +734,7 @@ def fetch_tides():
         "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
     ).format(NOAA_STATION)
     try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
+        data = fetch_json(url)
         preds = data.get("predictions", [])
         now = time.localtime()
         now_mins = now.tm_hour * 60 + now.tm_min
@@ -790,15 +774,9 @@ def fetch_tides():
 def fetch_planes():
     global planes
     gc.collect()
-    lamin = LAT - BBOX
-    lamax = LAT + BBOX
-    lomin = LON - BBOX
-    lomax = LON + BBOX
     url = "{}/api/planes".format(PROXY_HOST)
     try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
+        data = fetch_json(url)
         states = data.get("states") or []
         planes = []
         for s in states:
@@ -878,9 +856,7 @@ def fetch_ships():
     gc.collect()
     url = "{}/api/ships".format(PROXY_HOST)
     try:
-        resp = mp.network.fetch(url)
-        data = resp.json()
-        resp.close()
+        data = fetch_json(url)
         ships = data.get("ships", [])
         print("Ships nearby:", len(ships))
     except Exception as e:
@@ -890,6 +866,14 @@ def fetch_ships():
 
 
 def show_ship(ship):
+    try:
+        _show_ship_inner(ship)
+    except MemoryError as _e:
+        print("show_ship MemoryError:", _e)
+        gc.collect()
+
+
+def _show_ship_inner(ship):
     """Display a ship — reuses the plane screen group to save RAM."""
     gc.collect()
     switch_screen("plane")
@@ -909,12 +893,6 @@ def show_ship(ship):
     y_start = (32 - ship_h) // 2
     bow_len = max(2, ship_h // 5)  # pointed bow section
     cx = 7  # center x of 14px column
-
-    r = ((color >> 16) & 0xFF)
-    g = ((color >> 8) & 0xFF)
-    b = (color & 0xFF)
-    fill_c = color
-    border_c = ((r >> 2) << 16) | ((g >> 2) << 8) | (b >> 2)
 
     # Fill column with ocean blue
     pl_bg_pal[1] = 0x0A2A40  # ocean blue
@@ -980,6 +958,14 @@ def show_ship(ship):
 
 
 def show_weather_tides():
+    try:
+        _show_weather_tides_inner()
+    except MemoryError as _e:
+        print("show_weather_tides MemoryError:", _e)
+        gc.collect()
+
+
+def _show_weather_tides_inner():
     switch_screen("weather")
     # Weather icon — center in right panel
     update_weather_icon(weather_cond_main)
@@ -991,24 +977,13 @@ def show_weather_tides():
         temp_val = int(weather_str.split(chr(176))[0])
     except (ValueError, IndexError):
         temp_val = 60
-    if temp_val >= 90:
-        temp_label.color = 0xFF2222
-    elif temp_val >= 80:
-        temp_label.color = 0xFF8800
-    elif temp_val >= 60:
-        temp_label.color = 0xFFDD00
-    elif temp_val >= 40:
-        temp_label.color = 0x88FFCC
-    elif temp_val >= 20:
-        temp_label.color = 0x44AAFF
-    else:
-        temp_label.color = 0x2255CC
+    temp_label.color = temp_color(temp_val)
     # Nudge icon to left of centered temp
     tw = len(weather_str) * 5
     temp_center = _RIGHT_START + (_RIGHT_W - tw) // 2
     wx_icon_tg.x = temp_center - 10
-    # Condition — centered (small font)
-    _center_small(cond_label, weather_cond)
+    # Condition — centered (small font), cap to 8 chars to fit pre-sized label
+    _center_small(cond_label, weather_cond[:8])
     # Wind — centered (small font)
     _center_small(wind_label, wind_str)
     # Tide time at bottom of left column
@@ -1043,6 +1018,15 @@ def get_displayable_planes():
 
 
 def show_plane(plane):
+    try:
+        _show_plane_inner(plane)
+    except MemoryError as _e:
+        print("show_plane MemoryError:", _e)
+        gc.collect()
+
+
+def _show_plane_inner(plane):
+    gc.collect()
     switch_screen("plane")
     # Reset pl_bg_bmp to plane border layout (show_ship rewrites every pixel)
     for _y in range(32):
@@ -1093,19 +1077,20 @@ def show_plane(plane):
     alt_k = plane["alt"] // 1000
     compass = heading_to_compass(plane["hdg"])
     if alt_k > 0:
-        alt_label.text = "Alt: {}k ft {}".format(alt_k, compass)
+        alt_label.text = "{}k {}".format(alt_k, compass)
     else:
         alt_label.text = ""
 
     # Row 4: Registration (tail number) — small, dim
-    reg_label.text = "Reg: {}".format(reg) if reg else ""
+    reg_label.text = reg or ""
+
+
 
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-print("Starting main loop")
 
 if SHIPS_TEST:
     ships = [
@@ -1127,7 +1112,7 @@ while True:
     gc.collect()
     now = time.monotonic()
 
-    # --- Weather + Tides + Forecast refresh ---
+    # --- Weather + Tides refresh ---
     if now - last_weather_fetch >= WEATHER_INTERVAL:
         fetch_weather()
         fetch_tides()

@@ -151,7 +151,6 @@ def handle_route(params):
         try:
             route_data = json.loads(data)
             result["route"] = route_data.get("route", [])
-            result["operatorIata"] = route_data.get("operatorIata", "")
         except Exception:
             pass
 
@@ -222,8 +221,8 @@ def handle_aircraft(params):
 
 
 def handle_forecast(params):
-    """Fetch tomorrow's weather from OpenWeatherMap 5-day forecast.
-    Groups 3-hour intervals by date, returns tomorrow's hi/lo/condition.
+    """Fetch 3-day weather forecast from OpenWeatherMap 5-day forecast.
+    Returns today, tomorrow, and day-after with hi/lo/condition/wind.
     Cached for 1 hour."""
 
     cache_key = "forecast"
@@ -233,6 +232,9 @@ def handle_forecast(params):
 
     if not OWM_KEY:
         return 500, json.dumps({"error": "no openweather_key configured"}).encode()
+
+    import datetime
+    import math
 
     lat = float(params.get("lat", [LATITUDE])[0])
     lon = float(params.get("lon", [LONGITUDE])[0])
@@ -248,45 +250,55 @@ def handle_forecast(params):
         forecast = json.loads(data)
         items = forecast.get("list", [])
 
-        # Find tomorrow's date
-        import datetime
         today = datetime.date.today()
-        tomorrow = today + datetime.timedelta(days=1)
-        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+        target_dates = [today + datetime.timedelta(days=i) for i in range(3)]
+        date_strings = [d.strftime("%Y-%m-%d") for d in target_dates]
 
-        hi = -999
-        lo = 999
-        conditions = {}
-        cond_id = 800  # default clear
-
+        days = {}
         for item in items:
             dt_txt = item.get("dt_txt", "")
-            if dt_txt.startswith(tomorrow_str):
-                temp = item["main"]["temp"]
-                if temp > hi:
-                    hi = temp
-                if temp < lo:
-                    lo = temp
-                # Track most common condition
-                cid = item["weather"][0]["id"]
-                cmain = item["weather"][0]["main"]
-                conditions[cmain] = conditions.get(cmain, 0) + 1
-                cond_id = cid  # use last one, or most severe
+            date_str = dt_txt[:10]
+            if date_str not in date_strings:
+                continue
+            entry = days.setdefault(date_str, {
+                "hi": -999, "lo": 999,
+                "conditions": {}, "cond_id": 800,
+                "wind_speeds": [], "wind_degs": [],
+            })
+            temp = item["main"]["temp"]
+            entry["hi"] = max(entry["hi"], temp)
+            entry["lo"] = min(entry["lo"], temp)
+            cid = item["weather"][0]["id"]
+            cmain = item["weather"][0]["main"]
+            entry["conditions"][cmain] = entry["conditions"].get(cmain, 0) + 1
+            entry["cond_id"] = cid
+            wind = item.get("wind", {})
+            if wind.get("speed"):
+                entry["wind_speeds"].append(wind["speed"])
+            if wind.get("deg") is not None:
+                entry["wind_degs"].append(wind["deg"])
 
-        if hi == -999:
-            return 404, json.dumps({"error": "no forecast data for tomorrow"}).encode()
+        result = []
+        for ds in date_strings:
+            if ds not in days:
+                continue
+            e = days[ds]
+            if e["hi"] == -999:
+                continue
+            most_common = max(e["conditions"], key=e["conditions"].get) if e["conditions"] else "Clear"
+            avg_wind = round(sum(e["wind_speeds"]) / len(e["wind_speeds"])) if e["wind_speeds"] else 0
+            avg_deg = round(sum(e["wind_degs"]) / len(e["wind_degs"])) if e["wind_degs"] else 0
+            result.append({
+                "hi": round(e["hi"]),
+                "lo": round(e["lo"]),
+                "cond": most_common,
+                "cond_id": e["cond_id"],
+                "date": ds,
+                "wind": avg_wind,
+                "wind_deg": avg_deg,
+            })
 
-        # Pick most common condition
-        most_common = max(conditions, key=conditions.get) if conditions else "Clear"
-
-        result = {
-            "hi": round(hi),
-            "lo": round(lo),
-            "cond": most_common,
-            "cond_id": cond_id,
-            "date": tomorrow_str,
-        }
-        body = json.dumps(result).encode()
+        body = json.dumps({"days": result}).encode()
         cache_set(cache_key, body)
         return 200, body
     except Exception as e:
