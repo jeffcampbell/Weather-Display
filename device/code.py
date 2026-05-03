@@ -14,6 +14,7 @@ import time
 import gc
 import math
 import board
+import microcontroller
 import digitalio
 import terminalio
 import displayio
@@ -48,7 +49,7 @@ PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
 PLANES_ENABLED = True
 SHIPS_ENABLED = True    # Set True to enable ship tracking
 SHIPS_TEST = False
-SHIP_INTERVAL = 30      # poll for ships every 30 sec
+SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
@@ -475,15 +476,36 @@ flight_cache = {}
 _FLIGHT_CACHE_MAX = 10
 
 
+_consecutive_fetch_errs = 0
+_FETCH_ERR_RESET_THRESHOLD = 12  # auto-reboot after this many in a row
+
 def fetch_json(url):
     """Fetch a URL and return parsed JSON. Always closes the socket — without
     try/finally, a MemoryError mid-parse leaks the socket and the next fetch
-    fails with 'existing socket already connected' until reboot."""
+    fails with 'existing socket already connected' until reboot.
+
+    Also tracks a consecutive-error counter; if a fetch raises (caller's
+    except block calls fetch_failed), repeated failures trigger a hard
+    reboot — adafruit_requests can get into an unrecoverable SSL/socket
+    state that only a CPU reset clears."""
+    global _consecutive_fetch_errs
     resp = mp.network.fetch(url)
     try:
-        return resp.json()
+        data = resp.json()
+        _consecutive_fetch_errs = 0  # success resets the counter
+        return data
     finally:
         resp.close()
+
+
+def fetch_failed():
+    """Caller's except block invokes this so we count the error."""
+    global _consecutive_fetch_errs
+    _consecutive_fetch_errs += 1
+    if _consecutive_fetch_errs >= _FETCH_ERR_RESET_THRESHOLD:
+        print("Too many fetch errors ({}), hard reset".format(_consecutive_fetch_errs))
+        time.sleep(1)
+        microcontroller.reset()
 
 
 def fetch_route(callsign, icao24=""):
@@ -508,6 +530,7 @@ def fetch_route(callsign, icao24=""):
             callsign, info["origin"], info["dest"], info["type"]))
     except Exception as e:
         print("Route err for {}: {}".format(callsign, e))
+        fetch_failed()
     # Evict oldest if cache full
     if len(flight_cache) >= _FLIGHT_CACHE_MAX:
         flight_cache.pop(next(iter(flight_cache)))
@@ -723,6 +746,7 @@ def fetch_weather():
         print("Weather:", weather_str, "-", weather_cond, "Wind:", wind_str)
     except Exception as e:
         print("Weather err:", e)
+        fetch_failed()
         if not weather_str:
             weather_str = "N/A"
             weather_cond = "No Data"
@@ -770,6 +794,7 @@ def fetch_tides():
         interpolate_tide_level()
     except Exception as e:
         print("Tide err:", e)
+        fetch_failed()
         if not tide_str:
             tide_str = "N/A"
             tide_type_val = ""
@@ -783,33 +808,17 @@ def fetch_planes():
     try:
         url = "{}/api/planes".format(PROXY_HOST)
         data = fetch_json(url)
-        states = data.get("states") or []
-        planes = []
-        for s in states:
-            if s[8]:
-                continue
-            callsign = (s[1] or "").strip()
-            if not callsign:
-                continue
-            alt_m = s[7] or s[13] or 0
-            alt_ft = int(alt_m * 3.281)
-            vel_kt = int((s[9] or 0) * 1.944)
-            hdg = int(s[10] or 0)
-            vrate = s[11] or 0  # vertical rate m/s
-            planes.append({
-                "call": callsign[:8],
-                "icao24": s[0] or "",
-                "alt": alt_ft,
-                "spd": vel_kt,
-                "hdg": hdg,
-                "vrate": int(vrate),
-            })
+        # Proxy already filters on_ground / no-callsign and trims to the 6
+        # fields we use, so the response is roughly half the OpenSky size.
+        planes = data.get("planes") or []
         print("Planes overhead:", len(planes))
     except MemoryError:
         print("OpenSky: response too large, try smaller BBOX")
+        fetch_failed()
         planes = []
     except Exception as e:
         print("OpenSky err:", e)
+        fetch_failed()
         planes = []
     gc.collect()
 
@@ -867,6 +876,7 @@ def fetch_ships():
         print("Ships nearby:", len(ships))
     except Exception as e:
         print("Ships err:", e)
+        fetch_failed()
         ships = []
     gc.collect()
 
@@ -1118,6 +1128,15 @@ while True:
     gc.collect()
     now = time.monotonic()
 
+    # --- Daily 03:30 reboot — clears accumulated BDF glyph cache, socket
+    # state, and other gradual leaks. Uptime > 1h check prevents a reboot
+    # loop if the device starts inside the 03:30 window.
+    _t = time.localtime()
+    if _t.tm_hour == 3 and _t.tm_min == 30 and now > 3600:
+        print("Daily scheduled reboot")
+        time.sleep(1)
+        microcontroller.reset()
+
     # --- Weather + Tides refresh ---
     if now - last_weather_fetch >= WEATHER_INTERVAL:
         fetch_weather()
@@ -1205,12 +1224,17 @@ while True:
         # Animate tide basin surface
         _basin_anim_tick += 1
         update_basin_water(_tide_level, _basin_anim_tick)
-        # Slide tide direction pixel up (rising) or down (ebbing) along separator
-        if tide_type_val == "H":
-            _sep_pixel_y = (_sep_pixel_y - 1) % 32
-        elif tide_type_val == "L":
-            _sep_pixel_y = (_sep_pixel_y + 1) % 32
-        sep_pixel_tg.y = _sep_pixel_y
+        # Slide tide direction pixel up (rising) or down (ebbing) along
+        # the separator. Hide it when the label is showing HIGH/LOW (slack
+        # tide) since direction is meaningless at the turn.
+        _at_slack = tide_time_label.text in ("HIGH", "LOW")
+        sep_pixel_tg.hidden = _at_slack
+        if not _at_slack:
+            if tide_type_val == "H":
+                _sep_pixel_y = (_sep_pixel_y - 1) % 32
+            elif tide_type_val == "L":
+                _sep_pixel_y = (_sep_pixel_y + 1) % 32
+            sep_pixel_tg.y = _sep_pixel_y
         # Adjust brightness based on sunrise/sunset
         update_brightness()
 

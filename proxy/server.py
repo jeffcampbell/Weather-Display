@@ -105,8 +105,12 @@ def opensky_headers():
 # Register new handlers in the ROUTES dict at the bottom.
 
 def handle_planes(params):
-    """Proxy OpenSky states/all — returns aircraft in bounding box.
-    Cached for 30 seconds to respect rate limits."""
+    """Fetch aircraft in bounding box from OpenSky and return a slim
+    device-friendly response — only the fields the device actually uses,
+    with on-ground / no-callsign rows already filtered out. Cached 30s.
+
+    Cuts the JSON payload roughly in half vs. raw OpenSky, which matters
+    a lot to the SAMD51 device: smaller parse = less heap fragmentation."""
 
     cache_key = "planes"
     cached = cache_get(cache_key, max_age_sec=30)
@@ -123,9 +127,37 @@ def handle_planes(params):
         f"&lamax={lat+bbox}&lomax={lon+bbox}"
     )
     status, data = fetch(url, headers=opensky_headers())
-    if status == 200:
-        cache_set(cache_key, data)
-    return status, data
+    if status != 200:
+        return status, data
+
+    try:
+        raw = json.loads(data)
+        states = raw.get("states") or []
+        planes = []
+        for s in states:
+            if s[8]:                                # on_ground
+                continue
+            callsign = (s[1] or "").strip()
+            if not callsign:
+                continue
+            alt_m = s[7] or s[13] or 0              # baro_altitude or geo
+            alt_ft = int(alt_m * 3.281)
+            vel_kt = int((s[9] or 0) * 1.944)
+            hdg = int(s[10] or 0)
+            vrate = int(s[11] or 0)
+            planes.append({
+                "call":   callsign[:8],
+                "icao24": s[0] or "",
+                "alt":    alt_ft,
+                "spd":    vel_kt,
+                "hdg":    hdg,
+                "vrate":  vrate,
+            })
+        body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
+        cache_set(cache_key, body)
+        return 200, body
+    except Exception as e:
+        return 500, json.dumps({"error": str(e)}).encode()
 
 
 def handle_route(params):
