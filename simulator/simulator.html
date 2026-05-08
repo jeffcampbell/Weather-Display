@@ -1038,7 +1038,7 @@ function injectTestWeather() {
   const tw = TEST_WEATHER[_twIdx++ % TEST_WEATHER.length];
   weather_str=tw.temp; weather_cond=tw.cond; weather_condMain=tw.main;
   wind_str=tw.wind; _wind_speed=tw.ws; _tide_level=tw.tl;
-  tide_str="4:30"; tide_type_val="H"; ships=[]; showing_planes=false;
+  tide_str="4:30"; tide_type_val="H"; ships=[]; planes=[]; showing_planes=false;
   dataLoaded = true;
   log(`Test weather: ${tw.temp} ${tw.cond}`);
 }
@@ -1070,7 +1070,7 @@ const TEST_SHIPS = [
 let _tsIdx = 0;
 function injectTestShip() {
   const ts = TEST_SHIPS[_tsIdx++ % TEST_SHIPS.length];
-  ships = [ts]; showing_planes = false;
+  ships = [ts]; planes = []; showing_planes = false;
   _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;  // skip to ship phase
   dataLoaded = true;
   log(`Test ship: ${ts.name} (${ts.type_name}) ${ts.length}m`);
@@ -1115,7 +1115,7 @@ function injectWorstWeather() {
   } else {
     _tide_predictions = []; tide_str = "4:30"; tide_type_val = ww.tl > 0.5 ? "H" : "L";
   }
-  ships = []; showing_planes = false; dataLoaded = true;
+  ships = []; planes = []; showing_planes = false; dataLoaded = true;
   log(`Worst weather: ${ww.temp} "${ww.cond}" (${ww.cond.length} chars)`);
 }
 
@@ -1162,7 +1162,7 @@ const WORST_SHIPS = [
 let _wsIdx = 0;
 function injectWorstShip() {
   const ws = WORST_SHIPS[_wsIdx++ % WORST_SHIPS.length];
-  ships = [ws]; showing_planes = false;
+  ships = [ws]; planes = []; showing_planes = false;
   _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;
   dataLoaded = true;
   log(`Worst ship: "${ws.name}" (${ws.name.length} chars) ${ws.length}m dest="${ws.destination}"`);
