@@ -37,7 +37,10 @@
 <body>
 
 <h2>Matrix Portal Simulator &mdash; 64&times;32 RGB LED</h2>
-<div id="wrapper"><canvas id="matrix"></canvas></div>
+<div id="wrapper">
+  <canvas id="matrix"></canvas>
+  <canvas id="overlay" style="position:absolute;top:18px;left:22px;pointer-events:none;"></canvas>
+</div>
 <div id="status">Initializing...</div>
 <div id="controls">
   <button onclick="injectTestWeather()">Cycle Weather</button>
@@ -45,6 +48,10 @@
   <button onclick="injectTestShip()">Inject Ship</button>
   <button onclick="clearAll()">Clear / Weather</button>
   <button onclick="forceRefresh()">Force Refresh</button>
+  <button id="btnOverlay" onclick="toggleOverlay()">Guides OFF</button>
+  <button onclick="injectWorstWeather()">Worst Weather</button>
+  <button onclick="injectWorstPlane()">Worst Plane</button>
+  <button onclick="injectWorstShip()">Worst Ship</button>
 </div>
 <div id="log"></div>
 
@@ -52,6 +59,9 @@
 <script>
 // =========================================================================
 // Matrix Portal Simulator — mirrors device/code.py display logic exactly
+// 64x32 LED matrix, 1s logic tick, 60fps render
+// Layout: x=0-19 tide basin | x=20 separator | x=21-63 right panel
+//         plane/ship screen: x=0-13 logo/silhouette box | x=16+ content
 // =========================================================================
 
 const WIDTH = 64, HEIGHT = 32;
@@ -66,7 +76,13 @@ canvas.width = CANVAS_W;
 canvas.height = CANVAS_H;
 const ctx = canvas.getContext('2d');
 
-// Framebuffer
+const overlayCanvas = document.getElementById('overlay');
+overlayCanvas.width = CANVAS_W;
+overlayCanvas.height = CANVAS_H;
+const octx = overlayCanvas.getContext('2d');
+let overlayEnabled = false;
+
+// Framebuffer — [y][x] = [r, g, b]
 const fb = [];
 for (let y = 0; y < HEIGHT; y++) {
   fb[y] = [];
@@ -74,13 +90,19 @@ for (let y = 0; y < HEIGHT; y++) {
 }
 
 // =========================================================================
-// Fonts — 3 sizes matching device
+// Layout constants — must match device/code.py exactly
 // =========================================================================
-// FONT (terminalio): 6px wide cells, used for route + logo
-// FONT_MID (5x8.bdf): 5px wide cells, used for clock + temp
-// FONT_SMALL (tom-thumb): 4px wide cells, used for condition/wind/details
+const BASIN_W    = 20;  // left tide basin width (x=0-19)
+const SEP_X      = 20;  // separator line x position
+const RIGHT_START = 21; // right panel start x (_RIGHT_START in device)
+const RIGHT_W    = 43;  // right panel width   (_RIGHT_W in device)
 
-// Adafruit GFX 5x7 font data (column-encoded, LSB=top row)
+// =========================================================================
+// Fonts — 3 sizes matching device BDF fonts
+// FONT (terminalio): 6px wide cells  — route, IATA logo
+// FONT_MID (5x8.bdf): 5px wide cells — clock, temp
+// FONT_SMALL (4x6.bdf): 4px wide cells — condition, wind, detail rows
+// =========================================================================
 const FONT_DATA = {
   32:[0x00,0x00,0x00,0x00,0x00],
   33:[0x00,0x00,0x5F,0x00,0x00],
@@ -119,16 +141,15 @@ const FONT_DATA = {
   117:[0x3C,0x40,0x40,0x20,0x7C],118:[0x1C,0x20,0x40,0x20,0x1C],
   119:[0x3C,0x40,0x30,0x40,0x3C],120:[0x44,0x28,0x10,0x28,0x44],
   121:[0x0C,0x50,0x50,0x50,0x3C],
-  176:[0x06,0x09,0x09,0x06,0x00], // degree
+  176:[0x06,0x09,0x09,0x06,0x00], // degree symbol
 };
 
-// Font rendering sizes
-const FONT_W = 6;      // large: 6px per char
-const FONT_MID_W = 5;  // mid: 5px per char
-const FONT_SMALL_W = 4; // small: 4px per char (tom-thumb approximation)
+const FONT_W       = 6;   // terminalio (large)
+const FONT_MID_W   = 5;   // 5x8.bdf (mid)
+const FONT_SMALL_W = 4;   // 4x6.bdf (small)
 
 // =========================================================================
-// 8x8 Icon bitmaps (matching device exactly)
+// 8x8 icon bitmaps (matching device exactly)
 // =========================================================================
 const ICONS = {
   sun:   [0x10,0x92,0x44,0x38,0xBA,0x44,0x92,0x10],
@@ -149,7 +170,7 @@ const ICON_COLORS = {
 };
 
 // =========================================================================
-// Framebuffer drawing
+// Framebuffer primitives
 // =========================================================================
 function clearFB() {
   for (let y = 0; y < HEIGHT; y++)
@@ -158,6 +179,14 @@ function clearFB() {
 function hexToRGB(h) { return [(h>>16)&0xFF,(h>>8)&0xFF,h&0xFF]; }
 function setPixel(x, y, rgb) {
   if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) fb[y][x] = rgb;
+}
+function fillRect(x0, y0, w, h, rgb) {
+  for (let y = y0; y < y0+h; y++)
+    for (let x = x0; x < x0+w; x++) setPixel(x, y, rgb);
+}
+function drawVSep(x, colorHex) {
+  const rgb = hexToRGB(colorHex);
+  for (let y = 0; y < HEIGHT; y++) setPixel(x, y, rgb);
 }
 
 // Draw 8x8 icon from bitmap bytes
@@ -171,7 +200,7 @@ function drawIcon8(iconBytes, x0, y0, colorHex) {
   }
 }
 
-// Draw text with large font (6px wide, 7px tall glyphs)
+// Large font: 6px wide, 7px tall glyphs (terminalio)
 function drawTextLarge(text, x, yCenter, colorHex) {
   const rgb = hexToRGB(colorHex);
   const yTop = yCenter - 3;
@@ -187,7 +216,7 @@ function drawTextLarge(text, x, yCenter, colorHex) {
   }
 }
 
-// Draw text with mid font (5px wide, ~7px tall — same glyphs, tighter spacing)
+// Mid font: 5px wide, same glyphs tighter spacing (5x8.bdf)
 function drawTextMid(text, x, yCenter, colorHex) {
   const rgb = hexToRGB(colorHex);
   const yTop = yCenter - 3;
@@ -203,14 +232,13 @@ function drawTextMid(text, x, yCenter, colorHex) {
   }
 }
 
-// Draw text with small font (4px wide, ~5px tall — simplified rendering)
+// Small font: 4px wide, ~5px tall (4x6.bdf approximation)
 function drawTextSmall(text, x, yCenter, colorHex) {
   const rgb = hexToRGB(colorHex);
   const yTop = yCenter - 2;
   for (let i = 0; i < text.length; i++) {
     const glyph = FONT_DATA[text.charCodeAt(i)];
     if (!glyph) continue;
-    // Scale down: use cols 0-3 of 5, rows 0-4 of 7 (sample every ~1.4)
     for (let col = 0; col < 3; col++) {
       const srcCol = Math.min(col, 4);
       const bits = glyph[srcCol];
@@ -222,19 +250,13 @@ function drawTextSmall(text, x, yCenter, colorHex) {
   }
 }
 
-// Draw filled rectangle
-function fillRect(x0, y0, w, h, rgb) {
-  for (let y = y0; y < y0+h; y++)
-    for (let x = x0; x < x0+w; x++) setPixel(x, y, rgb);
-}
-
-// Draw left column box (14px or 16px wide, full height) with border
-function drawLeftColumn(w, fillColor, borderColor) {
-  const fill = hexToRGB(fillColor);
-  const border = hexToRGB(borderColor);
+// Draw 14px-wide logo box with fill + dark border (plane screen)
+function drawLogoBox(fillColorHex, borderColorHex) {
+  const fill = hexToRGB(fillColorHex);
+  const border = hexToRGB(borderColorHex);
   for (let y = 0; y < 32; y++) {
-    for (let x = 0; x < w; x++) {
-      if (x === 0 || x === w-1 || y === 0 || y === 31)
+    for (let x = 0; x < 14; x++) {
+      if (x === 0 || x === 13 || y === 0 || y === 31)
         setPixel(x, y, border);
       else
         setPixel(x, y, fill);
@@ -242,19 +264,22 @@ function drawLeftColumn(w, fillColor, borderColor) {
   }
 }
 
-// Vertical separator line
-function drawVSep(x, color) {
-  const rgb = hexToRGB(color);
-  for (let y = 0; y < 32; y++) setPixel(x, y, rgb);
+// =========================================================================
+// Centering helpers — match device _center_mid / _center_small / _center_ship
+// =========================================================================
+function centerMidX(text) {
+  return RIGHT_START + Math.floor((RIGHT_W - text.length * FONT_MID_W) / 2);
+}
+function centerSmallX(text) {
+  return RIGHT_START + Math.floor((RIGHT_W - text.length * FONT_SMALL_W) / 2);
+}
+// Ship labels span x=16-63 (48px wide): x = 16 + (48 - len*4) // 2
+function centerShipX(text) {
+  return 16 + Math.floor((48 - text.length * FONT_SMALL_W) / 2);
 }
 
-// Center text helpers (matching device _center_mid / _center_small)
-const RIGHT_START = 17, RIGHT_W = 47;
-function centerMidX(text) { return RIGHT_START + Math.floor((RIGHT_W - text.length * FONT_MID_W) / 2); }
-function centerSmallX(text) { return RIGHT_START + Math.floor((RIGHT_W - text.length * FONT_SMALL_W) / 2); }
-
 // =========================================================================
-// LED Matrix renderer
+// LED matrix renderer
 // =========================================================================
 function renderMatrix() {
   ctx.fillStyle = '#0c0c0c';
@@ -292,6 +317,88 @@ function renderMatrix() {
 }
 
 // =========================================================================
+// Zone guides overlay — draws boundary lines and overflow highlights
+// =========================================================================
+function toggleOverlay() {
+  overlayEnabled = !overlayEnabled;
+  document.getElementById('btnOverlay').textContent = overlayEnabled ? 'Guides ON' : 'Guides OFF';
+  if (!overlayEnabled) octx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+}
+
+function renderOverlay() {
+  octx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  octx.save();
+
+  // Vertical zone boundaries
+  const vLines = [
+    // x=13/14 — plane/ship logo box right edge (14px wide)
+    { x: 13.5, color: 'rgba(255,100,0,0.75)',  label: '14' },
+    // x=15/16 — plane/ship content start
+    { x: 15.5, color: 'rgba(255,180,0,0.75)',  label: '16' },
+    // x=20 — separator / basin right edge
+    { x: 19.5, color: 'rgba(60,180,255,0.75)', label: '20' },
+    // x=21 — right panel start
+    { x: 20.5, color: 'rgba(0,220,120,0.65)',  label: '21' },
+    // x=63 — right edge (any pixel here is at the boundary)
+    { x: 63,   color: 'rgba(255,60,60,0.9)',   label: '63' },
+  ];
+
+  octx.font = 'bold 8px monospace';
+  octx.textBaseline = 'top';
+  octx.setLineDash([4, 4]);
+  octx.lineWidth = 1.5;
+
+  for (const {x, color, label} of vLines) {
+    const px = (x + 0.5) * SCALE;
+    octx.strokeStyle = color;
+    octx.fillStyle = color;
+    octx.beginPath();
+    octx.moveTo(px, 0);
+    octx.lineTo(px, CANVAS_H);
+    octx.stroke();
+    octx.fillText(label, px + 3, 2);
+  }
+
+  // Horizontal content row markers
+  const hRows = [
+    { y: 4,  label: 'y4'  },
+    { y: 12, label: 'y12' },
+    { y: 13, label: 'y13' },
+    { y: 20, label: 'y20' },
+    { y: 27, label: 'y27' },
+    { y: 28, label: 'y28' },
+    { y: 29, label: 'y29' },
+  ];
+
+  octx.strokeStyle = 'rgba(220,220,0,0.4)';
+  octx.fillStyle   = 'rgba(220,220,0,0.6)';
+  octx.setLineDash([2, 8]);
+  octx.lineWidth = 1;
+
+  for (const {y, label} of hRows) {
+    const py = y * SCALE;
+    octx.beginPath();
+    octx.moveTo(0, py);
+    octx.lineTo(CANVAS_W, py);
+    octx.stroke();
+    octx.fillText(label, 2, py + 1);
+  }
+
+  // Overflow highlight — magenta box around any lit pixel at x=63 (right boundary)
+  octx.setLineDash([]);
+  octx.strokeStyle = '#FF00FF';
+  octx.lineWidth = 2;
+  for (let y = 0; y < HEIGHT; y++) {
+    const [r, g, b] = fb[y][63];
+    if (r > 0 || g > 0 || b > 0) {
+      octx.strokeRect(63 * SCALE + 1, y * SCALE + 1, SCALE - 2, SCALE - 2);
+    }
+  }
+
+  octx.restore();
+}
+
+// =========================================================================
 // Logging
 // =========================================================================
 const logEl = document.getElementById('log');
@@ -307,34 +414,45 @@ function log(msg, isErr) {
 function setStatus(s) { statusEl.textContent = s; }
 
 // =========================================================================
-// State (mirrors device)
+// State (mirrors device globals)
 // =========================================================================
 let weather_str = "", weather_cond = "", weather_condMain = "";
 let wind_str = "", _wind_speed = 0;
-let tide_str = "", tide_type = "";
+let tide_str = "", tide_type_val = "";  // "H" or "L"
 let _tide_level = 0.5, _basin_tick = 0;
-let planes = [], showing_planes = false, plane_idx = 0;
-let ships = [], ship_idx = 0;
-let currentScreen = "loading";
-let dataLoaded = false;
-let _ship_cycle_start = 0;
+let _tide_predictions = [];  // [(total_mins, type, h, m_str), ...]
+let _sep_pixel_y = 16;       // tide direction pixel y position along x=20
+let _tide_at_slack = false;  // true when within 15 min of a tide peak
 
-const WEATHER_INTERVAL = 600, OPENSKY_INTERVAL = 60, SHIP_INTERVAL = 30;
-const PLANE_CYCLE_SECS = 5, SHIP_WEATHER_SECS = 30, SHIP_DISPLAY_SECS = 10;
-const PLANES_ENABLED = false, SHIPS_ENABLED = true;
-
-let last_weather_fetch = -WEATHER_INTERVAL;
-let last_sky_fetch = -OPENSKY_INTERVAL;
-let last_ship_fetch = -SHIP_INTERVAL;
+let planes = [];             // positional arrays: [callsign, icao24, alt_ft, spd_kt, hdg, vrate]
+let showing_planes = false;
+let plane_idx = 0;
 let last_plane_cycle = 0;
 
-const flightCache = {};
-const _airlineCache = {};
+let ships = [];
+let _ship_cycle_start = 0;
+
+let currentScreen = "loading";
+let dataLoaded = false;
+
+const WEATHER_INTERVAL  = 600;
+const OPENSKY_INTERVAL  = 60;
+const SHIP_INTERVAL     = 30;
+const PLANE_CYCLE_SECS  = 5;
+const SHIP_WEATHER_SECS = 30;  // seconds of weather before cycling to ships
+const PLANES_ENABLED    = true;
+const SHIPS_ENABLED     = true;
+
+let last_weather_fetch = -WEATHER_INTERVAL;
+let last_sky_fetch     = -OPENSKY_INTERVAL;
+let last_ship_fetch    = -SHIP_INTERVAL;
+
+const flightCache = {};  // callsign -> {origin, dest, type, reg}
 
 function monotonic() { return performance.now() / 1000; }
 
 // =========================================================================
-// Condition short names (same as device conditions.csv)
+// Condition short names (mirrors device conditions.csv)
 // =========================================================================
 const COND_SHORT = {
   200:'Thndr Rain',201:'Thndr Rain',202:'Thndr Rain',210:'Lt Thndrs',
@@ -353,39 +471,48 @@ const COND_SHORT = {
 };
 
 // =========================================================================
-// Airline lookup
+// Airline lookup (mirrors device airlines.csv prefix lookup)
 // =========================================================================
 const AIRLINE_PREFETCH = {
-  'UAL':{name:'United',iata:'UA',color:0x0055A4},
-  'DAL':{name:'Delta',iata:'DL',color:0xCC2222},
+  'UAL':{name:'United',  iata:'UA',color:0x0055A4},
+  'DAL':{name:'Delta',   iata:'DL',color:0xCC2222},
   'AAL':{name:'American',iata:'AA',color:0xCC2222},
-  'JBU':{name:'JetBlue',iata:'B6',color:0x0033CC},
+  'JBU':{name:'JetBlue', iata:'B6',color:0x0033CC},
   'SWA':{name:'SouthWst',iata:'WN',color:0xF9A01B},
-  'BAW':{name:'British',iata:'BA',color:0x1B3D6D},
-  'NKS':{name:'Spirit',iata:'NK',color:0xF0CB00},
-  'ASA':{name:'Alaska',iata:'AS',color:0x01426A},
+  'BAW':{name:'British', iata:'BA',color:0x1B3D6D},
+  'NKS':{name:'Spirit',  iata:'NK',color:0xF0CB00},
+  'ASA':{name:'Alaska',  iata:'AS',color:0x01426A},
   'RPA':{name:'Republic',iata:'YX',color:0x3366BB},
   'FFT':{name:'Frontier',iata:'F9',color:0x008040},
+  'EIN':{name:'Aer Lgus',iata:'EI',color:0x006633},
+  'VIR':{name:'Virgin',  iata:'VS',color:0xCC0022},
+  'UAE':{name:'Emirates',iata:'EK',color:0xCC0000},
+  'QTR':{name:'Qatar',   iata:'QR',color:0x5C0A3D},
+  'ACA':{name:'Air Cana',iata:'AC',color:0xCC0000},
 };
 function getAirlineInfo(callsign) {
-  const p = callsign.substring(0,3).toUpperCase();
-  return AIRLINE_PREFETCH[p] || {name:p, iata:p.substring(0,2), color:0x00AA44};
+  const p = callsign.substring(0, 3).toUpperCase();
+  return AIRLINE_PREFETCH[p] || {name: p, iata: p.substring(0, 2), color: 0x00AA44};
 }
 
-// Ship type colors
-const SHIP_TYPE_COLORS = {3:0x44AA44,4:0xFF8800,5:0xAAAA00,6:0x44AAFF,7:0xCC8844,8:0xFF4444,9:0x888888};
-function getShipColor(tc) { return SHIP_TYPE_COLORS[Math.floor((tc||0)/10)] || 0x666688; }
-const SHIP_ABBREV = {Fishing:'FSH',HighSpeed:'HSC',Special:'SPL',Passenger:'PAX',Cargo:'CGO',Tanker:'TNK',Other:'OTH',Vessel:'VES'};
+// Ship type colors (mirrors device SHIP_TYPE_COLORS)
+const SHIP_TYPE_COLORS = {
+  3:0x44AA44, 4:0xFF8800, 5:0xAAAA00,
+  6:0x44AAFF, 7:0xCC8844, 8:0xFF4444, 9:0x888888,
+};
+function getShipColor(tc) {
+  return SHIP_TYPE_COLORS[Math.floor((tc || 0) / 10)] || 0x666688;
+}
 
-// Heading to compass
+// Heading to compass direction (N/NE/E/SE/S/SW/W/NW)
 function headingToCompass(h) {
-  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(((h%360)+360)%360/45)%8];
+  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(((h % 360) + 360) % 360 / 45) % 8];
 }
 
-// Temp color
+// Temp color — matches device show_weather_tides logic
 function getTempColor(tempStr) {
   let v = 60;
-  try { v = parseInt(tempStr.split('\u00B0')[0]); } catch(e) {}
+  try { v = parseInt(tempStr.split('°')[0]); } catch(e) {}
   if (v >= 90) return 0xFF2222;
   if (v >= 80) return 0xFF8800;
   if (v >= 60) return 0xFFDD00;
@@ -394,48 +521,113 @@ function getTempColor(tempStr) {
   return 0x2255CC;
 }
 
+// ICAO airport code → 3-letter display (mirrors device icao_to_display)
+function icaoToDisplay(icao) {
+  if (!icao) return '???';
+  if (icao.length === 4 && icao[0] === 'K') return icao.substring(1);
+  if (icao.length === 4 && icao.startsWith('CY')) return icao.substring(1);
+  return icao.substring(0, 3);
+}
+
 // =========================================================================
-// Screen composition — mirrors device exactly
+// Screen composition — mirrors device layout exactly
 // =========================================================================
 
+// --- Weather screen ---
+// Left:  x=0-19 animated tide basin + tide time at y=29
+//        x=20 vertical separator (dark) + white direction pixel
+// Right: x=21-63 (43px wide)
+//   y=4:  clock (mid font, centered)
+//   y=12: weather icon (8x8) + temp (mid font, centered pair)
+//   y=20: condition (small font, centered)
+//   y=28: wind (small font, centered)
 function composeWeather(timestamp) {
   clearFB();
 
-  // LEFT COLUMN: tide basin (16px wide)
+  // Water column — x=0-19, depth driven by tide level
   const waterTop = Math.max(8, Math.min(30, Math.floor(30 - _tide_level * 22)));
   const w = Math.min(_wind_speed, 25);
-  const amp = 0.3 + w * 0.06;
-  const spd = 0.3 + w * 0.02;
-  const chp = 0.5 + w * 0.03;
-  const thr = 0.2 - w * 0.02;
-  const extra = w >= 15 ? 1 : 0;
-  const deep = [3,20,32], mid = [6,40,56], surf = [12,56,80];
+  const calm = w < 5;
+  const amplitude  = 0.3 + w * 0.06;
+  const speed      = 0.3 + w * 0.02;
+  const chop       = 0.5 + w * 0.03;
+  const threshold  = 0.2 - w * 0.02;
+  const extraRows  = w >= 15 ? 1 : 0;
+
+  // Basin palette colors (match device basin_pal)
+  const deep = [3, 20, 32];    // basin_pal[1] = 0x031420
+  const mid  = [6, 40, 56];    // basin_pal[2] = 0x062838
+  const surf = [12, 56, 80];   // basin_pal[3] = 0x0C3850
+  const hullGray = [187,187,187]; // basin_pal[4] = 0xBBBBBB
+  const superAmber = [255,136,34]; // basin_pal[5] = 0xFF8822
+
+  // Ship silhouette spans in water column (drawn when ships present)
+  // cx = BASIN_W // 2 = 10
+  const cx = BASIN_W >> 1;
+  const hasShip = ships.length > 0;
+  const shipSpans = hasShip ? [
+    [waterTop - 3, cx - 1, cx,     superAmber],  // funnel  2px amber
+    [waterTop - 2, cx - 3, cx + 2, superAmber],  // bridge  6px amber
+    [waterTop - 1, cx - 5, cx + 5, hullGray],    // deck   11px gray
+    [waterTop,     cx - 5, cx + 5, hullGray],    // hull   11px gray
+    [waterTop + 1, cx - 4, cx + 4, hullGray],    // keel    9px gray
+  ] : [];
 
   for (let row = 0; row < 32; row++) {
-    for (let col = 0; col < 16; col++) {
-      if (row < waterTop - extra) {
-        // air
+    // Check ship silhouette span for this row
+    let shipX1 = -1, shipX2 = -1, shipRgb = null;
+    for (const [sr, sx1, sx2, srgb] of shipSpans) {
+      if (sr === row) { shipX1 = Math.max(0, sx1); shipX2 = Math.min(BASIN_W-1, sx2); shipRgb = srgb; break; }
+    }
+
+    for (let col = 0; col < BASIN_W; col++) {
+      if (shipRgb && col >= shipX1 && col <= shipX2) {
+        setPixel(col, row, shipRgb);
+      } else if (row < waterTop - extraRows) {
+        // air — leave black
       } else if (row <= waterTop) {
-        let wave = Math.sin(col * chp + _basin_tick * spd) * amp;
-        if (w >= 10) wave += Math.sin(col * 1.3 + _basin_tick * spd * 1.7) * amp * 0.4;
-        if (wave > thr) setPixel(col, row, surf);
+        if (calm) {
+          setPixel(col, row, surf);
+        } else {
+          let wave = Math.sin(col * chop + _basin_tick * speed) * amplitude;
+          if (w >= 10) wave += Math.sin(col * 1.3 + _basin_tick * speed * 1.7) * amplitude * 0.4;
+          if (wave > threshold) setPixel(col, row, surf);
+        }
       } else if (row === waterTop + 1) {
-        const wave = Math.sin(col * chp + _basin_tick * spd + 1.0);
-        setPixel(col, row, wave > 0 ? surf : mid);
+        if (calm) {
+          setPixel(col, row, mid);
+        } else {
+          const wave = Math.sin(col * chop + _basin_tick * speed + 1.0);
+          setPixel(col, row, wave > 0 ? surf : mid);
+        }
       } else {
         setPixel(col, row, deep);
       }
     }
   }
 
-  // Tide time at bottom of column
-  const tideColor = _tide_level < 0.2 ? 0xFFFFFF : 0x00CCDD;
-  drawTextSmall(tide_str, 1, 29, tideColor);
+  // Tide time / HIGH / LOW at bottom of left column (x=1, y=29)
+  const nowMins = new Date().getHours() * 60 + new Date().getMinutes();
+  let tideDisplay = tide_str;
+  let tideLabelColor = _tide_level < 0.2 ? 0xFFFFFF : 0x00CCDD;
+  for (const p of _tide_predictions) {
+    if (Math.abs(p[0] - nowMins) <= 15) {
+      tideDisplay = p[1] === 'H' ? 'HIGH' : 'LOW';
+      tideLabelColor = 0xFFFFFF;
+      break;
+    }
+  }
+  drawTextSmall(tideDisplay, 1, 29, tideLabelColor);
 
-  // Vertical separator
-  drawVSep(16, 0x222233);
+  // Vertical separator at x=20 (dark, drawn after basin)
+  drawVSep(SEP_X, 0x222233);
 
-  // Clock — centered, mid font
+  // Tide direction pixel — white pixel at x=20 moving up (rising) or down (ebbing)
+  if (!_tide_at_slack) {
+    setPixel(SEP_X, _sep_pixel_y, [255, 255, 255]);
+  }
+
+  // Clock — centered in right panel, mid font, y=4
   const now = new Date();
   let h = now.getHours() % 12 || 12;
   const m = now.getMinutes().toString().padStart(2, '0');
@@ -443,8 +635,8 @@ function composeWeather(timestamp) {
   const clockStr = `${h}:${m} ${ap}M`;
   drawTextMid(clockStr, centerMidX(clockStr), 4, 0xFFFFFF);
 
-  // Weather icon + temp — centered together
-  const iconName = ICON_MAP[weather_condMain] || 'cloud';
+  // Weather icon + temp — positioned as a pair, centered in right panel
+  const iconName  = ICON_MAP[weather_condMain] || 'cloud';
   const iconColor = ICON_COLORS[weather_condMain] || 0xAAAAAA;
   const tempColor = getTempColor(weather_str);
   const tw = weather_str.length * FONT_MID_W;
@@ -452,93 +644,146 @@ function composeWeather(timestamp) {
   drawIcon8(ICONS[iconName], tempX - 10, 9, iconColor);
   drawTextMid(weather_str, tempX, 12, tempColor);
 
-  // Condition — centered, small
+  // Condition — centered, small font, y=20
   drawTextSmall(weather_cond, centerSmallX(weather_cond), 20, 0x888899);
 
-  // Wind — centered, small
+  // Wind — centered, small font, y=28
   drawTextSmall(wind_str, centerSmallX(wind_str), 28, 0x6699AA);
 
-  setStatus(`Weather: ${weather_str} ${weather_cond} | Wind: ${wind_str} | Tide: ${tide_str}`);
+  setStatus(`Weather: ${weather_str} ${weather_cond} | Wind: ${wind_str} | Tide: ${tideDisplay} (${tide_type_val})`);
 }
 
+// --- Plane screen ---
+// Left: x=0-13 airline logo box (airline color + dark border)
+//        IATA code centered, large font, y=16
+// Right: x=16+ (no separator on plane screen)
+//   y=4:  route "BOS>SFO" — large font, x=16
+//   y=13: airline name (small, x=16) + type right-aligned (small)
+//   y=20: altitude "35k NW" — small font, x=16
+//   y=27: registration — small font, x=16
+// Plane format from Pi: [callsign, icao24, alt_ft, spd_kt, hdg, vrate]
 function composePlane(plane) {
   clearFB();
-  const info = getAirlineInfo(plane.call);
-  const flight = flightCache[plane.call] || {};
-  const color = info.color;
+  const callsign = plane[0];
+  const altFt    = plane[2];
+  const hdg      = plane[4];
+  const info     = getAirlineInfo(callsign);
+  const flight   = flightCache[callsign] || {};
+  const color    = info.color;
   const r = (color>>16)&0xFF, g = (color>>8)&0xFF, b = color&0xFF;
+  const darkColor = ((r>>2)<<16) | ((g>>2)<<8) | (b>>2);
 
-  // Left column: airline logo box (14px)
-  drawLeftColumn(14, color, ((r>>2)<<16)|((g>>2)<<8)|(b>>2));
+  // Left column: airline logo box (14px wide, full height)
+  drawLogoBox(color, darkColor);
 
-  // IATA code centered in box
-  const bright = r*0.299+g*0.587+b*0.114;
+  // IATA code centered in 14px box — large font (6px/char), y=16
+  const bright = r * 0.299 + g * 0.587 + b * 0.114;
   const textColor = bright > 140 ? 0x111111 : 0xFFFFFF;
   const iataX = 1 + Math.floor((14 - info.iata.length * FONT_W) / 2);
   drawTextLarge(info.iata, iataX, 16, textColor);
 
-  // Row 1: Route (large)
+  // Row 1 (y=4): route — large font, x=16
   const origin = flight.origin || '???';
-  const dest = flight.dest || '???';
+  const dest   = flight.dest   || '???';
   drawTextLarge(`${origin}>${dest}`, 16, 4, 0xFFFFFF);
 
-  // Row 2: Airline (left) + type (right) — small
-  drawTextSmall(info.name.substring(0,8), 16, 13, color);
+  // Row 2 (y=13): airline name (left) + type (right) — small font
+  drawTextSmall(info.name.substring(0, 8), 16, 13, color);
   const acType = flight.type || '';
   if (acType) {
     const typeX = Math.max(18, 64 - acType.length * FONT_SMALL_W);
     drawTextSmall(acType, typeX, 13, 0x55AADD);
   }
 
-  // Row 3: Altitude
-  const altK = Math.floor(plane.alt / 1000);
-  const compass = headingToCompass(plane.hdg);
-  if (altK > 0) drawTextSmall(`Alt: ${altK}k ft ${compass}`, 16, 20, 0x44AA44);
+  // Row 3 (y=20): altitude + heading — small font, x=16
+  const altK = Math.floor(altFt / 1000);
+  if (altK > 0) {
+    drawTextSmall(`${altK}k ${headingToCompass(hdg)}`, 16, 20, 0x44AA44);
+  }
 
-  // Row 4: Registration
+  // Row 4 (y=27): registration — small font, x=16
   const reg = flight.reg || '';
-  if (reg) drawTextSmall(`Reg: ${reg}`, 16, 27, 0x667788);
+  if (reg) drawTextSmall(reg, 16, 27, 0x667788);
 
-  setStatus(`Plane: ${plane.call} | ${origin}>${dest} | ${info.name}`);
+  setStatus(`Plane: ${callsign} | ${origin}>${dest} | ${info.name} | ${altK}k ft`);
 }
 
+// --- Ship screen ---
+// Left: x=0-13 ocean blue (0x0A2A40) with ship silhouette scaled to vessel length
+//        Silhouette: gray hull (0xDDDDDD), vertical orientation
+// Right: x=16-63 (48px wide), all 4 rows use _center_ship centering
+//   y=5:  ship name — small font, white
+//   y=12: type name — small font, ship color
+//   y=19: destination — small font, gray (0x888899)
+//   y=26: distance + heading — small font, light blue (0x6699AA)
 function composeShip(ship) {
   clearFB();
-  const tc = ship.type || 0;
-  const color = getShipColor(tc);
-  const r = (color>>16)&0xFF, g = (color>>8)&0xFF, b = color&0xFF;
+  const tc       = ship.type || 0;
+  const color    = getShipColor(tc);
   const typeName = ship.type_name || 'Vessel';
-  const abbrev = SHIP_ABBREV[typeName] || 'VES';
 
-  // Left column
-  drawLeftColumn(14, color, ((r>>2)<<16)|((g>>2)<<8)|(b>>2));
+  // Left column: ocean blue background (no border)
+  const oceanBlue = [10, 42, 64];   // 0x0A2A40
+  const shipGray  = [221, 221, 221]; // 0xDDDDDD
+  for (let y = 0; y < 32; y++)
+    for (let x = 0; x < 14; x++)
+      setPixel(x, y, oceanBlue);
 
-  // Type abbreviation
-  const bright = r*0.299+g*0.587+b*0.114;
-  drawTextSmall(abbrev, 1, 16, bright > 140 ? 0x111111 : 0xFFFFFF);
+  // Ship silhouette — scaled by length (30-300m → 10-28px tall)
+  // Matches device show_ship() drawing logic exactly
+  const length = ship.length || 50;
+  const ship_h = Math.max(10, Math.min(28, Math.floor(10 + (length - 30) * 18 / 270)));
+  const ship_w = Math.max(4, Math.min(10, Math.floor(ship_h / 3) + 2));
+  const y_start = Math.floor((32 - ship_h) / 2);
+  const bow_len = Math.max(2, Math.floor(ship_h / 5));
+  const scx = 7; // cx of 14px column
 
-  // Row 1: Ship name (mid font)
-  drawTextMid((ship.name||'UNKNOWN').substring(0,9), 16, 5, 0xFFFFFF);
+  for (let i = 0; i < ship_h; i++) {
+    const y = y_start + i;
+    if (y < 0 || y > 31) continue;
+    let hw;
+    if (i < bow_len) {
+      hw = Math.max(1, Math.floor(ship_w * (i + 1) / (bow_len + 1) / 2));
+    } else if (i >= ship_h - 2) {
+      hw = Math.floor(ship_w / 2) - 1;
+    } else {
+      hw = Math.floor(ship_w / 2);
+    }
+    for (let x = scx - hw; x <= scx + hw; x++) {
+      if (x >= 0 && x < 14) setPixel(x, y, shipGray);
+    }
+  }
 
-  // Row 2: Type
-  drawTextSmall(typeName, 16, 15, color);
+  // Ship name (white) — _center_ship: x = 16 + (48 - len*4) // 2
+  const name = (ship.name || 'UNKNOWN').substring(0, 12);
+  drawTextSmall(name, centerShipX(name), 5, 0xFFFFFF);
 
-  // Row 3: Destination
-  const dest = ship.destination || '';
-  if (dest) drawTextSmall(`To:${dest.substring(0,8)}`, 16, 23, 0x888899);
+  // Type name (ship color)
+  const typeStr = typeName.substring(0, 10);
+  drawTextSmall(typeStr, centerShipX(typeStr), 12, color);
 
-  setStatus(`Ship: ${ship.name} | ${typeName} | ${dest}`);
+  // Destination (gray)
+  const dest = (ship.destination || '').substring(0, 12);
+  if (dest) drawTextSmall(dest, centerShipX(dest), 19, 0x888899);
+
+  // Distance + heading (light blue)
+  const dist    = ship.distance_mi || 0;
+  const compass = headingToCompass(ship.heading || 0);
+  const infoStr = dist ? `${dist}mi ${compass}` : compass;
+  drawTextSmall(infoStr, centerShipX(infoStr), 26, 0x6699AA);
+
+  setStatus(`Ship: ${ship.name} | ${typeName} | ${dest || 'no dest'}`);
 }
 
 function composeLoading(timestamp) {
   clearFB();
   const pulse = Math.sin(timestamp / 1000 * 2) * 0.3 + 0.7;
   const v = Math.floor(255 * pulse);
-  drawTextLarge("LOADING...", 4, 12, (v<<16)|(v<<8));
+  drawTextLarge("LOADING...", 4, 12, (v << 16) | (v << 8));
 }
 
 // =========================================================================
-// API calls (through simulator server → proxy)
+// API fetchers
 // =========================================================================
 async function fetchWeather() {
   try {
@@ -547,11 +792,10 @@ async function fetchWeather() {
     const temp = Math.round(data.main.temp);
     weather_condMain = data.weather[0].main;
     const condId = data.weather[0].id;
-    weather_cond = COND_SHORT[condId] || data.weather[0].description.substring(0,10);
-    weather_str = `${temp}\u00B0F`;
-    _wind_speed = Math.round(data.wind?.speed || 0);
-    const windDir = headingToCompass(data.wind?.deg || 0);
-    wind_str = `${_wind_speed}mph ${windDir}`;
+    weather_cond = COND_SHORT[condId] || data.weather[0].description.substring(0, 10);
+    weather_str  = `${temp}°F`;
+    _wind_speed  = Math.round(data.wind?.speed || 0);
+    wind_str     = `${_wind_speed}mph ${headingToCompass(data.wind?.deg || 0)}`;
     log(`Weather: ${weather_str} ${weather_cond} Wind: ${wind_str}`);
   } catch(e) { log(`Weather err: ${e.message}`, true); }
 }
@@ -561,20 +805,76 @@ async function fetchTides() {
     const resp = await fetch('/api/tides');
     const data = await resp.json();
     const preds = data.predictions || [];
-    const now = new Date();
-    const nowMins = now.getHours()*60 + now.getMinutes();
+    const now   = new Date();
+    const nowMins = now.getHours() * 60 + now.getMinutes();
+
+    // Build predictions array for basin interpolation (today only)
+    _tide_predictions = [];
     for (const p of preds) {
-      const [hStr,mStr] = p.t.split(' ')[1].split(':');
-      const h = parseInt(hStr);
-      if (h*60+parseInt(mStr) >= nowMins) {
-        tide_type = p.type;
-        const h12 = h%12||12;
-        tide_str = `${h12}:${mStr}`;
-        log(`Tide: ${tide_type==='H'?'HI':'LO'} ${tide_str}`);
+      const [hStr, mStr] = p.t.split(' ')[1].split(':');
+      const h = parseInt(hStr), m = parseInt(mStr);
+      _tide_predictions.push([h * 60 + m, p.type, h, mStr]);
+    }
+
+    // Find next upcoming tide today
+    let found = false;
+    for (const p of _tide_predictions) {
+      if (p[0] >= nowMins) {
+        tide_type_val = p[1];
+        const h12 = p[2] % 12 || 12;
+        tide_str = `${h12}:${p[3]}`;
+        log(`Tide: ${tide_type_val === 'H' ? 'HI' : 'LO'} ${tide_str}`);
+        found = true;
         break;
       }
     }
+
+    // Tomorrow fallback (no two large JSON objects in memory simultaneously)
+    if (!found) {
+      try {
+        const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+        const ds = tomorrow.toISOString().slice(0, 10).replace(/-/g, '');
+        // NOAA doesn't accept a date override from here — server proxies it
+        // The device's proxy fetches ?date=tomorrow; here we call /api/tides?date=tomorrow
+        const resp2 = await fetch('/api/tides?date=tomorrow');
+        const data2 = await resp2.json();
+        const preds2 = data2.predictions || [];
+        for (const p of preds2) {
+          const [hStr, mStr] = p.t.split(' ')[1].split(':');
+          const h = parseInt(hStr);
+          const h12 = h % 12 || 12;
+          tide_type_val = p.type;
+          tide_str = `${h12}:${mStr}`;
+          log(`Tide (tmr): ${tide_type_val === 'H' ? 'HI' : 'LO'} ${tide_str}`);
+          found = true;
+          break;
+        }
+      } catch(e) { /* fall through */ }
+    }
+    if (!found) { tide_str = 'N/A'; tide_type_val = ''; }
+
+    interpolateTideLevel();
   } catch(e) { log(`Tide err: ${e.message}`, true); }
+}
+
+function interpolateTideLevel() {
+  if (_tide_predictions.length < 2) { _tide_level = 0.5; return; }
+  const nowMins = new Date().getHours() * 60 + new Date().getMinutes();
+  let prev = null, next = null;
+  for (let i = 0; i < _tide_predictions.length; i++) {
+    if (_tide_predictions[i][0] >= nowMins) {
+      next = _tide_predictions[i];
+      if (i > 0) prev = _tide_predictions[i - 1];
+      break;
+    }
+  }
+  if (!prev || !next) { _tide_level = tide_type_val === 'H' ? 0.7 : 0.3; return; }
+  const span = next[0] - prev[0];
+  if (span <= 0) { _tide_level = 0.5; return; }
+  const progress = (nowMins - prev[0]) / span;
+  if (prev[1] === 'L' && next[1] === 'H') _tide_level = progress;
+  else if (prev[1] === 'H' && next[1] === 'L') _tide_level = 1.0 - progress;
+  else _tide_level = 0.5;
 }
 
 async function fetchShips() {
@@ -582,28 +882,102 @@ async function fetchShips() {
     const resp = await fetch('/api/ships');
     const data = await resp.json();
     ships = data.ships || [];
+    if (ships.length && _ship_cycle_start === 0) _ship_cycle_start = monotonic();
     log(`Ships: ${ships.length}`);
   } catch(e) { log(`Ships err: ${e.message}`, true); }
 }
 
+async function fetchRoute(callsign, icao24) {
+  try {
+    let url = `/api/route?callsign=${callsign}`;
+    if (icao24) url += `&icao24=${icao24}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    const route  = data.route || [];
+    const origin = route.length > 0 ? icaoToDisplay(route[0])             : '???';
+    const dest   = route.length > 0 ? icaoToDisplay(route[route.length-1]) : '???';
+    flightCache[callsign] = {
+      origin, dest,
+      type: data.typecode    || '',
+      reg:  data.registration || '',
+    };
+    if (origin !== '???') log(`Route ${callsign}: ${origin}>${dest} ${data.typecode || ''}`);
+  } catch(e) {
+    flightCache[callsign] = {origin:'???', dest:'???', type:'', reg:''};
+    log(`Route err ${callsign}: ${e.message}`, true);
+  }
+}
+
+async function fetchPlanes() {
+  try {
+    const resp  = await fetch('/api/planes');
+    const data  = await resp.json();
+    planes = data.planes || [];
+    log(`Planes: ${planes.length}`);
+    // Fetch routes for any planes not yet cached
+    for (const p of planes) {
+      const callsign = p[0], icao24 = p[1];
+      if (!flightCache[callsign]) await fetchRoute(callsign, icao24);
+    }
+  } catch(e) { log(`Planes err: ${e.message}`, true); }
+}
+
 // =========================================================================
-// Main loops
+// Derived: planes with confirmed route data (mirrors device get_displayable_planes)
+// =========================================================================
+function getDisplayablePlanes() {
+  return planes.filter(p => {
+    const f = flightCache[p[0]];
+    return f && f.origin !== '???' && f.dest !== '???';
+  });
+}
+
+// =========================================================================
+// Main logic tick (1s interval) — fetches data and drives per-second state
 // =========================================================================
 async function logicTick() {
   const now = monotonic();
+
   if (now - last_weather_fetch >= WEATHER_INTERVAL) {
     await fetchWeather();
     await fetchTides();
     last_weather_fetch = now;
     dataLoaded = true;
   }
+
+  if (PLANES_ENABLED && now - last_sky_fetch >= OPENSKY_INTERVAL) {
+    await fetchPlanes();
+    last_sky_fetch = now;
+  }
+
   if (SHIPS_ENABLED && now - last_ship_fetch >= SHIP_INTERVAL) {
     await fetchShips();
     last_ship_fetch = now;
-    if (ships.length && _ship_cycle_start === 0) _ship_cycle_start = now;
+  }
+
+  // Tide direction pixel — move 1px/s, hide during slack (±15 min of tide)
+  const nowMins2 = new Date().getHours() * 60 + new Date().getMinutes();
+  _tide_at_slack = false;
+  for (const p of _tide_predictions) {
+    if (Math.abs(p[0] - nowMins2) <= 15) { _tide_at_slack = true; break; }
+  }
+  if (!_tide_at_slack) {
+    if (tide_type_val === 'H') _sep_pixel_y = (_sep_pixel_y - 1 + 32) % 32;
+    else if (tide_type_val === 'L') _sep_pixel_y = (_sep_pixel_y + 1) % 32;
+  }
+
+  // Plane cycling (5s per plane)
+  if (showing_planes) {
+    if (now - last_plane_cycle >= PLANE_CYCLE_SECS) {
+      plane_idx++;
+      last_plane_cycle = now;
+    }
   }
 }
 
+// =========================================================================
+// Render loop (~60fps) — draws the current screen based on live state
+// =========================================================================
 let lastFrameTime = 0;
 function renderLoop(timestamp) {
   const dt = Math.min((timestamp - lastFrameTime) / 1000, 0.1);
@@ -612,26 +986,39 @@ function renderLoop(timestamp) {
 
   if (!dataLoaded) {
     composeLoading(timestamp);
-  } else if (showing_planes && planes.length > 0) {
-    composePlane(planes[plane_idx % planes.length]);
   } else {
-    // Ship/weather cycling
-    const now = monotonic();
-    if (SHIPS_ENABLED && ships.length > 0) {
-      const cyclePos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + SHIP_DISPLAY_SECS);
-      if (cyclePos >= SHIP_WEATHER_SECS) {
-        const shipPhase = cyclePos - SHIP_WEATHER_SECS;
-        const idx = Math.floor(shipPhase / 5) % ships.length;
-        composeShip(ships[idx]);
+    const displayPlanes = PLANES_ENABLED ? getDisplayablePlanes() : [];
+
+    if (displayPlanes.length > 0) {
+      // Planes have priority over ships and weather
+      if (!showing_planes) {
+        showing_planes   = true;
+        plane_idx        = 0;
+        last_plane_cycle = monotonic();
+      }
+      composePlane(displayPlanes[plane_idx % displayPlanes.length]);
+    } else {
+      if (showing_planes) showing_planes = false;
+
+      const now = monotonic();
+      if (SHIPS_ENABLED && ships.length > 0) {
+        if (_ship_cycle_start === 0) _ship_cycle_start = now;
+        const shipDisplayTotal = ships.length * 15;  // 15s per ship (matches device)
+        const cyclePos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + shipDisplayTotal);
+        if (cyclePos >= SHIP_WEATHER_SECS) {
+          const idx = Math.floor((cyclePos - SHIP_WEATHER_SECS) / 15) % ships.length;
+          composeShip(ships[idx]);
+        } else {
+          composeWeather(timestamp);
+        }
       } else {
         composeWeather(timestamp);
       }
-    } else {
-      composeWeather(timestamp);
     }
   }
 
   renderMatrix();
+  if (overlayEnabled) renderOverlay();
   requestAnimationFrame(renderLoop);
 }
 
@@ -639,60 +1026,146 @@ function renderLoop(timestamp) {
 // Test controls
 // =========================================================================
 const TEST_WEATHER = [
-  {temp:"72\u00B0F",cond:"Clear Sky",main:"Clear",wind:"5mph SW",ws:5,tl:0.8},
-  {temp:"55\u00B0F",cond:"Heavy Rain",main:"Rain",wind:"22mph NE",ws:22,tl:0.3},
-  {temp:"28\u00B0F",cond:"Snow",main:"Snow",wind:"12mph N",ws:12,tl:0.5},
-  {temp:"65\u00B0F",cond:"Sctd Cloud",main:"Clouds",wind:"8mph E",ws:8,tl:0.9},
-  {temp:"80\u00B0F",cond:"Thndrstm",main:"Thunderstorm",wind:"25mph S",ws:25,tl:0.1},
-  {temp:"60\u00B0F",cond:"Fog",main:"Fog",wind:"2mph W",ws:2,tl:0.6},
+  {temp:"72°F",cond:"Clear Sky",main:"Clear",wind:"5mph SW",ws:5,tl:0.8},
+  {temp:"55°F",cond:"Heavy Rain",main:"Rain",wind:"22mph NE",ws:22,tl:0.3},
+  {temp:"28°F",cond:"Snow",main:"Snow",wind:"12mph N",ws:12,tl:0.5},
+  {temp:"65°F",cond:"Sctd Cloud",main:"Clouds",wind:"8mph E",ws:8,tl:0.9},
+  {temp:"80°F",cond:"Thndrstm",main:"Thunderstorm",wind:"25mph S",ws:25,tl:0.1},
+  {temp:"60°F",cond:"Fog",main:"Fog",wind:"2mph W",ws:2,tl:0.6},
 ];
 let _twIdx = 0;
 function injectTestWeather() {
   const tw = TEST_WEATHER[_twIdx++ % TEST_WEATHER.length];
   weather_str=tw.temp; weather_cond=tw.cond; weather_condMain=tw.main;
   wind_str=tw.wind; _wind_speed=tw.ws; _tide_level=tw.tl;
-  tide_str="4:30"; tide_type="H"; ships=[]; showing_planes=false;
+  tide_str="4:30"; tide_type_val="H"; ships=[]; showing_planes=false;
+  dataLoaded = true;
   log(`Test weather: ${tw.temp} ${tw.cond}`);
 }
 
+// Positional array format: [callsign, icao24, alt_ft, spd_kt, hdg, vrate]
 const TEST_PLANES = [
-  {call:'UAL1234',alt:35000,spd:450,hdg:270,origin:'BOS',dest:'SFO',type:'B739',reg:'N12345'},
-  {call:'DAL567',alt:28000,spd:420,hdg:180,origin:'BOS',dest:'ATL',type:'A321',reg:'N567DL'},
-  {call:'JBU42',alt:18000,spd:380,hdg:90,origin:'BOS',dest:'FLL',type:'A320',reg:'N42JB'},
-  {call:'BAW213',alt:38000,spd:490,hdg:45,origin:'BOS',dest:'LHR',type:'B789',reg:'G-ZBKA'},
-  {call:'AAL100',alt:32000,spd:440,hdg:250,origin:'BOS',dest:'DFW',type:'B738',reg:'N100AA'},
+  {call:'UAL1234',icao24:'a1b2c3',alt:35000,spd:450,hdg:270,origin:'BOS',dest:'SFO',type:'B739',reg:'N12345'},
+  {call:'DAL567', icao24:'d4e5f6',alt:28000,spd:420,hdg:180,origin:'BOS',dest:'ATL',type:'A321',reg:'N567DL'},
+  {call:'JBU42',  icao24:'b7c8d9',alt:18000,spd:380,hdg:90, origin:'BOS',dest:'FLL',type:'A320',reg:'N42JB'},
+  {call:'BAW213', icao24:'400abc',alt:38000,spd:490,hdg:45,  origin:'BOS',dest:'LHR',type:'B789',reg:'G-ZBKA'},
+  {call:'AAL100', icao24:'a0b1c2',alt:32000,spd:440,hdg:250,origin:'BOS',dest:'DFW',type:'B738',reg:'N100AA'},
 ];
 let _tpIdx = 0;
 function injectTestPlane() {
   const tp = TEST_PLANES[_tpIdx++ % TEST_PLANES.length];
-  planes = [{call:tp.call,alt:tp.alt,spd:tp.spd,hdg:tp.hdg}];
-  flightCache[tp.call] = {origin:tp.origin,dest:tp.dest,type:tp.type,reg:tp.reg};
-  showing_planes = true; plane_idx = 0;
-  log(`Test plane: ${tp.call} ${tp.origin}>${tp.dest}`);
+  planes = [[tp.call, tp.icao24, tp.alt, tp.spd, tp.hdg, 0]];
+  flightCache[tp.call] = {origin:tp.origin, dest:tp.dest, type:tp.type, reg:tp.reg};
+  showing_planes = true; plane_idx = 0; dataLoaded = true;
+  log(`Test plane: ${tp.call} ${tp.origin}>${tp.dest} ${tp.type}`);
 }
 
 const TEST_SHIPS = [
-  {name:'FREEDOM',type:50,type_name:'Special',destination:'BOSTON'},
-  {name:'GLORY',type:60,type_name:'Passenger',destination:'PTOWN'},
-  {name:'MSC FLORA',type:70,type_name:'Cargo',destination:'NEW YORK'},
-  {name:'ALAKAI',type:40,type_name:'HighSpeed',destination:'BAR HARBOR'},
-  {name:'NANOOK',type:50,type_name:'Special',destination:'NEW BEDFORD'},
-  {name:'SEA TITAN',type:80,type_name:'Tanker',destination:'HOUSTON'},
+  {name:'IYANOUGH', type:40,type_name:'HighSpeed',destination:'NANTUCKET',length:47, distance_mi:2.3,heading:135},
+  {name:'FREEDOM',  type:50,type_name:'Special',  destination:'BOSTON',   length:80, distance_mi:5.1,heading:315},
+  {name:'MSC FLORA',type:70,type_name:'Cargo',    destination:'NEW YORK', length:280,distance_mi:8.1,heading:220},
+  {name:'ALAKAI',   type:40,type_name:'HighSpeed',destination:'BAR HARBOR',length:56,distance_mi:3.7,heading:45},
+  {name:'SEA TITAN',type:80,type_name:'Tanker',   destination:'HOUSTON',  length:220,distance_mi:5.7,heading:45},
 ];
 let _tsIdx = 0;
 function injectTestShip() {
   const ts = TEST_SHIPS[_tsIdx++ % TEST_SHIPS.length];
-  ships = [ts]; showing_planes = false; _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;
-  log(`Test ship: ${ts.name} (${ts.type_name})`);
+  ships = [ts]; showing_planes = false;
+  _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;  // skip to ship phase
+  dataLoaded = true;
+  log(`Test ship: ${ts.name} (${ts.type_name}) ${ts.length}m`);
 }
 
 function clearAll() {
-  planes=[]; ships=[]; showing_planes=false; _ship_cycle_start=0;
+  planes = []; ships = []; showing_planes = false; _ship_cycle_start = 0;
   log("Cleared — weather mode");
 }
 function forceRefresh() {
-  last_weather_fetch=-WEATHER_INTERVAL; last_ship_fetch=-SHIP_INTERVAL;
-  log("Forcing refresh");
+  last_weather_fetch = -WEATHER_INTERVAL;
+  last_sky_fetch     = -OPENSKY_INTERVAL;
+  last_ship_fetch    = -SHIP_INTERVAL;
+  log("Forcing refresh of all data");
+}
+
+// =========================================================================
+// Worst-case test fixtures — boundary-pushing values for overflow testing
+// =========================================================================
+
+// Weather: longest condition string (10 chars = 40px, 3px from right edge),
+//          extreme temps, tight wind labels, tide at slack
+const WORST_WEATHER = [
+  // "Thndr Rain" is max-width COND_SHORT entry (10×4=40px, centered at x=22, right edge x=62)
+  {temp:"-18°F", cond:"Thndr Rain", main:"Thunderstorm", wind:"25mph NNW", ws:25, tl:0.1},
+  // Triple-digit heat, another 10-char condition
+  {temp:"103°F", cond:"Brkn Cloud", main:"Clouds",       wind:"3mph S",    ws:3,  tl:0.85},
+  // Tide at slack → shows "HIGH" label (4×4=16px, wide room)
+  {temp:"68°F",  cond:"Clear Sky",  main:"Clear",        wind:"7mph SW",   ws:7,  tl:1.0, slack:true},
+  // Minimal wind, fog — tight fog label
+  {temp:"44°F",  cond:"Dense Fog",  main:"Fog",          wind:"0mph",      ws:0,  tl:0.5},
+];
+let _wwIdx = 0;
+function injectWorstWeather() {
+  const ww = WORST_WEATHER[_wwIdx++ % WORST_WEATHER.length];
+  weather_str = ww.temp; weather_cond = ww.cond; weather_condMain = ww.main;
+  wind_str = ww.wind; _wind_speed = ww.ws; _tide_level = ww.tl;
+  if (ww.slack) {
+    const nowMins = new Date().getHours() * 60 + new Date().getMinutes();
+    _tide_predictions = [[nowMins, 'H', new Date().getHours(), String(new Date().getMinutes()).padStart(2,'0')]];
+    tide_str = "HIGH"; tide_type_val = "H";
+  } else {
+    _tide_predictions = []; tide_str = "4:30"; tide_type_val = ww.tl > 0.5 ? "H" : "L";
+  }
+  ships = []; showing_planes = false; dataLoaded = true;
+  log(`Worst weather: ${ww.temp} "${ww.cond}" (${ww.cond.length} chars)`);
+}
+
+// Planes: all fields present, long registration, type + reg overlap test
+const WORST_PLANES = [
+  // Long callsign (7 chars), known airline, all fields — tests row 2 type+name overlap
+  {call:'DAL2247', icao24:'a1b2c3', alt:37000, spd:450, hdg:270,
+   origin:'BOS', dest:'LAX', type:'B788', reg:'N867DA'},
+  // ???>??? missing route — displays fallback
+  {call:'UAL5001', icao24:'b2c3d4', alt:28500, spd:420, hdg:90,
+   origin:'???', dest:'???', type:'',    reg:''},
+  // Short ICAO airline, 5-char type — tests right-align of type label
+  {call:'EIN104',  icao24:'4ca2c3', alt:40000, spd:480, hdg:100,
+   origin:'BOS', dest:'DUB', type:'A333', reg:'EI-DUZ'},
+  // Altitude = 0 (ground) — alt row should be blank
+  {call:'JBU1',    icao24:'c3d4e5', alt:0,     spd:0,   hdg:45,
+   origin:'BOS', dest:'JFK', type:'A320', reg:'N823JB'},
+];
+let _wpIdx = 0;
+function injectWorstPlane() {
+  const wp = WORST_PLANES[_wpIdx++ % WORST_PLANES.length];
+  planes = [[wp.call, wp.icao24, wp.alt, wp.spd, wp.hdg, 0]];
+  flightCache[wp.call] = {origin:wp.origin, dest:wp.dest, type:wp.type, reg:wp.reg};
+  showing_planes = true; plane_idx = 0; dataLoaded = true;
+  log(`Worst plane: ${wp.call} ${wp.origin}>${wp.dest} type="${wp.type}" reg="${wp.reg}"`);
+}
+
+// Ships: max-length name (12 chars fills 48px exactly), huge vessel (300m silhouette),
+//        long destination (12 chars), short distance to test formatting
+const WORST_SHIPS = [
+  // 12-char name fills x=16-63 exactly (centerShipX=16, last pixel x=62)
+  {name:'HARBOR PILOT', type:50, type_name:'Special Ops', destination:'PLYMOUTH MA',
+   length:65, distance_mi:0.9, heading:280},
+  // 300m vessel — maximum silhouette height (28px)
+  {name:'EVER GOLDEN',  type:70, type_name:'Container',   destination:'ROTTERDAM',
+   length:300, distance_mi:12.0, heading:75},
+  // 12-char destination (also hits the limit)
+  {name:'NEPTUNE',      type:80, type_name:'Crude Tanker', destination:'PUERTO CORTE',
+   length:180, distance_mi:6.4, heading:195},
+  // Minimum-length ship — silhouette at 10px (shortest possible)
+  {name:'PILOT',        type:50, type_name:'Pilot',        destination:'',
+   length:12, distance_mi:0.3, heading:90},
+];
+let _wsIdx = 0;
+function injectWorstShip() {
+  const ws = WORST_SHIPS[_wsIdx++ % WORST_SHIPS.length];
+  ships = [ws]; showing_planes = false;
+  _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;
+  dataLoaded = true;
+  log(`Worst ship: "${ws.name}" (${ws.name.length} chars) ${ws.length}m dest="${ws.destination}"`);
 }
 
 // =========================================================================

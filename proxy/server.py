@@ -16,6 +16,7 @@ Usage:
 
 import json
 import os
+import sqlite3
 import time
 import asyncio
 import threading
@@ -69,6 +70,94 @@ def cache_get(key, max_age_sec):
 def cache_set(key, data):
     with _cache_lock:
         _cache[key] = {"data": data, "time": time.time()}
+
+
+# ---------------------------------------------------------------------------
+# Sightings log (SQLite)
+# ---------------------------------------------------------------------------
+
+DB_PATH = Path(__file__).parent / "sightings.db"
+_db_lock = Lock()
+
+def _db_init():
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS ships (
+                id        INTEGER PRIMARY KEY,
+                ts        INTEGER NOT NULL,
+                mmsi      TEXT,
+                name      TEXT,
+                type_name TEXT,
+                lat       REAL,
+                lon       REAL,
+                speed     REAL,
+                heading   INTEGER,
+                distance_mi REAL,
+                destination TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS planes (
+                id        INTEGER PRIMARY KEY,
+                ts        INTEGER NOT NULL,
+                callsign  TEXT,
+                icao24    TEXT,
+                alt_ft    INTEGER,
+                speed_kt  INTEGER,
+                heading   INTEGER,
+                lat       REAL,
+                lon       REAL,
+                distance_mi REAL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS ships_ts  ON ships(ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS planes_ts ON planes(ts)")
+
+# Deduplicate: don't log the same vessel again within this window
+_SHIP_LOG_INTERVAL  = 300   # 5 minutes
+_PLANE_LOG_INTERVAL = 120   # 2 minutes
+_last_ship_log  = {}  # mmsi  -> last logged ts
+_last_plane_log = {}  # callsign -> last logged ts
+
+def log_ship(s):
+    mmsi = s.get("mmsi", "")
+    now = int(time.time())
+    if now - _last_ship_log.get(mmsi, 0) < _SHIP_LOG_INTERVAL:
+        return
+    _last_ship_log[mmsi] = now
+    with _db_lock:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT INTO ships (ts,mmsi,name,type_name,lat,lon,speed,heading,distance_mi,destination) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (now, mmsi, s.get("name",""), s.get("type_name",""),
+                 s.get("lat"), s.get("lon"), s.get("speed"), s.get("heading"),
+                 s.get("distance_mi"), s.get("destination",""))
+            )
+
+def log_plane(callsign, icao24, alt_ft, speed_kt, heading, lat, lon):
+    now = int(time.time())
+    if now - _last_plane_log.get(callsign, 0) < _PLANE_LOG_INTERVAL:
+        return
+    _last_plane_log[callsign] = now
+    import math
+    def _dist(la1, lo1, la2, lo2):
+        if not la2 or not lo2:
+            return None
+        R = 3958.8
+        phi1, phi2 = math.radians(la1), math.radians(la2)
+        dphi = math.radians(la2 - la1)
+        dlam = math.radians(lo2 - lo1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+        return round(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
+    distance_mi = _dist(LATITUDE, LONGITUDE, lat, lon)
+    with _db_lock:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT INTO planes (ts,callsign,icao24,alt_ft,speed_kt,heading,lat,lon,distance_mi) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (now, callsign, icao24, alt_ft, speed_kt, heading, lat, lon, distance_mi)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +222,10 @@ def handle_planes(params):
     try:
         raw = json.loads(data)
         states = raw.get("states") or []
+        # Return a slim positional-array per plane: [call, icao24, alt, spd, hdg, vrate]
+        # Positional arrays avoid the ~30-byte string-key interning per field
+        # that named-key dicts cost on the device's JSON parser. With ~6 fields
+        # per plane, that's ~180 bytes saved per plane in device heap.
         planes = []
         for s in states:
             if s[8]:                                # on_ground
@@ -141,18 +234,17 @@ def handle_planes(params):
             if not callsign:
                 continue
             alt_m = s[7] or s[13] or 0              # baro_altitude or geo
-            alt_ft = int(alt_m * 3.281)
-            vel_kt = int((s[9] or 0) * 1.944)
-            hdg = int(s[10] or 0)
-            vrate = int(s[11] or 0)
-            planes.append({
-                "call":   callsign[:8],
-                "icao24": s[0] or "",
-                "alt":    alt_ft,
-                "spd":    vel_kt,
-                "hdg":    hdg,
-                "vrate":  vrate,
-            })
+            p_lat, p_lon = s[6] or 0, s[5] or 0
+            entry = [
+                callsign[:8],
+                s[0] or "",                         # icao24
+                int(alt_m * 3.281),                 # alt (ft)
+                int((s[9] or 0) * 1.944),           # spd (kt)
+                int(s[10] or 0),                    # hdg
+                int(s[11] or 0),                    # vrate
+            ]
+            planes.append(entry)
+            log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
         cache_set(cache_key, body)
         return 200, body
@@ -382,8 +474,8 @@ _ships = {}         # MMSI -> ship info dict
 _ships_lock = Lock()
 SHIP_STALE_SECS = 600  # remove ships not seen in 10 min
 SHIP_MIN_LENGTH = 30   # meters — filter out small vessels
-SHIP_CENTER_LAT = 42.142039  # center point for distance filter
-SHIP_CENTER_LON = -70.693353
+SHIP_CENTER_LAT = 42.14265296228326
+SHIP_CENTER_LON = -70.69248720290413
 SHIP_MAX_MILES = 10    # only show ships within this radius
 
 AIS_TYPE_NAMES = {
@@ -502,8 +594,9 @@ def handle_ships(params):
         for s in _ships.values():
             if not s.get("name"):
                 continue
-            # Minimum length filter
-            if s.get("length", 0) < SHIP_MIN_LENGTH:
+            # Minimum length filter — only exclude if length was reported and is small
+            length = s.get("length", 0)
+            if length and length < SHIP_MIN_LENGTH:
                 continue
             # Require a valid position fix before including
             lat = s.get("lat", 0)
@@ -515,6 +608,7 @@ def handle_ships(params):
                 continue
             s["distance_mi"] = round(dist, 1)
             ship_list.append(s)
+            log_ship(s)
         # Sort by distance
         ship_list.sort(key=lambda s: s.get("distance_mi", 999))
     body = json.dumps({"ships": ship_list}).encode()
@@ -531,17 +625,68 @@ def handle_health(params):
     }).encode()
 
 
+def handle_ships_debug(params):
+    """Return raw ship data without filtering, for diagnostics."""
+    _prune_stale_ships()
+    with _ships_lock:
+        ships_raw = list(_ships.values())
+    ships_raw.sort(key=lambda s: _distance_miles(
+        SHIP_CENTER_LAT, SHIP_CENTER_LON,
+        s.get("lat", 0), s.get("lon", 0)
+    ))
+    annotated = []
+    for s in ships_raw[:20]:
+        d = dict(s)
+        d["distance_mi"] = round(_distance_miles(
+            SHIP_CENTER_LAT, SHIP_CENTER_LON,
+            s.get("lat", 0), s.get("lon", 0)
+        ), 1)
+        annotated.append(d)
+    return 200, json.dumps({"ships": annotated, "total": len(ships_raw)}).encode()
+
+
 # ---------------------------------------------------------------------------
 # Route registry — add new APIs here
 # ---------------------------------------------------------------------------
 
+def handle_sightings(params):
+    """Query historical sightings log.
+    ?type=ships|planes  (default: both)
+    ?hours=N            (default: 24)
+    ?limit=N            (default: 100)
+    """
+    kind   = params.get("type",  ["both"])[0]
+    hours  = int(params.get("hours", ["24"])[0])
+    limit  = int(params.get("limit", ["100"])[0])
+    since  = int(time.time()) - hours * 3600
+    result = {}
+    with _db_lock:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            if kind in ("ships", "both"):
+                rows = con.execute(
+                    "SELECT * FROM ships WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                    (since, limit)
+                ).fetchall()
+                result["ships"] = [dict(r) for r in rows]
+            if kind in ("planes", "both"):
+                rows = con.execute(
+                    "SELECT * FROM planes WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                    (since, limit)
+                ).fetchall()
+                result["planes"] = [dict(r) for r in rows]
+    return 200, json.dumps(result).encode()
+
+
 ROUTES = {
-    "/api/planes":    handle_planes,
-    "/api/route":     handle_route,
-    "/api/aircraft":  handle_aircraft,
-    "/api/forecast":  handle_forecast,
-    "/api/ships":     handle_ships,
-    "/api/health":    handle_health,
+    "/api/planes":      handle_planes,
+    "/api/route":       handle_route,
+    "/api/aircraft":    handle_aircraft,
+    "/api/forecast":    handle_forecast,
+    "/api/ships":       handle_ships,
+    "/api/ships/debug": handle_ships_debug,
+    "/api/sightings":   handle_sightings,
+    "/api/health":      handle_health,
 }
 
 
@@ -580,10 +725,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _db_init()
     print(f"Matrix Portal Proxy — port {PORT}")
     print(f"Config: {CONFIG_FILE}")
     print(f"Routes: {', '.join(ROUTES.keys())}")
     print(f"Location: {LATITUDE}, {LONGITUDE} (bbox {BBOX})")
+    print(f"Sightings DB: {DB_PATH}")
 
     # Start AIS WebSocket listener in background thread
     if AISSTREAM_KEY:

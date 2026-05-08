@@ -13,13 +13,13 @@ import json
 import os
 import urllib.request
 import urllib.error
-import base64
 from pathlib import Path
 
 PORT = 8000
 BASE_DIR = Path(__file__).parent
 DEVICE_DIR = BASE_DIR.parent / "device"
 ENV_FILE = BASE_DIR / ".env"
+PI_PROXY = "http://YOUR_PROXY_HOST:6590"
 
 
 def load_env():
@@ -88,12 +88,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # --- /api/tides → proxy NOAA ---
-        if self.path == "/api/tides":
+        # --- /api/tides → proxy NOAA (supports ?date=today|tomorrow) ---
+        if self.path == "/api/tides" or self.path.startswith("/api/tides?"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            date_param = qs.get("date", ["today"])[0]
+            if date_param not in ("today", "tomorrow"):
+                date_param = "today"
             station = ENV.get("NOAA_STATION", "8443970")
             url = (
                 f"https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-                f"?date=today&station={station}&product=predictions&datum=MLLW"
+                f"?date={date_param}&station={station}&product=predictions&datum=MLLW"
                 f"&time_zone=lst_ldt&interval=hilo&units=english&format=json"
             )
             status, data = proxy_get(url)
@@ -103,73 +108,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # --- /api/planes → proxy OpenSky ---
-        if self.path == "/api/planes":
-            lat = float(ENV.get("LATITUDE", 42.36))
-            lon = float(ENV.get("LONGITUDE", -71.06))
-            bbox = 0.1
-            url = (
-                f"https://opensky-network.org/api/states/all"
-                f"?lamin={lat-bbox}&lomin={lon-bbox}"
-                f"&lamax={lat+bbox}&lomax={lon+bbox}"
-            )
-            headers = {}
-            user = ENV.get("OPENSKY_USER", "")
-            pw = ENV.get("OPENSKY_PASS", "")
-            if user and pw:
-                cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
-                headers["Authorization"] = f"Basic {cred}"
-            status, data = proxy_get(url, headers)
+        # --- /api/planes → proxy to Pi ---
+        if self.path == "/api/planes" or self.path.startswith("/api/planes?"):
+            status, data = proxy_get(f"{PI_PROXY}{self.path}")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(data)
             return
 
-        # --- /api/route?callsign=XXX → proxy OpenSky routes ---
+        # --- /api/route?callsign=XXX&icao24=XXX → proxy to Pi ---
         if self.path.startswith("/api/route?"):
-            from urllib.parse import urlparse, parse_qs
-            qs = parse_qs(urlparse(self.path).query)
-            callsign = qs.get("callsign", [""])[0].strip()
-            if not callsign:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"missing callsign"}')
-                return
-            url = f"https://opensky-network.org/api/routes?callsign={callsign}"
-            headers = {}
-            user = ENV.get("OPENSKY_USER", "")
-            pw = ENV.get("OPENSKY_PASS", "")
-            if user and pw:
-                cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
-                headers["Authorization"] = f"Basic {cred}"
-            status, data = proxy_get(url, headers)
+            status, data = proxy_get(f"{PI_PROXY}{self.path}")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(data)
             return
 
-        # --- /api/aircraft?icao24=XXX → proxy OpenSky metadata ---
+        # --- /api/aircraft?icao24=XXX → proxy to Pi ---
         if self.path.startswith("/api/aircraft?"):
-            from urllib.parse import urlparse, parse_qs
-            qs = parse_qs(urlparse(self.path).query)
-            icao24 = qs.get("icao24", [""])[0].strip()
-            if not icao24:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"missing icao24"}')
-                return
-            url = f"https://opensky-network.org/api/metadata/aircraft/icao24/{icao24}"
-            headers = {}
-            user = ENV.get("OPENSKY_USER", "")
-            pw = ENV.get("OPENSKY_PASS", "")
-            if user and pw:
-                cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
-                headers["Authorization"] = f"Basic {cred}"
-            status, data = proxy_get(url, headers)
+            status, data = proxy_get(f"{PI_PROXY}{self.path}")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -197,9 +156,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # --- /api/ships → proxy to Pi's ship endpoint ---
+        # --- /api/ships → proxy to Pi ---
         if self.path == "/api/ships":
-            status, data = proxy_get("http://YOUR_PROXY_HOST:6590/api/ships")
+            status, data = proxy_get(f"{PI_PROXY}/api/ships")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

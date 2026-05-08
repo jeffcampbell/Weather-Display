@@ -224,24 +224,6 @@ def icao_to_display(icao):
 
 COMPASS_DIRS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 
-def temp_color(t):
-    """Return display color for a temperature value (°F)."""
-    if t >= 90: return 0xFF2222
-    if t >= 80: return 0xFF8800
-    if t >= 60: return 0xFFDD00
-    if t >= 40: return 0x88FFCC
-    if t >= 20: return 0x44AAFF
-    return 0x2255CC
-
-def _icon_color_for(cond_main):
-    """Return icon color for a weather condition string."""
-    if cond_main == "Clear":       return 0xFFCC00
-    if cond_main in ("Rain", "Drizzle"): return 0x4488FF
-    if cond_main == "Snow":        return 0xCCDDFF
-    if cond_main == "Thunderstorm": return 0xAAAA00
-    if cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"): return 0x888888
-    return 0xAAAAAA
-
 def heading_to_compass(hdg):
     return COMPASS_DIRS[round(hdg / 45) % 8]
 
@@ -477,7 +459,7 @@ _FLIGHT_CACHE_MAX = 10
 
 
 _consecutive_fetch_errs = 0
-_FETCH_ERR_RESET_THRESHOLD = 12  # auto-reboot after this many in a row
+_FETCH_ERR_RESET_THRESHOLD = 12  # auto-reboot after this many fetch/render errors in a row
 
 def fetch_json(url):
     """Fetch a URL and return parsed JSON. Always closes the socket — without
@@ -632,15 +614,23 @@ loading_group.append(loading_label)
 # Start with loading screen
 display.root_group = loading_group
 
+
 # ---------------------------------------------------------------------------
-# Time sync (Adafruit IO)
+# Time sync — NTP direct (Adafruit IO requires aio_username/aio_key we don't have)
 # ---------------------------------------------------------------------------
-print("Syncing time...")
+print("Syncing time via NTP...")
 try:
-    mp.network.get_local_time(TIMEZONE)
-    print("Time synced:", time.localtime())
+    import socketpool, wifi as _wifi_mod, adafruit_ntp, rtc as _rtc_mod
+    _pool = socketpool.SocketPool(_wifi_mod.radio)
+    _ntp = adafruit_ntp.NTP(_pool, tz_offset=0)
+    _utc = _ntp.datetime
+    # America/New_York: EDT (UTC-4) March-October, EST (UTC-5) otherwise
+    _tz_off = -4 if 3 <= _utc.tm_mon <= 10 else -5
+    _local_secs = time.mktime(_utc) + _tz_off * 3600
+    _rtc_mod.RTC().datetime = time.localtime(_local_secs)
+    print("Time synced (UTC{:+d}):".format(_tz_off), time.localtime())
 except Exception as e:
-    print("Time sync failed:", e)
+    print("NTP sync failed:", e)
 
 # ---------------------------------------------------------------------------
 # State
@@ -677,7 +667,19 @@ current_screen = "loading"
 def update_weather_icon(cond_main):
     """Rebuild the weather icon bitmap for the given condition."""
     icon_data = _get_icon_for(cond_main)
-    wx_icon_pal[1] = _icon_color_for(cond_main)
+    if cond_main == "Clear":
+        c = 0xFFCC00
+    elif cond_main in ("Rain", "Drizzle"):
+        c = 0x4488FF
+    elif cond_main == "Snow":
+        c = 0xCCDDFF
+    elif cond_main == "Thunderstorm":
+        c = 0xAAAA00
+    elif cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"):
+        c = 0x888888
+    else:
+        c = 0xAAAAAA
+    wx_icon_pal[1] = c
     for row in range(8):
         byte = icon_data[row]
         for col in range(8):
@@ -759,17 +761,16 @@ def fetch_tides():
     global tide_str, tide_type_val, _tide_predictions
     gc.collect()
     try:
-        url = (
+        base = (
             "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-            "?date=today&station={}&product=predictions&datum=MLLW"
+            "?date={}&station={}&product=predictions&datum=MLLW"
             "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
-        ).format(NOAA_STATION)
-        data = fetch_json(url)
-        preds = data.get("predictions", [])
+        )
+        preds = fetch_json(base.format("today", NOAA_STATION)).get("predictions", [])
         now = time.localtime()
         now_mins = now.tm_hour * 60 + now.tm_min
 
-        # Store all predictions for basin interpolation
+        # Store today's predictions for basin interpolation (today only)
         _tide_predictions = []
         for p in preds:
             time_part = p["t"].split(" ")[1]
@@ -777,7 +778,7 @@ def fetch_tides():
             h, m = int(h_str), int(m_str)
             _tide_predictions.append((h * 60 + m, p.get("type", ""), h, m_str))
 
-        # Find next upcoming tide
+        # Find next upcoming tide; fall through to tomorrow if today is exhausted
         found = False
         for p in _tide_predictions:
             if p[0] >= now_mins:
@@ -788,9 +789,21 @@ def fetch_tides():
                 print("Tide:", tide_type_val, tide_str)
                 break
         if not found:
-            tide_str = "DONE"
-            tide_type_val = ""
-        # Calculate basin level
+            tmr_preds = fetch_json(base.format("tomorrow", NOAA_STATION)).get("predictions", [])
+            for p in tmr_preds:
+                time_part = p["t"].split(" ")[1]
+                h_str, m_str = time_part.split(":")
+                h = int(h_str)
+                h12 = h % 12 or 12
+                tide_type_val = p.get("type", "")
+                tide_str = "{}:{}".format(h12, m_str)
+                print("Tide (tmr):", tide_type_val, tide_str)
+                found = True
+                break
+            if not found:
+                tide_str = "N/A"
+                tide_type_val = ""
+        # Calculate basin level — the per-tick block redraws it each frame
         interpolate_tide_level()
     except Exception as e:
         print("Tide err:", e)
@@ -808,8 +821,8 @@ def fetch_planes():
     try:
         url = "{}/api/planes".format(PROXY_HOST)
         data = fetch_json(url)
-        # Proxy already filters on_ground / no-callsign and trims to the 6
-        # fields we use, so the response is roughly half the OpenSky size.
+        # Proxy returns positional arrays: [call, icao24, alt, spd, hdg, vrate]
+        # Avoids ~180 bytes/plane of string-key interning vs named-key dicts.
         planes = data.get("planes") or []
         print("Planes overhead:", len(planes))
     except MemoryError:
@@ -882,138 +895,113 @@ def fetch_ships():
 
 
 def show_ship(ship):
+    """Display a ship — reuses the plane screen group to save RAM.
+    Wrapped in try/except so a label-realloc MemoryError just skips this
+    render instead of crashing the device."""
     try:
-        _show_ship_inner(ship)
+        gc.collect()
+        switch_screen("plane")
+        name = ship.get("name", "UNKNOWN")
+        type_name = ship.get("type_name", "Vessel")
+        type_code = ship.get("type", 0)
+        dest = ship.get("destination", "")
+        color = get_ship_type_color(type_code)
+        length = ship.get("length", 50)
+
+        # Draw ship silhouette in left column, scaled by length.
+        # Map 30-300m → 10-28px tall, centered vertically.
+        ship_h = max(10, min(28, int(10 + (length - 30) * 18 / 270)))
+        ship_w = max(4, min(10, ship_h // 3 + 2))
+        y_start = (32 - ship_h) // 2
+        bow_len = max(2, ship_h // 5)
+        cx = 7
+
+        pl_bg_pal[1] = 0x0A2A40
+        pl_bg_pal[2] = 0xDDDDDD
+        for y in range(32):
+            for x in range(14):
+                pl_bg_bmp[x, y] = 1
+        for i in range(ship_h):
+            y = y_start + i
+            if y < 0 or y > 31:
+                continue
+            if i < bow_len:
+                hw = max(1, ship_w * (i + 1) // (bow_len + 1) // 2)
+            elif i >= ship_h - 2:
+                hw = ship_w // 2 - 1
+            else:
+                hw = ship_w // 2
+            for x in range(cx - hw, cx + hw + 1):
+                if 0 <= x < 14:
+                    pl_bg_bmp[x, y] = 2
+
+        actype_label.text = ""
+        logo_label.text = ""
+        route_label.text = ""
+
+        _center_ship(airline_label, name[:12])
+        airline_label.color = 0xFFFFFF
+        airline_label.y = 5
+
+        _center_ship(reg_label, type_name)
+        reg_label.color = color
+        reg_label.y = 12
+
+        if dest:
+            _center_ship(alt_label, dest[:12])
+        else:
+            alt_label.text = ""
+        alt_label.color = 0x888899
+        alt_label.y = 19
+
+        dist = ship.get("distance_mi", 0)
+        hdg = ship.get("heading", 0)
+        compass = heading_to_compass(hdg)
+        info = "{}mi {}".format(dist, compass) if dist else compass
+        _center_ship(actype_label, info)
+        actype_label.color = 0x6699AA
+        actype_label.y = 26
     except MemoryError as _e:
         print("show_ship MemoryError:", _e)
         gc.collect()
 
 
-def _show_ship_inner(ship):
-    """Display a ship — reuses the plane screen group to save RAM."""
-    gc.collect()
-    switch_screen("plane")
-    name = ship.get("name", "UNKNOWN")
-    type_name = ship.get("type_name", "Vessel")
-    type_code = ship.get("type", 0)
-    dest = ship.get("destination", "")
-
-    # Update left column color with ship type
-    color = get_ship_type_color(type_code)
-    length = ship.get("length", 50)
-
-    # Draw ship silhouette in left column, scaled by length
-    # Map 30-300m → 10-28px tall, centered vertically
-    ship_h = max(10, min(28, int(10 + (length - 30) * 18 / 270)))
-    ship_w = max(4, min(10, ship_h // 3 + 2))  # width proportional
-    y_start = (32 - ship_h) // 2
-    bow_len = max(2, ship_h // 5)  # pointed bow section
-    cx = 7  # center x of 14px column
-
-    # Fill column with ocean blue
-    pl_bg_pal[1] = 0x0A2A40  # ocean blue
-    pl_bg_pal[2] = 0xDDDDDD  # ship hull (white/light gray)
-    for y in range(32):
-        for x in range(14):
-            pl_bg_bmp[x, y] = 1  # ocean
-
-    # Draw white ship hull
-    for i in range(ship_h):
-        y = y_start + i
-        if y < 0 or y > 31:
-            continue
-        if i < bow_len:
-            hw = max(1, ship_w * (i + 1) // (bow_len + 1) // 2)
-        elif i >= ship_h - 2:
-            hw = ship_w // 2 - 1
-        else:
-            hw = ship_w // 2
-        for x in range(cx - hw, cx + hw + 1):
-            if 0 <= x < 14:
-                pl_bg_bmp[x, y] = 2  # white hull
-
-    actype_label.text = ""
-    logo_label.text = ""
-
-    # Clear large-font label
-    route_label.text = ""
-
-    # Row 1: Ship name (small font, centered)
-    logo_label.text = ""
-    _center_ship(airline_label, name[:12])
-    airline_label.color = 0xFFFFFF
-    airline_label.y = 5
-
-    # Row 2: Vessel type (centered)
-    _center_ship(reg_label, type_name)
-    reg_label.color = color
-    reg_label.y = 12
-
-    # Row 3: Destination (centered)
-    if dest:
-        _center_ship(alt_label, dest[:12])
-    else:
-        alt_label.text = ""
-    alt_label.color = 0x888899
-    alt_label.y = 19
-
-    # Row 4: Distance + heading (centered, reuse route_label but keep short)
-    dist = ship.get("distance_mi", 0)
-    hdg = ship.get("heading", 0)
-    compass = heading_to_compass(hdg)
-    if dist:
-        info = "{}mi {}".format(dist, compass)
-    else:
-        info = compass
-    route_label.text = ""
-    # Row 4: distance + heading (small font, centered)
-    _center_ship(actype_label, info)
-    actype_label.color = 0x6699AA
-    actype_label.y = 26
-
-
-
 def show_weather_tides():
+    """Render the current weather + tide screen. Wrapped in try/except so
+    a label-realloc MemoryError just skips this render instead of crashing."""
     try:
-        _show_weather_tides_inner()
+        switch_screen("weather")
+        update_weather_icon(weather_cond_main)
+        wx_icon_tg.x = _RIGHT_START + (_RIGHT_W - 8) // 2 - 10
+        _center_mid(temp_label, weather_str)
+        try:
+            temp_val = int(weather_str.split(chr(176))[0])
+        except (ValueError, IndexError):
+            temp_val = 60
+        if temp_val >= 90:   tc = 0xFF2222
+        elif temp_val >= 80: tc = 0xFF8800
+        elif temp_val >= 60: tc = 0xFFDD00
+        elif temp_val >= 40: tc = 0x88FFCC
+        elif temp_val >= 20: tc = 0x44AAFF
+        else:                tc = 0x2255CC
+        temp_label.color = tc
+        tw = len(weather_str) * 5
+        wx_icon_tg.x = _RIGHT_START + (_RIGHT_W - tw) // 2 - 10
+        _center_small(cond_label, weather_cond[:8])
+        _center_small(wind_label, wind_str)
+        # Tide time / HIGH / LOW at bottom of left column
+        now_m = time.localtime()
+        now_mins = now_m.tm_hour * 60 + now_m.tm_min
+        slack_label = ""
+        for p in _tide_predictions:
+            if abs(p[0] - now_mins) <= 15:
+                slack_label = "HIGH" if p[1] == "H" else "LOW"
+                break
+        tide_time_label.text = slack_label if slack_label else tide_str
+        tide_time_label.color = 0xFFFFFF if (slack_label or _tide_level < 0.2) else 0x00CCDD
     except MemoryError as _e:
         print("show_weather_tides MemoryError:", _e)
         gc.collect()
-
-
-def _show_weather_tides_inner():
-    switch_screen("weather")
-    # Weather icon — center in right panel
-    update_weather_icon(weather_cond_main)
-    icon_x = _RIGHT_START + (_RIGHT_W - 8) // 2
-    wx_icon_tg.x = icon_x - 10  # offset left of temp
-    # Temperature — centered, color based on temp value
-    _center_mid(temp_label, weather_str)
-    try:
-        temp_val = int(weather_str.split(chr(176))[0])
-    except (ValueError, IndexError):
-        temp_val = 60
-    temp_label.color = temp_color(temp_val)
-    # Nudge icon to left of centered temp
-    tw = len(weather_str) * 5
-    temp_center = _RIGHT_START + (_RIGHT_W - tw) // 2
-    wx_icon_tg.x = temp_center - 10
-    # Condition — centered (small font), cap to 8 chars to fit pre-sized label
-    _center_small(cond_label, weather_cond[:8])
-    # Wind — centered (small font)
-    _center_small(wind_label, wind_str)
-    # Tide time at bottom of left column
-    # Show "HIGH" or "LOW" when within 15 min of slack tide
-    now_m = time.localtime()
-    now_mins = now_m.tm_hour * 60 + now_m.tm_min
-    slack_label = ""
-    for p in _tide_predictions:
-        if abs(p[0] - now_mins) <= 15:
-            slack_label = "HIGH" if p[1] == "H" else "LOW"
-            break
-    tide_time_label.text = slack_label if slack_label else tide_str
-    tide_time_label.color = 0xFFFFFF if (slack_label or _tide_level < 0.2) else 0x00CCDD
-    # Basin + clock updated in main loop
 
 
 def has_route(callsign):
@@ -1023,82 +1011,63 @@ def has_route(callsign):
 
 
 def get_displayable_planes():
-    """Return only planes that have route data."""
+    """Return only planes that have route data.
+    Plane format from proxy: [call, icao24, alt, spd, hdg, vrate]"""
     result = []
     for p in planes:
-        if p["call"] not in flight_cache:
-            fetch_route(p["call"], p.get("icao24", ""))
-        if has_route(p["call"]):
+        call = p[0]
+        if call not in flight_cache:
+            fetch_route(call, p[1])
+        if has_route(call):
             result.append(p)
     return result
 
 
 def show_plane(plane):
+    """Render plane info. Wrapped in try/except so a label-realloc MemoryError
+    just skips this render instead of crashing.
+    Plane format from proxy: [call, icao24, alt, spd, hdg, vrate]"""
     try:
-        _show_plane_inner(plane)
+        gc.collect()
+        switch_screen("plane")
+        # Reset bg pixels (show_ship may have rewritten them) + label layout
+        for _y in range(32):
+            for _x in range(14):
+                pl_bg_bmp[_x, _y] = 2 if (_x == 0 or _x == 13 or _y == 0 or _y == 31) else 1
+        airline_label.y = 13; airline_label.x = 16
+        actype_label.y  = 13; actype_label.x  = 48
+        alt_label.y     = 20; alt_label.x     = 16; alt_label.color = 0x44AA44
+        reg_label.y     = 27; reg_label.x     = 16; reg_label.color = 0x667788
+        logo_label.y    = 16; logo_label.x    = 2
+
+        callsign = plane[0]
+        name, iata, color = get_airline_info(callsign)
+        update_plane_bg(color)
+
+        logo_label.text = iata
+        logo_label.x = 1 + (14 - len(iata) * 6) // 2
+        bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
+        logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
+
+        route = flight_cache.get(callsign, {})
+        route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
+
+        airline_label.text = name[:8]
+        airline_label.color = color
+        ac_type = route.get("type", "")
+        actype_label.text = ac_type
+        actype_label.x = max(18, 64 - len(ac_type) * 4) if ac_type else 48
+
+        alt_k = plane[2] // 1000
+        if alt_k > 0:
+            alt_label.text = "{}k {}".format(alt_k, heading_to_compass(plane[4]))
+        else:
+            alt_label.text = ""
+
+        reg_label.text = route.get("reg", "") or ""
     except MemoryError as _e:
         print("show_plane MemoryError:", _e)
         gc.collect()
-
-
-def _show_plane_inner(plane):
-    gc.collect()
-    switch_screen("plane")
-    # Reset pl_bg_bmp to plane border layout (show_ship rewrites every pixel)
-    for _y in range(32):
-        for _x in range(14):
-            pl_bg_bmp[_x, _y] = 2 if (_x == 0 or _x == 13 or _y == 0 or _y == 31) else 1
-    # Reset label positions/colors to plane layout (show_ship mutates these)
-    airline_label.y = 13
-    airline_label.x = 16
-    actype_label.y = 13
-    actype_label.x = 48
-    alt_label.y = 20
-    alt_label.x = 16
-    alt_label.color = 0x44AA44
-    reg_label.y = 27
-    reg_label.x = 16
-    reg_label.color = 0x667788
-    logo_label.y = 16
-    logo_label.x = 2
-    callsign = plane["call"]
-    name, iata, color = get_airline_info(callsign)
-
-    # Update background with airline branding
-    update_plane_bg(color)
-
-    # Logo: IATA code centered in logo box
-    logo_label.text = iata
-    logo_label.x = 1 + (14 - len(iata) * 6) // 2
-    bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
-    logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
-
-    route = flight_cache.get(callsign, {})
-    origin = route.get("origin", "")
-    dest = route.get("dest", "")
-    ac_type = route.get("type", "")
-    reg = route.get("reg", "")
-
-    # Row 1: Route — LARGE, next to plane icon
-    route_label.text = "{}>{}".format(origin, dest)
-
-    # Row 2: Airline (left) + type (right-aligned)
-    airline_label.text = name[:8]
-    airline_label.color = color
-    actype_label.text = ac_type
-    # Right-align type: 4px per char in small font
-    actype_label.x = max(18, 64 - len(ac_type) * 4) if ac_type else 48
-
-    # Row 3: Altitude + climb/descend arrow + heading — small
-    alt_k = plane["alt"] // 1000
-    compass = heading_to_compass(plane["hdg"])
-    if alt_k > 0:
-        alt_label.text = "{}k {}".format(alt_k, compass)
-    else:
-        alt_label.text = ""
-
-    # Row 4: Registration (tail number) — small, dim
-    reg_label.text = reg or ""
 
 
 
@@ -1215,28 +1184,44 @@ while True:
                         ship_idx = expected_idx
                         show_ship(ships[ship_idx])
 
-    # Weather screen per-tick updates: clock + basin animation
+    # Per-tick updates: clock + basin wave animation + tide direction pixel.
+    # Wrapped in try/except so a transient MemoryError just skips this frame
+    # instead of propagating to the top-level loop and crashing the device.
+    # gc.collect() first to maximize the largest contiguous free block.
+    # NOTE: do NOT call fetch_failed() here — render MemoryErrors are normal
+    # and must not count toward the auto-reboot threshold.
     if not showing_planes and not _showing_ship:
-        t = time.localtime()
-        h12 = t.tm_hour % 12 or 12
-        ampm = "A" if t.tm_hour < 12 else "P"
-        _center_mid(clock_label, "{}:{:02d} {}M".format(h12, t.tm_min, ampm))
-        # Animate tide basin surface
-        _basin_anim_tick += 1
-        update_basin_water(_tide_level, _basin_anim_tick)
-        # Slide tide direction pixel up (rising) or down (ebbing) along
-        # the separator. Hide it when the label is showing HIGH/LOW (slack
-        # tide) since direction is meaningless at the turn.
-        _at_slack = tide_time_label.text in ("HIGH", "LOW")
-        sep_pixel_tg.hidden = _at_slack
-        if not _at_slack:
-            if tide_type_val == "H":
-                _sep_pixel_y = (_sep_pixel_y - 1) % 32
-            elif tide_type_val == "L":
-                _sep_pixel_y = (_sep_pixel_y + 1) % 32
-            sep_pixel_tg.y = _sep_pixel_y
-        # Adjust brightness based on sunrise/sunset
-        update_brightness()
+        try:
+            gc.collect()
+            t = time.localtime()
+            h12 = t.tm_hour % 12 or 12
+            ampm = "A" if t.tm_hour < 12 else "P"
+            _center_mid(clock_label, "{}:{:02d} {}M".format(h12, t.tm_min, ampm))
+            _basin_anim_tick += 1
+            update_basin_water(_tide_level, _basin_anim_tick)
+            _at_slack = tide_time_label.text in ("HIGH", "LOW")
+            if _at_slack:
+                _now_mins = t.tm_hour * 60 + t.tm_min
+                _still_slack = False
+                for _p in _tide_predictions:
+                    if abs(_p[0] - _now_mins) <= 15:
+                        _still_slack = True
+                        break
+                if not _still_slack:
+                    tide_time_label.text = tide_str
+                    tide_time_label.color = 0x00CCDD
+                    _at_slack = False
+            sep_pixel_tg.hidden = _at_slack
+            if not _at_slack:
+                if tide_type_val == "H":
+                    _sep_pixel_y = (_sep_pixel_y - 1) % 32
+                elif tide_type_val == "L":
+                    _sep_pixel_y = (_sep_pixel_y + 1) % 32
+                sep_pixel_tg.y = _sep_pixel_y
+            update_brightness()
+        except MemoryError as _e:
+            print("per-tick MemoryError:", _e)
+            gc.collect()
 
     # --- Button handling ---
     if not btn_down.value:  # pressed (active low)
