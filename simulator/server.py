@@ -4,18 +4,19 @@ Tiny dev server for the Matrix Portal Simulator.
 Reads .env for API keys, serves simulator.html, and proxies API calls to
 avoid CORS issues.
 
-Usage:  python3 server.py
-        Then open http://localhost:8000
+Usage:  python3 server.py [port]
+        Then open http://localhost:8000  (or whichever port)
 """
 
 import http.server
 import json
 import os
+import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-PORT = 8000
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 BASE_DIR = Path(__file__).parent
 DEVICE_DIR = BASE_DIR.parent / "device"
 ENV_FILE = BASE_DIR / ".env"
@@ -179,6 +180,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"Matrix Portal Simulator → http://localhost:{PORT}")
     print(f"Keys loaded from: {ENV_FILE}")
+    print(f"Tip: python3 server.py <port> to use a different port")
     server = http.server.HTTPServer(("", PORT), Handler)
     try:
         server.serve_forever()

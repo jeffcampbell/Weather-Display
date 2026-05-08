@@ -265,9 +265,9 @@ _TIDE_PARTICLES = ((3, 0), (11, 11), (17, 22))
 basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 6)
 basin_pal = displayio.Palette(6)
 basin_pal[0] = 0x000000
-basin_pal[1] = 0x031420   # water deep
-basin_pal[2] = 0x062838   # water mid
-basin_pal[3] = 0x0C3850   # water surface/crest
+basin_pal[1] = 0x001237   # water deep (navy)
+basin_pal[2] = 0x003264   # water mid (ocean blue)
+basin_pal[3] = 0x125A96   # water surface/crest (bright blue)
 basin_pal[4] = 0xBBBBBB   # ship hull (light gray)
 basin_pal[5] = 0xFF8822   # ship superstructure (amber)
 
@@ -587,15 +587,15 @@ plane_group.append(logo_label)
 route_label = Label(FONT, text="", color=0xFFFFFF, x=16, y=4)
 plane_group.append(route_label)
 
-# Row 2: Airline (left) + type (right) — small font
-airline_label = Label(FONT_SMALL, text="", color=0x00FF00, x=16, y=13)
+# Row 2: Airline name — mid font (bigger, more readable)
+airline_label = Label(FONT_MID, text="", color=0x00FF00, x=16, y=13)
 plane_group.append(airline_label)
 
-actype_label = Label(FONT_SMALL, text="", color=0x55AADD, x=48, y=13)
+actype_label = Label(FONT_SMALL, text="", color=0x55AADD, x=16, y=27)
 plane_group.append(actype_label)
 
-# Row 3: Altitude + heading — small font
-alt_label = Label(FONT_SMALL, text="", color=0x44AA44, x=16, y=20)
+# Row 3: Altitude + heading — mid font
+alt_label = Label(FONT_MID, text="", color=0x44AA44, x=16, y=20)
 plane_group.append(alt_label)
 
 # Row 4: Registration (tail number) — small font
@@ -854,6 +854,10 @@ def _center_ship(label, text):
     label.text = text
     label.x = 16 + (48 - len(text) * 4) // 2
 
+def _center_ship_mid(label, text):
+    label.text = text
+    label.x = 16 + (48 - len(text) * 5) // 2
+
 def _center_small(label, text):
     """Center a small-font label (4px/char) in the right panel."""
     label.text = text
@@ -916,8 +920,8 @@ def show_ship(ship):
         bow_len = max(2, ship_h // 5)
         cx = 7
 
-        pl_bg_pal[1] = 0x0A2A40
-        pl_bg_pal[2] = 0xDDDDDD
+        pl_bg_pal[1] = 0x041840   # deep ocean blue
+        pl_bg_pal[2] = 0xBBBBCC  # hull (light blue-gray)
         for y in range(32):
             for x in range(14):
                 pl_bg_bmp[x, y] = 1
@@ -939,28 +943,34 @@ def show_ship(ship):
         logo_label.text = ""
         route_label.text = ""
 
-        _center_ship(airline_label, name[:12])
+        # Upgrade to mid font for ship name/type/dest rows
+        airline_label.font = FONT_MID
+        alt_label.font = FONT_MID
+        reg_label.font = FONT_MID
+
+        _center_ship_mid(airline_label, name[:9])
         airline_label.color = 0xFFFFFF
         airline_label.y = 5
 
-        _center_ship(reg_label, type_name)
+        _center_ship_mid(reg_label, type_name[:9])
         reg_label.color = color
-        reg_label.y = 12
+        reg_label.y = 13
 
         if dest:
-            _center_ship(alt_label, dest[:12])
+            _center_ship_mid(alt_label, dest[:9])
         else:
             alt_label.text = ""
-        alt_label.color = 0x888899
-        alt_label.y = 19
+        alt_label.color = 0x8899AA
+        alt_label.y = 21
 
         dist = ship.get("distance_mi", 0)
         hdg = ship.get("heading", 0)
         compass = heading_to_compass(hdg)
         info = "{}mi {}".format(dist, compass) if dist else compass
+        actype_label.font = FONT_SMALL
         _center_ship(actype_label, info)
         actype_label.color = 0x6699AA
-        actype_label.y = 26
+        actype_label.y = 29
     except MemoryError as _e:
         print("show_ship MemoryError:", _e)
         gc.collect()
@@ -1034,9 +1044,15 @@ def show_plane(plane):
         for _y in range(32):
             for _x in range(14):
                 pl_bg_bmp[_x, _y] = 2 if (_x == 0 or _x == 13 or _y == 0 or _y == 31) else 1
+        # Restore fonts (show_ship may have changed them)
+        airline_label.font = FONT_MID
+        alt_label.font = FONT_MID
+        reg_label.font = FONT_SMALL
+        actype_label.font = FONT_SMALL
+
         airline_label.y = 13; airline_label.x = 16
-        actype_label.y  = 13; actype_label.x  = 48
         alt_label.y     = 20; alt_label.x     = 16; alt_label.color = 0x44AA44
+        actype_label.y  = 27; actype_label.x  = 16
         reg_label.y     = 27; reg_label.x     = 16; reg_label.color = 0x667788
         logo_label.y    = 16; logo_label.x    = 2
 
@@ -1054,17 +1070,18 @@ def show_plane(plane):
 
         airline_label.text = name[:8]
         airline_label.color = color
-        ac_type = route.get("type", "")
-        actype_label.text = ac_type
-        actype_label.x = max(18, 64 - len(ac_type) * 4) if ac_type else 48
 
         alt_k = plane[2] // 1000
-        if alt_k > 0:
-            alt_label.text = "{}k {}".format(alt_k, heading_to_compass(plane[4]))
-        else:
-            alt_label.text = ""
+        alt_label.text = "{}k {}".format(alt_k, heading_to_compass(plane[4])) if alt_k > 0 else ""
 
-        reg_label.text = route.get("reg", "") or ""
+        # Row 4: type (left) + registration (right-aligned)
+        ac_type = route.get("type", "")
+        actype_label.text = ac_type
+        actype_label.color = 0x55AADD
+        reg = route.get("reg", "") or ""
+        reg_label.text = reg
+        if reg:
+            reg_label.x = max(16, 64 - len(reg) * 4)
     except MemoryError as _e:
         print("show_plane MemoryError:", _e)
         gc.collect()
