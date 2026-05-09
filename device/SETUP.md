@@ -65,6 +65,29 @@ Copy `device/secrets.py.template` to `device/secrets.py` and fill in your values
 
 Copy `device/code.py` to `CIRCUITPY/code.py`. CircuitPython restarts automatically.
 
+## 7. (Optional, S3 only) Enable the web workflow
+
+Once the device boots correctly from USB, you can switch to managing it over Wi-Fi via [CircuitPython's web workflow](https://learn.adafruit.com/getting-started-with-web-workflow-using-the-code-editor/device-setup). After this step the CIRCUITPY drive no longer mounts as USB storage, so do it last — when you're confident the device is working.
+
+1. Copy `device/settings.toml.template` to `device/settings.toml` and fill in:
+
+   | Key | What to put |
+   |-----|-------------|
+   | `CIRCUITPY_WIFI_SSID` / `CIRCUITPY_WIFI_PASSWORD` | Same Wi-Fi as in `secrets.py` |
+   | `CIRCUITPY_WEB_API_PASSWORD` | A password the web editor will ask for; not your Wi-Fi password |
+   | `CIRCUITPY_WEB_API_PORT` | `80` |
+
+   `settings.toml` is gitignored.
+
+2. Copy `device/settings.toml` to `CIRCUITPY/settings.toml`.
+3. Copy `device/boot.py` to `CIRCUITPY/boot.py`. This calls `storage.disable_usb_drive()` so the web workflow gets read-write access. (On the S3, USB mass storage and the web workflow can't both have write access — Adafruit's recommendation is to disable USB.)
+4. Hard-reset the board (power-cycle or press the reset button — a soft reset isn't enough).
+5. Visit [code.circuitpython.org](https://code.circuitpython.org/) and click **Connect to Device**. Pick `cpy-XXXXXX.local` (or use the device's IP) and enter the `CIRCUITPY_WEB_API_PASSWORD`.
+
+To get USB drive access back, edit `boot.py` (via the web editor) to comment out `storage.disable_usb_drive()` and hard-reset.
+
+> **Note:** Wi-Fi credentials live in two places — `secrets.py` (read by the MatrixPortal library at runtime) and `settings.toml` (read by CircuitPython at boot). Keep them in sync if you change networks.
+
 ## Configuration
 
 Key settings at the top of `code.py`:

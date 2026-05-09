@@ -1,0 +1,19 @@
+# CircuitPython native settings — read at boot before code.py runs.
+# Copy to device/settings.toml, fill in real values, then copy that file
+# to CIRCUITPY/settings.toml. settings.toml is gitignored.
+#
+# These keys enable Wi-Fi auto-connect and the CircuitPython web workflow,
+# which lets you edit files and reset the board over Wi-Fi from
+# https://code.circuitpython.org/ — see device/SETUP.md.
+#
+# Required keys:
+
+CIRCUITPY_WIFI_SSID = "YOUR_WIFI_SSID"
+CIRCUITPY_WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+
+# Password the web workflow asks for before allowing edits/uploads.
+# Pick something different from your Wi-Fi password.
+CIRCUITPY_WEB_API_PASSWORD = "YOUR_WEB_WORKFLOW_PASSWORD"
+
+# TCP port for the web workflow server. 80 is conventional.
+CIRCUITPY_WEB_API_PORT = 80
