@@ -97,8 +97,6 @@ btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
 btn_down.switch_to_input(pull=digitalio.Pull.UP)
 
 # Button handlers — no-ops in production, saves ~3KB RAM
-def inject_test_weather(): pass
-def inject_test_plane(): pass
 def reset_to_live():
     global last_weather_fetch
     last_weather_fetch = -WEATHER_INTERVAL
@@ -1488,14 +1486,9 @@ while True:
             gc.collect()
 
     # --- Button handling ---
-    if not btn_down.value:  # pressed (active low)
-        if DEMO_MODE:
-            _demo_advance()
-            _demo_last_switch = now
-        elif PLANES_ENABLED:
-            inject_test_plane()
-        else:
-            inject_test_weather()
+    if not btn_down.value and DEMO_MODE:  # pressed (active low)
+        _demo_advance()
+        _demo_last_switch = now
         time.sleep(0.3)  # debounce
     if not btn_up.value:
         if PLANES_ENABLED:
