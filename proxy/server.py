@@ -59,6 +59,10 @@ _cache = {}       # key -> {"data": bytes, "time": float}
 _cache_lock = Lock()
 _started_at = time.time()
 
+# Consecutive OpenSky 429s; reset on the next successful upstream fetch.
+# Used by handle_planes to escalate the back-off window from 1h → 2h.
+_opensky_429_streak = 0
+
 
 def cache_get(key, max_age_sec):
     """Return cached bytes if fresh, else None. Respects age_override set by cache_set."""
@@ -86,6 +90,23 @@ DB_PATH = Path(__file__).parent / "sightings.db"
 _db_lock = Lock()
 LOG_FILE = Path(__file__).parent / "device.log"
 _log_lock = Lock()
+
+
+def _log_proxy_event(msg):
+    """Append a proxy-side event to device.log in the same format the
+    device uses, so /api/devicelog tail surfaces both sources together.
+    Each line is prefixed with `proxy:` so it's easy to grep."""
+    now = time.localtime()
+    entry = "[{:02d}:{:02d}:{:02d}] proxy: {}".format(
+        now.tm_hour, now.tm_min, now.tm_sec, msg)
+    line = "{} | {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), entry)
+    with _log_lock:
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line)
+        except Exception:
+            pass
+    print(entry)
 
 def _db_init():
     with sqlite3.connect(DB_PATH) as con:
@@ -225,16 +246,28 @@ def handle_planes(params):
     )
     status, data = fetch(url, headers=opensky_headers())
 
+    global _opensky_429_streak
+
     if status == 429:
+        _opensky_429_streak += 1
+        # First 429 in a streak: back off 1h. Successive 429s (when the
+        # next upstream attempt also gets throttled) escalate to 2h to be
+        # a better citizen to the OpenSky API.
+        backoff_secs = 7200 if _opensky_429_streak >= 2 else 3600
         empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
-        cache_set(cache_key, empty, age_override=3600)  # back off for 1 hour
-        print("OpenSky rate-limited (429) — caching empty response for 1 hour")
+        cache_set(cache_key, empty, age_override=backoff_secs)
+        _log_proxy_event("OpenSky 429 #{} — backing off {}h".format(
+            _opensky_429_streak, backoff_secs // 3600))
         return 200, empty
 
     if status != 200:
         # Always return valid JSON — a non-JSON upstream body (HTML 503, etc.)
         # would cause resp.json() to raise on the device, triggering fetch_failed().
         return 200, json.dumps({"time": 0, "planes": [], "upstream_error": status}).encode()
+
+    if _opensky_429_streak:
+        _log_proxy_event("OpenSky recovered after {} 429(s)".format(_opensky_429_streak))
+        _opensky_429_streak = 0
 
     try:
         raw = json.loads(data)
