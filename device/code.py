@@ -1,14 +1,6 @@
-# Matrix Portal M4 — Tides + Weather + Overhead Aircraft Tracker
-# Hardware: Matrix Portal M4 (SAMD51 + ESP32) + 64x32 RGB LED Matrix
-#
-# Enhanced display:
-#   Weather screen: weather icon + temp | scrolling condition | tide arrow + time
-#   Plane screen:   plane icon + callsign (airline color) | alt + compass | speed
-#
-# Required libs (copy from Adafruit CircuitPython Bundle to CIRCUITPY/lib):
-#   adafruit_matrixportal, adafruit_portalbase, adafruit_esp32spi,
-#   adafruit_bus_device, adafruit_requests, adafruit_connection_manager,
-#   adafruit_display_text, adafruit_io, adafruit_fakerequests, neopixel,
+# Matrix Portal — Tides, Weather, Aircraft, and Ship Tracker
+# Hardware: Adafruit MatrixPortal (M4 or S3) + 64x32 RGB LED Matrix
+# See device/SETUP.md for the full library list and setup walkthrough.
 
 import time
 import gc
@@ -36,10 +28,7 @@ LAT = float(secrets["latitude"])
 LON = float(secrets["longitude"])
 OWM_KEY = secrets["openweather_key"]
 TIMEZONE = secrets.get("timezone", "America/New_York")
-OPENSKY_USER = secrets.get("opensky_user", "")
-OPENSKY_PASS = secrets.get("opensky_pass", "")
 
-BBOX = 0.1
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 PLANE_CYCLE_SECS = 5
@@ -96,11 +85,10 @@ btn_up.switch_to_input(pull=digitalio.Pull.UP)
 btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
 btn_down.switch_to_input(pull=digitalio.Pull.UP)
 
-# Button handlers — no-ops in production, saves ~3KB RAM
-def reset_to_live():
-    global last_weather_fetch
-    last_weather_fetch = -WEATHER_INTERVAL
-def clear_test_planes():
+# BTN_UP forces the weather screen back on, even if a plane is currently
+# being shown. Defined here so the button-poll block at the bottom of the
+# file can reach it; show_weather_tides is defined before that block runs.
+def force_weather_screen():
     global planes, showing_planes
     planes = []
     showing_planes = False
@@ -1490,11 +1478,8 @@ while True:
         _demo_advance()
         _demo_last_switch = now
         time.sleep(0.3)  # debounce
-    if not btn_up.value:
-        if PLANES_ENABLED:
-            clear_test_planes()
-        else:
-            reset_to_live()
-        time.sleep(0.3)
+    if not btn_up.value:                  # pressed (active low)
+        force_weather_screen()
+        time.sleep(0.3)                   # debounce
 
     time.sleep(1)

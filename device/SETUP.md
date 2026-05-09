@@ -23,7 +23,6 @@ adafruit_bus_device/
 adafruit_connection_manager/
 adafruit_esp32spi/        # M4 only (not needed on S3)
 adafruit_requests/
-adafruit_io/
 adafruit_ntp.mpy
 neopixel.mpy
 ```
@@ -60,7 +59,6 @@ Copy `device/secrets.py.template` to `device/secrets.py` and fill in your values
 | `noaa_station` | [tidesandcurrents.noaa.gov/stations.html](https://tidesandcurrents.noaa.gov/stations.html) — find the station nearest you |
 | `latitude` / `longitude` | Your location in decimal degrees |
 | `timezone` | Olson timezone name, e.g. `America/New_York` |
-| `opensky_user` / `opensky_pass` | [opensky-network.org](https://opensky-network.org) — free, optional but recommended |
 | `proxy_host` | `http://YOUR_PI_IP:6590` — see proxy setup in root README |
 
 ## 6. Deploy code.py
@@ -73,7 +71,6 @@ Key settings at the top of `code.py`:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `BBOX` | `0.1` | Plane search box half-width in degrees (~7 mi) |
 | `WEATHER_INTERVAL` | `600` | Seconds between weather/tide refreshes |
 | `OPENSKY_INTERVAL` | `60` | Seconds between aircraft checks |
 | `PLANE_CYCLE_SECS` | `5` | Seconds per plane when multiple are overhead |
@@ -83,13 +80,15 @@ Key settings at the top of `code.py`:
 | `SHIPS_ENABLED` | `True` | Disable to turn off ship tracking entirely |
 | `DEMO_MODE` | `False` | Cycle test fixtures without network (development only) |
 
+The plane bounding-box size lives on the proxy (`bbox` in `config.json`), not the device.
+
 ## Troubleshooting
 
 **Stuck on "LOADING..."** — Wi-Fi failed. Check `ssid`/`password` in `secrets.py`.
 
 **Weather shows "N/A"** — Check `openweather_key` and internet connectivity.
 
-**No planes shown** — Verify `proxy_host` is reachable and the proxy is running. Try increasing `BBOX`.
+**No planes shown** — Verify `proxy_host` is reachable and the proxy is running. Try increasing `bbox` in the proxy's `config.json`.
 
 **No ships shown** — Ships require `aisstream_key` in the proxy's `config.json` and a location near a shipping lane.
 
