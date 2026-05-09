@@ -1,19 +1,24 @@
-# Secrets (all directories)
+# Secrets — never commit these
 .env
 device/secrets.py
 device/credentials.json
 proxy/config.json
 
+# Runtime logs
+proxy/device.log
+proxy/sightings.db
+simulator/device.log
+
 # Python
 .venv/
 __pycache__/
+*.pyc
 
 # System
 .DS_Store
 .claude/
 
-# Test output
+# Test / generated output
 bugs/
-
-# Generated reference images
 plane_bbox_map.png
+simulator/screenshots/*.png

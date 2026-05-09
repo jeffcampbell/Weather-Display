@@ -476,8 +476,8 @@ _ships = {}         # MMSI -> ship info dict
 _ships_lock = Lock()
 SHIP_STALE_SECS = 600  # remove ships not seen in 10 min
 SHIP_MIN_LENGTH = 30   # meters — filter out small vessels
-SHIP_CENTER_LAT = 42.14265296228326
-SHIP_CENTER_LON = -70.69248720290413
+SHIP_CENTER_LAT = LATITUDE   # center of ship search radius (same as home location)
+SHIP_CENTER_LON = LONGITUDE
 SHIP_MAX_MILES = 10    # only show ships within this radius
 
 AIS_TYPE_NAMES = {

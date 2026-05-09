@@ -56,7 +56,7 @@ DEMO_MODE = False       # Set True to auto-cycle test fixtures (no network neede
 DEMO_INTERVAL = 30      # seconds per view in demo mode
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
-PROXY_HOST = "http://YOUR_PROXY_HOST:6590"
+PROXY_HOST = secrets.get("proxy_host", "")       # e.g. "http://YOUR_PI_IP:6590"
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths

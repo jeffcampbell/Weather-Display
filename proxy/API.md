@@ -324,8 +324,8 @@ Liveness check — confirms the proxy is reachable and reports basic internal st
   "opensky_pass": "your-opensky-password",
   "openweather_key": "your-owm-api-key",
   "aisstream_key": "your-aisstream-api-key",
-  "latitude": 42.142039,
-  "longitude": -70.693353,
+  "latitude": 42.36,
+  "longitude": -71.06,
   "bbox": 0.1
 }
 ```

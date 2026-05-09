@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to config.json and fill in your values. config.json is gitignored.",
+
+  "latitude":  42.36,
+  "longitude": -71.06,
+  "bbox": 0.1,
+
+  "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",
+
+  "opensky_user": "YOUR_OPENSKY_USERNAME",
+  "opensky_pass": "YOUR_OPENSKY_PASSWORD",
+
+  "aisstream_key": "YOUR_AISSTREAM_API_KEY",
+
+  "flightaware_key": ""
+}

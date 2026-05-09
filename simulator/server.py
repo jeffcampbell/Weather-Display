@@ -22,7 +22,6 @@ BASE_DIR = Path(__file__).parent
 DEVICE_DIR = BASE_DIR.parent / "device"
 ENV_FILE = BASE_DIR / ".env"
 DEVICE_LOG_FILE = BASE_DIR / "device.log"
-PI_PROXY = "http://YOUR_PROXY_HOST:6590"
 
 
 def load_env():
@@ -40,6 +39,7 @@ def load_env():
 
 
 ENV = load_env()
+PI_PROXY = ENV.get("PI_PROXY", "http://localhost:6590")  # set PI_PROXY=http://YOUR_PI_IP:6590 in .env
 
 
 def proxy_get(url, headers=None):

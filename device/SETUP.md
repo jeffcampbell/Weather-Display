@@ -1,82 +1,96 @@
-# Matrix Portal Tides + Weather + Plane Tracker
-
-Displays weather and next tide on a 64x32 RGB LED matrix. Polls OpenSky every 60 seconds — when aircraft are overhead, the display switches to show plane callsign, altitude, and heading. Switches back when skies clear.
+# Device Setup
 
 ## Hardware
 
-- Matrix Portal M4 (ATSAMD51J19 + ESP32 coprocessor)
-- 64x32 RGB LED Matrix
+- [Adafruit MatrixPortal S3](https://www.adafruit.com/product/5778) or [MatrixPortal M4](https://www.adafruit.com/product/4745)
+- [64×32 RGB LED Matrix Panel](https://www.adafruit.com/product/2278) (3 mm or 4 mm pitch)
+- USB-C power supply, 5 V, at least 2 A
 
-## Display Layout
+## 1. Install CircuitPython
 
-**Default screen** (yellow + cyan):
+Download CircuitPython 10.x for your board from [circuitpython.org](https://circuitpython.org/downloads) and follow the flashing instructions.
+
+## 2. Install Libraries
+
+Download the [Adafruit CircuitPython Bundle](https://circuitpython.org/libraries) matching your CircuitPython version. Copy these folders/files into `CIRCUITPY/lib/`:
+
 ```
-72F SUNNY      ← current weather
-HI 2:30P      ← next high/low tide
+adafruit_matrixportal/
+adafruit_portalbase/
+adafruit_display_text/
+adafruit_bitmap_font/
+adafruit_bus_device/
+adafruit_connection_manager/
+adafruit_esp32spi/        # M4 only (not needed on S3)
+adafruit_requests/
+adafruit_io/
+adafruit_ntp.mpy
+neopixel.mpy
 ```
 
-**Plane screen** (green, cycles every 5s if multiple):
-```
-UAL1234       ← callsign
-35Kft 270d    ← altitude + heading
-```
+## 3. Copy Font Files
 
-## Setup Steps
+The display uses two BDF bitmap fonts. Copy these onto `CIRCUITPY/` (root, not lib/):
 
-### 1. Get Free API Keys
+- `4x6.bdf` — small font (conditions, wind, tide time)
+- `5x8.bdf` — medium font (temperature, clock, route)
 
-- **OpenWeatherMap** (weather): https://openweathermap.org/api
-- **Adafruit IO** (time sync): https://io.adafruit.com
-- **OpenSky Network** (optional, higher rate limits): https://opensky-network.org
+These ship with CircuitPython releases and the Adafruit bundle. You can also extract them with `simulator/extract_fonts.py` if the device is already mounted.
 
-### 2. Find Your NOAA Tide Station
+## 4. Copy Data Files
 
-Go to https://tidesandcurrents.noaa.gov/stations.html and find the station ID nearest to you (e.g., `8443970` for Boston).
+Copy these from `device/` to `CIRCUITPY/` (root):
 
-### 3. Install CircuitPython Libraries
+| File | Purpose |
+|------|---------|
+| `airlines.csv` | Airline ICAO → display name + color |
+| `airports.csv` | ICAO airport code → 3-letter display code |
+| `conditions.csv` | OWM weather condition ID → short text |
 
-Copy these from the [Adafruit CircuitPython Bundle](https://circuitpython.org/libraries) to `CIRCUITPY/lib/`:
+## 5. Configure secrets.py
 
-- `adafruit_matrixportal`
-- `adafruit_portalbase`
-- `adafruit_esp32spi`
-- `adafruit_bus_device`
-- `adafruit_requests`
-- `adafruit_connection_manager`
-- `adafruit_display_text`
-- `adafruit_io`
-- `neopixel`
+Copy `device/secrets.py.template` to `device/secrets.py` and fill in your values, then copy that file to `CIRCUITPY/secrets.py`.
 
-### 4. Configure secrets.py
+`secrets.py` is gitignored and must never be committed.
 
-Edit `secrets.py` with your values:
+| Key | Where to get it |
+|-----|----------------|
+| `ssid` / `password` | Your Wi-Fi credentials |
+| `openweather_key` | [openweathermap.org/api](https://openweathermap.org/api) — free |
+| `noaa_station` | [tidesandcurrents.noaa.gov/stations.html](https://tidesandcurrents.noaa.gov/stations.html) — find the station nearest you |
+| `latitude` / `longitude` | Your location in decimal degrees |
+| `timezone` | Olson timezone name, e.g. `America/New_York` |
+| `opensky_user` / `opensky_pass` | [opensky-network.org](https://opensky-network.org) — free, optional but recommended |
+| `proxy_host` | `http://YOUR_PI_IP:6590` — see proxy setup in root README |
 
-- WiFi SSID and password
-- OpenWeatherMap API key
-- Adafruit IO username and key
-- NOAA tide station ID
-- Your latitude and longitude
-- Timezone (Olson format, e.g., `America/New_York`)
-- OpenSky credentials (optional but recommended)
+## 6. Deploy code.py
 
-### 5. Deploy to Board
+Copy `device/code.py` to `CIRCUITPY/code.py`. CircuitPython restarts automatically.
 
-Copy `secrets.py` and `code.py` to your CIRCUITPY drive.
+## Configuration
 
-## Tuning
+Key settings at the top of `code.py`:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `BBOX` | `0.1` (~7 mi) | Bounding box radius in degrees for aircraft detection |
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `BBOX` | `0.1` | Plane search box half-width in degrees (~7 mi) |
 | `WEATHER_INTERVAL` | `600` | Seconds between weather/tide refreshes |
 | `OPENSKY_INTERVAL` | `60` | Seconds between aircraft checks |
-| `PLANE_CYCLE_SECS` | `5` | Seconds between cycling multiple planes |
+| `PLANE_CYCLE_SECS` | `5` | Seconds per plane when multiple are overhead |
+| `PLANE_MAX_SECS` | `600` | Max time on plane screen before forcing a weather break |
+| `SHIP_INTERVAL` | `60` | Seconds between ship list refreshes |
+| `PLANES_ENABLED` | `True` | Disable to turn off plane tracking entirely |
+| `SHIPS_ENABLED` | `True` | Disable to turn off ship tracking entirely |
+| `DEMO_MODE` | `False` | Cycle test fixtures without network (development only) |
 
-## Potential Improvements
+## Troubleshooting
 
-- [ ] Use a smaller BDF font (e.g., tom-thumb 3x5) to fit 4 lines instead of 2
-- [ ] Add wind speed/direction to weather display
-- [ ] Show tide height alongside time
-- [ ] Add aircraft speed (knots) to plane display
-- [ ] Color-code altitude (green = high, yellow = mid, red = low)
-- [ ] Add button press to manually toggle between screens
+**Stuck on "LOADING..."** — Wi-Fi failed. Check `ssid`/`password` in `secrets.py`.
+
+**Weather shows "N/A"** — Check `openweather_key` and internet connectivity.
+
+**No planes shown** — Verify `proxy_host` is reachable and the proxy is running. Try increasing `BBOX`.
+
+**No ships shown** — Ships require `aisstream_key` in the proxy's `config.json` and a location near a shipping lane.
+
+**Frequent reboots** — Normal. The device auto-reboots at 03:30 daily and after repeated fetch failures to clear memory fragmentation.
