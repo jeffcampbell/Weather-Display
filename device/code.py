@@ -462,19 +462,20 @@ def update_basin_water(level, tick):
     _draw_weather_sky(water_top)
 
 def interpolate_tide_level():
-    """Calculate current tide basin fill (0.0-1.0) from predictions."""
+    """Calculate current tide basin fill (0.0-1.0) from predictions.
+    Predictions are stored as absolute seconds, so this works seamlessly
+    across midnight (the tomorrow-half of the 2-day fetch is in the list)."""
     global _tide_level
     if len(_tide_predictions) < 2:
         _tide_level = 0.5
         return
-    now = time.localtime()
-    now_mins = now.tm_hour * 60 + now.tm_min
+    now_secs = time.mktime(time.localtime())
 
     # Find bracketing tides (previous and next)
     prev_tide = None
     next_tide = None
     for i, p in enumerate(_tide_predictions):
-        if p[0] >= now_mins:
+        if p[0] >= now_secs:
             next_tide = p
             if i > 0:
                 prev_tide = _tide_predictions[i - 1]
@@ -490,7 +491,7 @@ def interpolate_tide_level():
     if span <= 0:
         _tide_level = 0.5
         return
-    progress = (now_mins - prev_tide[0]) / span
+    progress = (now_secs - prev_tide[0]) / span
 
     # Rising (prev=L, next=H) or falling (prev=H, next=L)
     if prev_tide[1] == "L" and next_tide[1] == "H":
@@ -939,51 +940,52 @@ def fetch_weather():
 
 
 def fetch_tides():
+    """Fetch today + tomorrow's tide predictions from NOAA in one request and
+    store them as (abs_secs, type, hour, minute_str). Using a 2-day window
+    means the next upcoming tide is always in the list (no fall-through to a
+    second request) and the basin-level interpolation works across midnight.
+
+    NOTE: NOAA's `date` param only accepts `today`, `latest`, `recent`. To get
+    a specific day or range you must use `begin_date`/`end_date` — passing
+    `date=tomorrow` silently returns today's data."""
     global tide_str, tide_type_val, _tide_predictions
     gc.collect()
     try:
-        base = (
-            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-            "?date={}&station={}&product=predictions&datum=MLLW"
-            "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
-        )
-        preds = fetch_json(base.format("today", NOAA_STATION)).get("predictions", [])
         now = time.localtime()
-        now_mins = now.tm_hour * 60 + now.tm_min
+        today_str = "{:04d}{:02d}{:02d}".format(now.tm_year, now.tm_mon, now.tm_mday)
+        tmr = time.localtime(time.mktime(now) + 86400)
+        tmr_str = "{:04d}{:02d}{:02d}".format(tmr.tm_year, tmr.tm_mon, tmr.tm_mday)
+        url = (
+            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+            "?begin_date={}&end_date={}&station={}&product=predictions&datum=MLLW"
+            "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
+        ).format(today_str, tmr_str, NOAA_STATION)
+        preds = fetch_json(url).get("predictions", [])
+        now_secs = time.mktime(now)
 
-        # Store today's predictions for basin interpolation (today only)
         _tide_predictions = []
         for p in preds:
-            time_part = p["t"].split(" ")[1]
-            h_str, m_str = time_part.split(":")
+            ts = p["t"]                        # e.g. "2026-05-09 18:12"
+            d_part, t_part = ts.split(" ")
+            y, mo, d = [int(x) for x in d_part.split("-")]
+            h_str, m_str = t_part.split(":")
             h, m = int(h_str), int(m_str)
-            _tide_predictions.append((h * 60 + m, p.get("type", ""), h, m_str))
+            secs = time.mktime((y, mo, d, h, m, 0, 0, 0, 0))
+            _tide_predictions.append((secs, p.get("type", ""), h, m_str))
 
-        # Find next upcoming tide; fall through to tomorrow if today is exhausted
-        found = False
+        next_p = None
         for p in _tide_predictions:
-            if p[0] >= now_mins:
-                tide_type_val = p[1]
-                h12 = p[2] % 12 or 12
-                tide_str = "{}:{}".format(h12, p[3])
-                found = True
-                device_log("Tide:{} {}".format(tide_type_val, tide_str))
+            if p[0] >= now_secs:
+                next_p = p
                 break
-        if not found:
-            tmr_preds = fetch_json(base.format("tomorrow", NOAA_STATION)).get("predictions", [])
-            for p in tmr_preds:
-                time_part = p["t"].split(" ")[1]
-                h_str, m_str = time_part.split(":")
-                h = int(h_str)
-                h12 = h % 12 or 12
-                tide_type_val = p.get("type", "")
-                tide_str = "{}:{}".format(h12, m_str)
-                device_log("Tide tmr:{} {}".format(tide_type_val, tide_str))
-                found = True
-                break
-            if not found:
-                tide_str = "N/A"
-                tide_type_val = ""
+        if next_p:
+            tide_type_val = next_p[1]
+            h12 = next_p[2] % 12 or 12
+            tide_str = "{}:{}".format(h12, next_p[3])
+            device_log("Tide:{} {}".format(tide_type_val, tide_str))
+        else:
+            tide_str = "N/A"
+            tide_type_val = ""
         # Calculate basin level — the per-tick block redraws it each frame
         interpolate_tide_level()
     except Exception as e:
@@ -1233,12 +1235,12 @@ def show_weather_tides():
         temp_label.color = tc
         _center_small(cond_label, weather_cond[:10])
         _center_small(wind_label, wind_str)
-        # Tide time / HIGH / LOW at bottom of left column
-        now_m = time.localtime()
-        now_mins = now_m.tm_hour * 60 + now_m.tm_min
+        # Tide time / HIGH / LOW at bottom of left column. Slack window
+        # is ±15 minutes, expressed in seconds since predictions are absolute.
+        now_secs = time.mktime(time.localtime())
         slack_label = ""
         for p in _tide_predictions:
-            if abs(p[0] - now_mins) <= 15:
+            if abs(p[0] - now_secs) <= 900:
                 slack_label = "HIGH" if p[1] == "H" else "LOW"
                 break
         tide_time_label.text = slack_label if slack_label else tide_str
@@ -1512,10 +1514,10 @@ while True:
             update_basin_water(_tide_level, _basin_anim_tick)
             _at_slack = tide_time_label.text in ("HIGH", "LOW")
             if _at_slack:
-                _now_mins = t.tm_hour * 60 + t.tm_min
+                _now_secs = time.mktime(t)
                 _still_slack = False
                 for _p in _tide_predictions:
-                    if abs(_p[0] - _now_mins) <= 15:
+                    if abs(_p[0] - _now_secs) <= 900:
                         _still_slack = True
                         break
                 if not _still_slack:
