@@ -429,6 +429,7 @@ function setStatus(s) { statusEl.textContent = s; }
 // =========================================================================
 let weather_str = "", weather_cond = "", weather_condMain = "";
 let wind_str = "", _wind_speed = 0;
+let _sunrise_mins = 330, _sunset_mins = 1170;  // 5:30 AM / 7:30 PM defaults
 let tide_str = "", tide_type_val = "";  // "H" or "L"
 let _tide_level = 0.5, _basin_tick = 0;
 let testClockStr = null;  // set to 'H:MM XM' to freeze clock for screenshot tests
@@ -550,9 +551,93 @@ function icaoToDisplay(icao) {
 //        x=20 vertical separator (dark) + white direction pixel
 // Right: x=21-63 (43px wide)
 //   y=4:  clock (mid font, centered)
-//   y=12: weather icon (8x8) + temp (mid font, centered pair)
+//   y=12: temp (mid font, centered)
 //   y=20: condition (small font, centered)
 //   y=28: wind (small font, centered)
+
+// ---------------------------------------------------------------------------
+// Weather sky art — draws into the basin sky area (y < waterTop)
+// ---------------------------------------------------------------------------
+function drawWeatherSky(waterTop) {
+  if (!weather_condMain || waterTop < 4) return;
+  const SUN = [255, 204,   0];   // sun / lightning yellow
+  const CLD = [187, 187, 204];   // cloud / snow gray
+  const RN  = [ 34,  85, 170];   // rain blue
+  const STAR = [70, 70, 90];     // dim star
+
+  const now = new Date();
+  const nowMins = now.getHours() * 60 + now.getMinutes();
+  const night = nowMins < _sunrise_mins || nowMins > _sunset_mins;
+  const wt = waterTop;
+
+  function sp(x, y, rgb) {
+    if (x >= 0 && x < BASIN_W && y >= 0 && y < wt) setPixel(x, y, rgb);
+  }
+  function skySun(cx, cy, c) {
+    for (let dx = -1; dx <= 1; dx++) { sp(cx+dx, cy-2, c); sp(cx+dx, cy+2, c); }
+    for (let dx = -2; dx <= 2; dx++) { sp(cx+dx, cy-1, c); sp(cx+dx, cy, c); sp(cx+dx, cy+1, c); }
+    sp(cx, cy-3, c); sp(cx, cy+3, c); sp(cx-3, cy, c); sp(cx+3, cy, c);
+    sp(cx-2, cy-3, c); sp(cx+2, cy-3, c);
+    sp(cx-3, cy-2, c); sp(cx+3, cy-2, c);
+    sp(cx-3, cy+2, c); sp(cx+3, cy+2, c);
+    sp(cx-2, cy+3, c); sp(cx+2, cy+3, c);
+  }
+  function skyMoon(cx, cy, c) {
+    for (let dx = -1; dx <= 1; dx++) { sp(cx+dx, cy-2, c); sp(cx+dx, cy+2, c); }
+    for (let dx = -2; dx <= 2; dx++) { sp(cx+dx, cy-1, c); sp(cx+dx, cy, c); sp(cx+dx, cy+1, c); }
+    for (let dy = -1; dy <= 1; dy++) { sp(cx+1, cy+dy, [0,0,0]); sp(cx+2, cy+dy, [0,0,0]); }
+  }
+  function skyCloud(x, y, w, c) {
+    for (let dx = 1; dx < w-1; dx++) sp(x+dx, y, c);
+    for (let dx = 0; dx < w; dx++) { sp(x+dx, y+1, c); sp(x+dx, y+2, c); }
+  }
+  function skyRain(x, y, count, c) {
+    for (let i = 0; i < count; i++) { sp(x+i*3, y, c); sp(x+i*3+1, y+1, c); }
+  }
+  function skyLightning(x, y, c) {
+    sp(x+2, y, c); sp(x+1, y+1, c); sp(x+2, y+1, c);
+    sp(x+1, y+2, c); sp(x, y+3, c); sp(x+1, y+3, c);
+  }
+  function skySnow(x, y) {
+    for (let i = 0; i < 3; i++) {
+      const xx = x + i * 5;
+      sp(xx+1, y, CLD); sp(xx, y+1, CLD); sp(xx+1, y+1, CLD); sp(xx+2, y+1, CLD); sp(xx+1, y+2, CLD);
+    }
+  }
+
+  const cond = weather_condMain;
+  if (cond === 'Clear') {
+    if (night) {
+      skyMoon(5, 3, SUN);
+      const STARS = [[2,1],[7,4],[14,2],[4,7],[11,5],[17,3],[8,8],[1,6]];
+      for (const [sx, sy] of STARS) { if (sy < wt - 1) setPixel(sx, sy, STAR); }
+    } else {
+      skySun(9, 3, SUN);
+    }
+  } else if (cond === 'Clouds') {
+    if (night) skyMoon(4, 2, SUN); else skySun(4, 2, SUN);
+    skyCloud(9, 0, 10, CLD);
+  } else if (cond === 'Rain') {
+    skyCloud(1, 0, 14, CLD);
+    skyRain(2, 4, 5, RN);
+    skyRain(3, 6, 4, RN);
+  } else if (cond === 'Drizzle') {
+    skyCloud(3, 0, 10, CLD);
+    for (let i = 0; i < 5; i++) sp(3 + i*3, 5, RN);
+  } else if (cond === 'Snow') {
+    skyCloud(1, 0, 14, CLD);
+    skySnow(2, 4);
+  } else if (cond === 'Thunderstorm') {
+    skyCloud(1, 0, 14, CLD);
+    skyRain(4, 6, 4, RN);
+    skyLightning(8, 3, SUN);
+  } else {
+    // Fog / Mist / Haze / Smoke — horizontal dot lines
+    for (let yo = 0; yo < 3; yo++)
+      for (let x = 1; x < BASIN_W - 1; x += 2) sp(x, 2 + yo*2, CLD);
+  }
+}
+
 function composeWeather(timestamp) {
   clearFB();
 
@@ -618,13 +703,8 @@ function composeWeather(timestamp) {
     }
   }
 
-  // Stars in sky portion of basin (clear sky only)
-  if (weather_condMain === 'Clear') {
-    const STARS = [[2,1],[7,4],[14,2],[4,7],[11,5],[17,3],[8,8],[1,6]];
-    for (const [sc, sr] of STARS) {
-      if (sr < waterTop - 1) setPixel(sc, sr, [70, 70, 90]);
-    }
-  }
+  // Weather sky art (sun/moon/clouds/rain/lightning/snow/fog)
+  drawWeatherSky(waterTop);
 
   // Tide time / HIGH / LOW at bottom of left column (x=1, y=29)
   const nowMins = new Date().getHours() * 60 + new Date().getMinutes();
@@ -660,14 +740,10 @@ function composeWeather(timestamp) {
   }
   drawTextMid(clockStr, centerMidX(clockStr), 4, 0xFFFFFF);
 
-  // Weather icon + temp — positioned as a pair, centered in right panel
-  const iconName  = ICON_MAP[weather_condMain] || 'cloud';
-  const iconColor = ICON_COLORS[weather_condMain] || 0xAAAAAA;
+  // Temp — centered in right panel, no icon
   const tempColor = getTempColor(weather_str);
   const tw = weather_str.length * FONT_MID_W;
-  const tempX = RIGHT_START + Math.floor((RIGHT_W - tw) / 2);
-  drawIcon8(ICONS[iconName], tempX - 10, 9, iconColor);
-  drawTextMid(weather_str, tempX, 12, tempColor);
+  drawTextMid(weather_str, RIGHT_START + Math.floor((RIGHT_W - tw) / 2), 12, tempColor);
 
   // Condition — centered, small font, y=20
   drawTextSmall(weather_cond, centerSmallX(weather_cond), 20, 0x888899);
@@ -826,6 +902,11 @@ async function fetchWeather() {
     weather_str  = `${temp}°F`;
     _wind_speed  = Math.round(data.wind?.speed || 0);
     wind_str     = `${_wind_speed}mph ${headingToCompass(data.wind?.deg || 0)}`;
+    const tz = data.timezone || -14400;
+    if (data.sys?.sunrise && data.sys?.sunset) {
+      _sunrise_mins = Math.floor(((data.sys.sunrise + tz) % 86400) / 60);
+      _sunset_mins  = Math.floor(((data.sys.sunset  + tz) % 86400) / 60);
+    }
     log(`Weather: ${weather_str} ${weather_cond} Wind: ${wind_str}`);
   } catch(e) { log(`Weather err: ${e.message}`, true); }
 }

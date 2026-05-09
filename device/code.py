@@ -51,7 +51,7 @@ SHIPS_ENABLED = True    # Set True to enable ship tracking
 SHIPS_TEST = False
 SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
-DEMO_MODE = False       # Set True to auto-cycle test fixtures (no network needed)
+DEMO_MODE = True        # Set True to auto-cycle test fixtures (no network needed)
 DEMO_INTERVAL = 30      # seconds per view in demo mode
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
@@ -292,16 +292,23 @@ BASIN_W = 20   # full left column width
 BASIN_H = 32   # full display height
 # Tide current particles: (x, y_phase_offset) — staggered so they never clump
 _TIDE_PARTICLES = ((3, 0), (11, 11), (17, 22))
-# Palette: 0=black, 1=water deep, 2=water mid, 3=water surface,
-#          4=ship hull (gray), 5=ship superstructure (amber)
-basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 6)
-basin_pal = displayio.Palette(6)
+# Fixed star positions (col, row) for clear-sky night sky in weather basin
+_STAR_POSITIONS = ((2, 1), (7, 4), (14, 2), (4, 7), (11, 5), (17, 3), (8, 8), (1, 6))
+# Palette: 0=black sky, 1=water deep, 2=water mid, 3=water surface,
+#          4=ship hull (gray), 5=ship superstructure (amber), 6=dim star,
+#          7=sun/lightning yellow, 8=cloud/snow gray, 9=rain blue
+basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 10)
+basin_pal = displayio.Palette(10)
 basin_pal[0] = 0x000000
 basin_pal[1] = 0x001237   # water deep (navy)
 basin_pal[2] = 0x003264   # water mid (ocean blue)
 basin_pal[3] = 0x125A96   # water surface/crest (bright blue)
 basin_pal[4] = 0xBBBBBB   # ship hull (light gray)
 basin_pal[5] = 0xFF8822   # ship superstructure (amber)
+basin_pal[6] = 0x232335   # dim star (night sky)
+basin_pal[7] = 0xFFCC00   # sun / lightning yellow
+basin_pal[8] = 0xBBBBCC   # cloud / snow gray
+basin_pal[9] = 0x2255AA   # rain blue
 
 basin_tg = displayio.TileGrid(basin_bmp, pixel_shader=basin_pal, x=0, y=0)
 
@@ -339,6 +346,134 @@ def update_brightness():
         b = BRIGHTNESS_MIN
 
     display.brightness = max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, b))
+
+# ---------------------------------------------------------------------------
+# Weather sky art helpers — draw into basin_bmp sky area (y < water_top)
+# ---------------------------------------------------------------------------
+
+def _sp(x, y, c, wt):
+    if 0 <= x < BASIN_W and 0 <= y < wt:
+        basin_bmp[x, y] = c
+
+
+def _sky_sun(cx, cy, c, wt):
+    """5×5 circle body + 4 cardinal rays + 4 diagonal rays."""
+    for dx in (-1, 0, 1):
+        _sp(cx + dx, cy - 2, c, wt)
+        _sp(cx + dx, cy + 2, c, wt)
+    for dx in (-2, -1, 0, 1, 2):
+        _sp(cx + dx, cy - 1, c, wt)
+        _sp(cx + dx, cy,     c, wt)
+        _sp(cx + dx, cy + 1, c, wt)
+    _sp(cx,      cy - 3, c, wt); _sp(cx,      cy + 3, c, wt)
+    _sp(cx - 3,  cy,     c, wt); _sp(cx + 3,  cy,     c, wt)
+    _sp(cx - 2,  cy - 3, c, wt); _sp(cx + 2,  cy - 3, c, wt)
+    _sp(cx - 3,  cy - 2, c, wt); _sp(cx + 3,  cy - 2, c, wt)
+    _sp(cx - 3,  cy + 2, c, wt); _sp(cx + 3,  cy + 2, c, wt)
+    _sp(cx - 2,  cy + 3, c, wt); _sp(cx + 2,  cy + 3, c, wt)
+
+
+def _sky_moon(cx, cy, c, wt):
+    """Left-facing crescent moon: filled oval, right side bitten out."""
+    for dx in (-1, 0, 1):
+        _sp(cx + dx, cy - 2, c, wt)
+        _sp(cx + dx, cy + 2, c, wt)
+    for dx in (-2, -1, 0, 1, 2):
+        _sp(cx + dx, cy - 1, c, wt)
+        _sp(cx + dx, cy,     c, wt)
+        _sp(cx + dx, cy + 1, c, wt)
+    # Bite out right side
+    for dy in (-1, 0, 1):
+        _sp(cx + 1, cy + dy, 0, wt)
+        _sp(cx + 2, cy + dy, 0, wt)
+
+
+def _sky_cloud(x, y, w, c, wt):
+    """Fluffy cloud: narrow bumpy top, two solid rows below."""
+    for dx in range(1, w - 1):
+        _sp(x + dx, y, c, wt)
+    for dx in range(w):
+        _sp(x + dx, y + 1, c, wt)
+        _sp(x + dx, y + 2, c, wt)
+
+
+def _sky_rain(x, y, count, c, wt):
+    """Diagonal rain streaks: each streak is 2 pixels at 45°."""
+    for i in range(count):
+        xx = x + i * 3
+        _sp(xx,     y,     c, wt)
+        _sp(xx + 1, y + 1, c, wt)
+
+
+def _sky_lightning(x, y, c, wt):
+    """Classic zigzag lightning bolt, 4 rows tall."""
+    _sp(x + 2, y,     c, wt)
+    _sp(x + 1, y + 1, c, wt); _sp(x + 2, y + 1, c, wt)
+    _sp(x + 1, y + 2, c, wt)
+    _sp(x,     y + 3, c, wt); _sp(x + 1, y + 3, c, wt)
+
+
+def _sky_snow(x, y, wt):
+    """Three + pattern snowflakes in a row."""
+    c = 8
+    for i in range(3):
+        xx = x + i * 5
+        _sp(xx + 1, y,     c, wt)
+        _sp(xx,     y + 1, c, wt); _sp(xx + 1, y + 1, c, wt); _sp(xx + 2, y + 1, c, wt)
+        _sp(xx + 1, y + 2, c, wt)
+
+
+def _draw_weather_sky(water_top):
+    """Draw weather-appropriate art in the sky portion of the basin."""
+    if not weather_cond_main or water_top < 4:
+        return
+    SUN = 7; CLD = 8; RN = 9
+    t = time.localtime()
+    now_mins = t.tm_hour * 60 + t.tm_min
+    night = now_mins < _sunrise_mins or now_mins > _sunset_mins
+    cond = weather_cond_main
+
+    if cond == "Clear":
+        if night:
+            _sky_moon(5, 3, SUN, water_top)
+            for sx, sy in _STAR_POSITIONS:
+                if sy < water_top - 1:
+                    basin_bmp[sx, sy] = 6  # dim star
+        else:
+            _sky_sun(9, 3, SUN, water_top)
+
+    elif cond == "Clouds":
+        if night:
+            _sky_moon(4, 2, SUN, water_top)
+        else:
+            _sky_sun(4, 2, SUN, water_top)
+        _sky_cloud(9, 0, 10, CLD, water_top)
+
+    elif cond in ("Rain", "Drizzle"):
+        if cond == "Drizzle":
+            _sky_cloud(3, 0, 10, CLD, water_top)
+            for i in range(5):
+                _sp(3 + i * 3, 5, RN, water_top)
+        else:
+            _sky_cloud(1, 0, 14, CLD, water_top)
+            _sky_rain(2, 4, 5, RN, water_top)
+            _sky_rain(3, 6, 4, RN, water_top)
+
+    elif cond == "Snow":
+        _sky_cloud(1, 0, 14, CLD, water_top)
+        _sky_snow(2, 4, water_top)
+
+    elif cond == "Thunderstorm":
+        _sky_cloud(1, 0, 14, CLD, water_top)
+        _sky_rain(4, 6, 4, RN, water_top)
+        _sky_lightning(8, 3, SUN, water_top)
+
+    else:
+        # Fog / Mist / Haze / Smoke — horizontal dot lines
+        for y_off in range(3):
+            for x in range(1, BASIN_W - 1, 2):
+                _sp(x, 2 + y_off * 2, CLD, water_top)
+
 
 def update_basin_water(level, tick):
     """Redraw water column with tide level. Wave intensity driven by wind."""
@@ -418,6 +553,9 @@ def update_basin_water(level, tick):
                 if 0 <= py < BASIN_H:
                     basin_bmp[px, py] = 2  # mid-water tone — subtle against deep
 
+    # Weather sky art (sun/moon/clouds/rain/lightning/snow/fog)
+    _draw_weather_sky(water_top)
+
 def interpolate_tide_level():
     """Calculate current tide basin fill (0.0-1.0) from predictions."""
     global _tide_level
@@ -461,11 +599,15 @@ def interpolate_tide_level():
 # Palette: 0=navy dark, 1=logo fill (updated per airline), 2=logo border,
 #          3=separator, 4=content zone, 5=accent bar
 # Plane background — logo box on left, black everywhere else
-pl_bg_bmp = displayio.Bitmap(14, 32, 3)
-pl_bg_pal = displayio.Palette(3)
+# Indices 0-2 used for plane, 1-5 repurposed for ship ocean + hull
+pl_bg_bmp = displayio.Bitmap(14, 32, 6)
+pl_bg_pal = displayio.Palette(6)
 pl_bg_pal[0] = 0x000000
-pl_bg_pal[1] = 0x0055A4   # logo fill (updated per airline)
-pl_bg_pal[2] = 0x002244   # logo border (updated per airline)
+pl_bg_pal[1] = 0x0055A4   # logo fill (plane) / ocean deep (ship)
+pl_bg_pal[2] = 0x002244   # logo border (plane) / hull gray (ship)
+pl_bg_pal[3] = 0x003264   # ocean mid (ship only)
+pl_bg_pal[4] = 0x125A96   # ocean surface (ship only)
+pl_bg_pal[5] = 0xFF8822   # ship superstructure (ship only)
 
 for y in range(32):
     for x in range(14):
@@ -484,6 +626,36 @@ def update_plane_bg(airline_color):
     b = (airline_color & 0xFF)
     pl_bg_pal[1] = airline_color
     pl_bg_pal[2] = ((r >> 2) << 16) | ((g >> 2) << 8) | (b >> 2)
+
+
+def update_ship_ocean(tick):
+    """Animate ocean waves in ship left panel (14×32). Called every second."""
+    if not _ship_hull_params:
+        return
+    y_start, ship_h, bow_len, ship_w, cx = _ship_hull_params
+    super_rows = max(2, ship_h * 3 // 10)
+    for y in range(32):
+        for x in range(14):
+            w1 = math.sin(x * 0.8 + tick * 1.2 + y * 0.5) * 0.6
+            w2 = math.sin(x * 1.3 - tick * 0.7 + y * 0.4) * 0.4
+            v = w1 + w2
+            pl_bg_bmp[x, y] = 4 if v > 0.4 else (3 if v > 0 else 1)
+    # Redraw ship silhouette over ocean
+    for i in range(ship_h):
+        y = y_start + i
+        if y < 0 or y > 31:
+            continue
+        if i < bow_len:
+            hw = max(1, ship_w * (i + 1) // (bow_len + 1) // 2)
+        elif i >= ship_h - 2:
+            hw = ship_w // 2 - 1
+        else:
+            hw = ship_w // 2
+        pal_idx = 5 if bow_len <= i < bow_len + super_rows else 2
+        for x in range(cx - hw, cx + hw + 1):
+            if 0 <= x < 14:
+                pl_bg_bmp[x, y] = pal_idx
+
 
 # Route cache: callsign -> {"origin": "BOS", "dest": "JFK"}
 flight_cache = {}
@@ -681,6 +853,8 @@ ship_idx = 0
 last_ship_fetch = -SHIP_INTERVAL
 _ship_cycle_start = 0
 _showing_ship = False
+_ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship ocean animation
+_ship_anim_tick = 0
 planes = []
 showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
@@ -940,6 +1114,7 @@ def show_ship(ship):
     """Display a ship — reuses the plane screen group to save RAM.
     Wrapped in try/except so a label-realloc MemoryError just skips this
     render instead of crashing the device."""
+    global _ship_hull_params, _ship_anim_tick
     try:
         gc.collect()
         switch_screen("plane")
@@ -957,9 +1132,15 @@ def show_ship(ship):
         y_start = (32 - ship_h) // 2
         bow_len = max(2, ship_h // 5)
         cx = 7
+        super_rows = max(2, ship_h * 3 // 10)
 
-        pl_bg_pal[1] = 0x041840   # deep ocean blue
-        pl_bg_pal[2] = 0xBBBBCC  # hull (light blue-gray)
+        pl_bg_pal[1] = 0x001237   # ocean deep
+        pl_bg_pal[2] = 0xBBBBCC   # hull (light blue-gray)
+        pl_bg_pal[3] = 0x003264   # ocean mid
+        pl_bg_pal[4] = 0x125A96   # ocean surface
+        pl_bg_pal[5] = color       # superstructure (ship type color)
+
+        # Fill ocean background, then draw hull — update_ship_ocean animates it
         for y in range(32):
             for x in range(14):
                 pl_bg_bmp[x, y] = 1
@@ -973,9 +1154,13 @@ def show_ship(ship):
                 hw = ship_w // 2 - 1
             else:
                 hw = ship_w // 2
+            pal_idx = 5 if bow_len <= i < bow_len + super_rows else 2
             for x in range(cx - hw, cx + hw + 1):
                 if 0 <= x < 14:
-                    pl_bg_bmp[x, y] = 2
+                    pl_bg_bmp[x, y] = pal_idx
+
+        _ship_hull_params = (y_start, ship_h, bow_len, ship_w, cx)
+        _ship_anim_tick = 0
 
         actype_label.text = ""
         logo_label.text = ""
@@ -1019,8 +1204,7 @@ def show_weather_tides():
     a label-realloc MemoryError just skips this render instead of crashing."""
     try:
         switch_screen("weather")
-        update_weather_icon(weather_cond_main)
-        wx_icon_tg.x = _RIGHT_START + (_RIGHT_W - 8) // 2 - 10
+        wx_icon_tg.hidden = True
         _center_mid(temp_label, weather_str)
         try:
             temp_val = int(weather_str.split(chr(176))[0])
@@ -1033,8 +1217,6 @@ def show_weather_tides():
         elif temp_val >= 20: tc = 0x44AAFF
         else:                tc = 0x2255CC
         temp_label.color = tc
-        tw = len(weather_str) * 5
-        wx_icon_tg.x = _RIGHT_START + (_RIGHT_W - tw) // 2 - 10
         _center_small(cond_label, weather_cond[:8])
         _center_small(wind_label, wind_str)
         # Tide time / HIGH / LOW at bottom of left column
@@ -1321,6 +1503,15 @@ while True:
             update_brightness()
         except MemoryError as _e:
             print("per-tick MemoryError:", _e)
+            gc.collect()
+
+    if _showing_ship:
+        try:
+            gc.collect()
+            _ship_anim_tick += 1
+            update_ship_ocean(_ship_anim_tick)
+        except MemoryError as _e:
+            print("ship-anim MemoryError:", _e)
             gc.collect()
 
     # --- Button handling ---
