@@ -80,7 +80,7 @@ Once the device boots correctly from USB, you can switch to managing it over Wi-
    `settings.toml` is gitignored.
 
 2. Copy `device/settings.toml` to `CIRCUITPY/settings.toml`.
-3. Copy `device/boot.py` to `CIRCUITPY/boot.py`. This calls `storage.disable_usb_drive()` so the web workflow gets read-write access. (On the S3, USB mass storage and the web workflow can't both have write access — Adafruit's recommendation is to disable USB.)
+3. Copy `device/boot.py` to `CIRCUITPY/boot.py`. On boards with native Wi-Fi (S3) it calls `storage.disable_usb_drive()` so the web workflow gets read-write access; on the M4 it detects the missing `wifi` module and skips the call, so the file is safe to ship either way. (On the S3, USB mass storage and the web workflow can't both have write access — Adafruit's recommendation is to disable USB.)
 4. Hard-reset the board (power-cycle or press the reset button — a soft reset isn't enough).
 5. Visit [code.circuitpython.org](https://code.circuitpython.org/) and click **Connect to Device**. Pick `cpy-XXXXXX.local` (or use the device's IP) and enter the `CIRCUITPY_WEB_API_PASSWORD`.
 
