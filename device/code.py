@@ -12,6 +12,7 @@
 
 import time
 import gc
+import json
 import math
 import board
 import microcontroller
@@ -689,9 +690,50 @@ def fetch_failed():
     global _consecutive_fetch_errs
     _consecutive_fetch_errs += 1
     if _consecutive_fetch_errs >= _FETCH_ERR_RESET_THRESHOLD:
-        print("Too many fetch errors ({}), hard reset".format(_consecutive_fetch_errs))
+        device_log("Too many errs ({}), reset".format(_consecutive_fetch_errs))
         time.sleep(1)
         microcontroller.reset()
+
+
+def device_log(msg):
+    """Timestamp and buffer a log entry; also prints to serial."""
+    global _log_buffer
+    t = time.localtime()
+    entry = "[{:02d}:{:02d}:{:02d}] {}".format(t.tm_hour, t.tm_min, t.tm_sec, msg)
+    print(entry)
+    _log_buffer.append(entry)
+    if len(_log_buffer) > 30:
+        _log_buffer.pop(0)
+
+
+def flush_device_log():
+    """POST buffered log entries to the Pi proxy. Throttled to once per 5 min."""
+    global _log_buffer, _last_log_flush
+    if not _log_buffer:
+        return
+    now = time.monotonic()
+    if now - _last_log_flush < 300:
+        return
+    _last_log_flush = now
+    msgs = _log_buffer[:]
+    _log_buffer = []
+    try:
+        gc.collect()
+        body = json.dumps({"msgs": msgs}).encode()
+        resp = mp.network.requests.post(
+            "{}/api/devicelog".format(PROXY_HOST),
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.close()
+        del body
+        gc.collect()
+        print("Log flushed: {} msgs".format(len(msgs)))
+    except Exception as e:
+        print("Log flush err:", e)
+        _log_buffer = msgs + _log_buffer
+        if len(_log_buffer) > 50:
+            _log_buffer = _log_buffer[-30:]
 
 
 def fetch_route(callsign, icao24=""):
@@ -839,6 +881,8 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+_log_buffer = []
+_last_log_flush = 0.0
 weather_str = ""
 weather_cond = ""
 weather_cond_main = ""
@@ -871,6 +915,7 @@ _demo_plane_idx    = 0
 _demo_ship_idx     = 0
 _demo_last_switch  = 0
 
+device_log("Boot OK")
 
 # ---------------------------------------------------------------------------
 # Icon update helper
@@ -957,9 +1002,9 @@ def fetch_weather():
             ss_local = (ss + tz_off) % 86400
             _sunrise_mins = sr_local // 60
             _sunset_mins = ss_local // 60
-        print("Weather:", weather_str, "-", weather_cond, "Wind:", wind_str)
+        device_log("Wx:{} {} {}".format(weather_str, weather_cond, wind_str))
     except Exception as e:
-        print("Weather err:", e)
+        device_log("Wx err:{}".format(e))
         fetch_failed()
         if not weather_str:
             weather_str = "N/A"
@@ -998,7 +1043,7 @@ def fetch_tides():
                 h12 = p[2] % 12 or 12
                 tide_str = "{}:{}".format(h12, p[3])
                 found = True
-                print("Tide:", tide_type_val, tide_str)
+                device_log("Tide:{} {}".format(tide_type_val, tide_str))
                 break
         if not found:
             tmr_preds = fetch_json(base.format("tomorrow", NOAA_STATION)).get("predictions", [])
@@ -1009,7 +1054,7 @@ def fetch_tides():
                 h12 = h % 12 or 12
                 tide_type_val = p.get("type", "")
                 tide_str = "{}:{}".format(h12, m_str)
-                print("Tide (tmr):", tide_type_val, tide_str)
+                device_log("Tide tmr:{} {}".format(tide_type_val, tide_str))
                 found = True
                 break
             if not found:
@@ -1018,7 +1063,7 @@ def fetch_tides():
         # Calculate basin level — the per-tick block redraws it each frame
         interpolate_tide_level()
     except Exception as e:
-        print("Tide err:", e)
+        device_log("Tide err:{}".format(e))
         fetch_failed()
         if not tide_str:
             tide_str = "N/A"
@@ -1036,13 +1081,13 @@ def fetch_planes():
         # Proxy returns positional arrays: [call, icao24, alt, spd, hdg, vrate]
         # Avoids ~180 bytes/plane of string-key interning vs named-key dicts.
         planes = data.get("planes") or []
-        print("Planes overhead:", len(planes))
+        device_log("Planes:{}".format(len(planes)))
     except MemoryError:
-        print("OpenSky: response too large, try smaller BBOX")
+        device_log("Planes: response too large")
         fetch_failed()
         planes = []
     except Exception as e:
-        print("OpenSky err:", e)
+        device_log("Planes err:{}".format(e))
         fetch_failed()
         planes = []
     gc.collect()
@@ -1102,9 +1147,9 @@ def fetch_ships():
         url = "{}/api/ships".format(PROXY_HOST)
         data = fetch_json(url)
         ships = data.get("ships", [])
-        print("Ships nearby:", len(ships))
+        device_log("Ships:{}".format(len(ships)))
     except Exception as e:
-        print("Ships err:", e)
+        device_log("Ships err:{}".format(e))
         fetch_failed()
         ships = []
     gc.collect()
@@ -1379,7 +1424,8 @@ while True:
     # loop if the device starts inside the 03:30 window.
     _t = time.localtime()
     if _t.tm_hour == 3 and _t.tm_min == 30 and now > 3600:
-        print("Daily scheduled reboot")
+        device_log("Daily reboot")
+        flush_device_log()
         time.sleep(1)
         microcontroller.reset()
 
@@ -1392,6 +1438,7 @@ while True:
         if now - last_weather_fetch >= WEATHER_INTERVAL:
             fetch_weather()
             fetch_tides()
+            flush_device_log()
             last_weather_fetch = now
             if not showing_planes:
                 show_weather_tides()
@@ -1414,7 +1461,7 @@ while True:
         # (e.g. fetch issue, hovering aircraft, stale ADS-B data), force a
         # weather break so the user is never permanently stuck on a plane.
         if showing_planes and now - plane_screen_started_at >= PLANE_MAX_SECS:
-            print("Plane screen max duration reached, weather break")
+            device_log("Plane max, weather break")
             showing_planes = False
             plane_cooldown_until = now + PLANE_COOLDOWN_SECS
             show_weather_tides()
@@ -1424,6 +1471,7 @@ while True:
             plane_idx = 0
             last_plane_cycle = now
             plane_screen_started_at = now
+            device_log("Plane:{}".format(display_planes[0][0]))
             show_plane(display_planes[0])
         elif not display_planes and showing_planes:
             showing_planes = False
@@ -1458,6 +1506,7 @@ while True:
                     if not _showing_ship:
                         _showing_ship = True
                         ship_idx = 0
+                        device_log("Ship:{} {}mi".format(ships[0].get("name","?")[:12], ships[0].get("distance_mi","?")))
                         show_ship(ships[ship_idx])
                     elif len(ships) > 1:
                         ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS

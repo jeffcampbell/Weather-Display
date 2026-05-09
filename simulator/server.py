@@ -12,6 +12,7 @@ import http.server
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -20,6 +21,7 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 BASE_DIR = Path(__file__).parent
 DEVICE_DIR = BASE_DIR.parent / "device"
 ENV_FILE = BASE_DIR / ".env"
+DEVICE_LOG_FILE = BASE_DIR / "device.log"
 PI_PROXY = "http://YOUR_PROXY_HOST:6590"
 
 
@@ -166,11 +168,59 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        # --- /api/devicelog → read local device.log ---
+        if self.path == "/api/devicelog" or self.path.startswith("/api/devicelog?"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            lines_n = min(int(qs.get("lines", ["100"])[0]), 1000)
+            try:
+                if DEVICE_LOG_FILE.exists():
+                    with open(DEVICE_LOG_FILE) as f:
+                        all_lines = f.readlines()
+                    recent = [l.rstrip("\n") for l in all_lines[-lines_n:]]
+                    total = len(all_lines)
+                else:
+                    recent, total = [], 0
+                body = json.dumps({"lines": recent, "total": total}).encode()
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # --- / → serve simulator.html ---
         if self.path == "/":
             self.path = "/simulator.html"
 
         return super().do_GET()
+
+    def do_POST(self):
+        if self.path == "/api/devicelog":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body.decode())
+                msgs = data.get("msgs", [])
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                lines = ["{} | {}\n".format(ts, m) for m in msgs]
+                with open(DEVICE_LOG_FILE, "a") as f:
+                    f.writelines(lines)
+                response = json.dumps({"ok": True, "appended": len(lines)}).encode()
+                status = 200
+            except Exception as e:
+                response = json.dumps({"error": str(e)}).encode()
+                status = 500
+        else:
+            response = json.dumps({"error": "not found"}).encode()
+            status = 404
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(response))
+        self.end_headers()
+        self.wfile.write(response)
 
     def log_message(self, fmt, *args):
         # Quieter logging

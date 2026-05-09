@@ -78,6 +78,8 @@ def cache_set(key, data):
 
 DB_PATH = Path(__file__).parent / "sightings.db"
 _db_lock = Lock()
+LOG_FILE = Path(__file__).parent / "device.log"
+_log_lock = Lock()
 
 def _db_init():
     with sqlite3.connect(DB_PATH) as con:
@@ -646,6 +648,61 @@ def handle_ships_debug(params):
 
 
 # ---------------------------------------------------------------------------
+# Device log — append-only flat file, one entry per line
+# ---------------------------------------------------------------------------
+
+def handle_devicelog_post(body):
+    """Append device log messages to device.log.
+    Expects JSON body: {"msgs": ["[HH:MM:SS] message", ...]}
+    Each line written as: "YYYY-MM-DD HH:MM:SS | [HH:MM:SS] message"
+    """
+    try:
+        data = json.loads(body.decode())
+        msgs = data.get("msgs", [])
+        if not msgs:
+            return 400, json.dumps({"error": "no msgs"}).encode()
+    except Exception as e:
+        return 400, json.dumps({"error": str(e)}).encode()
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["{} | {}\n".format(ts, m) for m in msgs]
+
+    with _log_lock:
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.writelines(lines)
+            with open(LOG_FILE, "r") as f:
+                all_lines = f.readlines()
+            if len(all_lines) > 10000:
+                with open(LOG_FILE, "w") as f:
+                    f.writelines(all_lines[-10000:])
+        except Exception as e:
+            return 500, json.dumps({"error": str(e)}).encode()
+
+    return 200, json.dumps({"ok": True, "appended": len(lines)}).encode()
+
+
+def handle_devicelog_get(params):
+    """Return recent device log lines.
+    ?lines=N  — how many tail lines to return (default 100, max 1000)
+    """
+    lines_n = min(int(params.get("lines", ["100"])[0]), 1000)
+
+    with _log_lock:
+        try:
+            if not LOG_FILE.exists():
+                return 200, json.dumps({"lines": [], "total": 0}).encode()
+            with open(LOG_FILE, "r") as f:
+                all_lines = f.readlines()
+            recent = [l.rstrip("\n") for l in all_lines[-lines_n:]]
+            total = len(all_lines)
+        except Exception as e:
+            return 500, json.dumps({"error": str(e)}).encode()
+
+    return 200, json.dumps({"lines": recent, "total": total}).encode()
+
+
+# ---------------------------------------------------------------------------
 # Route registry — add new APIs here
 # ---------------------------------------------------------------------------
 
@@ -686,6 +743,7 @@ ROUTES = {
     "/api/ships":       handle_ships,
     "/api/ships/debug": handle_ships_debug,
     "/api/sightings":   handle_sightings,
+    "/api/devicelog":   handle_devicelog_get,
     "/api/health":      handle_health,
 }
 
@@ -718,6 +776,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        if path == "/api/devicelog":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            status, response = handle_devicelog_post(body)
+        else:
+            status, response = 404, json.dumps({"error": "not found"}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(response))
+        self.end_headers()
+        self.wfile.write(response)
 
     def log_message(self, fmt, *args):
         ts = time.strftime("%H:%M:%S")
