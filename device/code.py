@@ -800,11 +800,13 @@ display.root_group = loading_group
 
 
 # ---------------------------------------------------------------------------
-# Time sync — NTP at boot, RTC kept in local time. The applied UTC offset
-# is tracked in _tz_offset_secs so fetch_weather can re-sync to whatever
-# OpenWeatherMap reports for the configured location (DST-correct, every TZ).
+# Time sync — NTP at boot if reachable; otherwise we wait until the first
+# weather fetch and use OWM's authoritative `dt` (UTC unix timestamp) to
+# set the RTC. _rtc_known tracks whether the RTC's current offset matches
+# _tz_offset_secs — only then is the delta-based DST resync safe.
 # ---------------------------------------------------------------------------
 _tz_offset_secs = TZ_OFFSET_HOURS * 3600
+_rtc_known = False
 print("Syncing time via NTP...")
 try:
     import socketpool, wifi as _wifi_mod, adafruit_ntp, rtc as _rtc_mod
@@ -812,6 +814,7 @@ try:
     _ntp = adafruit_ntp.NTP(_pool, tz_offset=0)
     _local_secs = time.mktime(_ntp.datetime) + _tz_offset_secs
     _rtc_mod.RTC().datetime = time.localtime(_local_secs)
+    _rtc_known = True
     print("Time synced (UTC{:+d}):".format(TZ_OFFSET_HOURS), time.localtime())
 except Exception as e:
     print("NTP sync failed:", e)
@@ -907,7 +910,7 @@ def get_condition_text(cond_id, fallback):
 
 def fetch_weather():
     global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed
-    global _sunrise_mins, _sunset_mins, _tz_offset_secs
+    global _sunrise_mins, _sunset_mins, _tz_offset_secs, _rtc_known
     gc.collect()
     try:
         url = (
@@ -926,12 +929,28 @@ def fetch_weather():
         wind_deg = data.get("wind", {}).get("deg", 0)
         wind_dir = heading_to_compass(wind_deg)
         wind_str = "{}mph {}".format(_wind_speed, wind_dir)
-        # OWM reports the location's current UTC offset in seconds (DST-aware).
-        # If it differs from what we last applied, slide the RTC by the delta
-        # so the device clock follows DST without manual intervention.
+        # Time / DST sync. Two cases:
+        #   - _rtc_known=False (NTP failed at boot, or this is the first
+        #     fetch after a soft-reload that lost track of the RTC offset):
+        #     use OWM's `dt` (UTC unix timestamp) to set the RTC absolutely.
+        #     Authoritative, no dependence on prior state.
+        #   - _rtc_known=True: the RTC's offset matches _tz_offset_secs, so
+        #     the DST flip can be handled with a small delta nudge — avoids
+        #     the small backward jump from re-reading OWM's slightly-stale dt.
         tz_off = data.get("timezone", _tz_offset_secs)
-        delta = tz_off - _tz_offset_secs
-        if delta:
+        utc_secs = data.get("dt", 0)
+        if not _rtc_known:
+            if utc_secs:
+                try:
+                    import rtc as _rtc_mod
+                    _rtc_mod.RTC().datetime = time.localtime(utc_secs + tz_off)
+                    _tz_offset_secs = tz_off
+                    _rtc_known = True
+                    device_log("RTC sync (UTC{:+d})".format(tz_off // 3600))
+                except Exception as e:
+                    print("RTC sync err:", e)
+        elif tz_off != _tz_offset_secs:
+            delta = tz_off - _tz_offset_secs
             try:
                 import rtc as _rtc_mod
                 _rtc_mod.RTC().datetime = time.localtime(time.mktime(time.localtime()) + delta)
