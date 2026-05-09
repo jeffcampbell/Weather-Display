@@ -18,6 +18,9 @@ __pycache__/
 .DS_Store
 .claude/
 
+# Local helper scripts (not part of the public project)
+scripts/
+
 # Test / generated output
 bugs/
 plane_bbox_map.png
