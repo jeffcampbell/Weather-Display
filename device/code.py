@@ -899,6 +899,8 @@ _ship_cycle_start = 0
 _showing_ship = False
 _ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship ocean animation
 _ship_anim_tick = 0
+_ship_name_w = 0           # pixel width of current ship name (5 * chars)
+_ship_name_phase = 0       # marquee tick counter
 planes = []
 showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
@@ -1211,14 +1213,18 @@ def show_ship(ship):
         logo_label.text = ""
         route_label.text = ""
 
+        global _ship_name_w, _ship_name_phase
         # Upgrade to mid font for ship name/type/dest rows
         airline_label.font = FONT_MID
         alt_label.font = FONT_MID
         reg_label.font = FONT_MID
 
-        _center_ship_mid(airline_label, name[:9])
+        _ship_name_w = len(name) * 5
+        _ship_name_phase = 0
+        airline_label.text = name
         airline_label.color = 0xFFFFFF
         airline_label.y = 5
+        airline_label.x = 16 if _ship_name_w > 48 else 16 + (48 - _ship_name_w) // 2
 
         _center_ship_mid(reg_label, type_name[:9])
         reg_label.color = color
@@ -1559,6 +1565,18 @@ while True:
             gc.collect()
             _ship_anim_tick += 1
             update_ship_ocean(_ship_anim_tick)
+            _overflow = _ship_name_w - 48
+            if _overflow > 0:
+                _ship_name_phase += 1
+                _scroll_ticks = (_overflow + 1) // 2   # ceil(overflow / 2px-per-tick)
+                _cycle_len = 2 + _scroll_ticks + 2     # pause-start + scroll + pause-end
+                _pos = _ship_name_phase % _cycle_len
+                if _pos < 2:
+                    airline_label.x = 16
+                elif _pos < 2 + _scroll_ticks:
+                    airline_label.x = 16 - min((_pos - 2) * 2, _overflow)
+                else:
+                    airline_label.x = 16 - _overflow
         except MemoryError as _e:
             print("ship-anim MemoryError:", _e)
             gc.collect()
