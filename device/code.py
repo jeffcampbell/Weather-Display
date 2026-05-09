@@ -835,7 +835,8 @@ def switch_screen(name):
 # ---------------------------------------------------------------------------
 
 def get_condition_text(cond_id, fallback):
-    """Look up short condition text from conditions.csv on disk."""
+    """Look up short condition text from conditions.csv on disk.
+    The display column fits 10 small-font chars (4 px/char in a 43 px panel)."""
     cid = str(cond_id)
     try:
         with open("conditions.csv", "r") as f:
@@ -845,7 +846,7 @@ def get_condition_text(cond_id, fallback):
                     return line.split(",", 1)[1]
     except Exception:
         pass
-    return fallback[:8]
+    return fallback[:10]
 
 
 def fetch_weather():
@@ -1167,7 +1168,7 @@ def show_weather_tides():
         elif temp_val >= 20: tc = 0x44AAFF
         else:                tc = 0x2255CC
         temp_label.color = tc
-        _center_small(cond_label, weather_cond[:8])
+        _center_small(cond_label, weather_cond[:10])
         _center_small(wind_label, wind_str)
         # Tide time / HIGH / LOW at bottom of left column
         now_m = time.localtime()
