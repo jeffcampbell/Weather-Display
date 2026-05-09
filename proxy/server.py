@@ -259,7 +259,12 @@ def handle_planes(params):
             planes.append(entry)
             log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
-        cache_set(cache_key, body)
+        # Cache longer when sky is empty — no planes means no reason to call again soon.
+        # Device still polls every 60s and gets a fresh proxy response; we just avoid
+        # burning a credit on every poll when there's nothing overhead.
+        # Empty → 5 min cache (~12 credits/hr vs 60). Planes present → 30s for position freshness.
+        ttl = 30 if planes else 300
+        cache_set(cache_key, body, age_override=ttl)
         return 200, body
     except Exception as e:
         return 500, json.dumps({"error": str(e)}).encode()
