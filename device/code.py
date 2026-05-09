@@ -51,7 +51,7 @@ SHIPS_ENABLED = True    # Set True to enable ship tracking
 SHIPS_TEST = False
 SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
-DEMO_MODE = True        # Set True to auto-cycle test fixtures (no network needed)
+DEMO_MODE = False       # Set True to auto-cycle test fixtures (no network needed)
 DEMO_INTERVAL = 30      # seconds per view in demo mode
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
