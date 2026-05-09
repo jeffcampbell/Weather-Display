@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/Development/matrix-portal-proxy
-ExecStart=/usr/bin/python3 /home/pi/Development/matrix-portal-proxy/server.py
+WorkingDirectory=/home/pi/matrix-portal-tracker/proxy
+ExecStart=/usr/bin/python3 /home/pi/matrix-portal-tracker/proxy/server.py
 Restart=always
 RestartSec=5
 Environment=PORT=6590

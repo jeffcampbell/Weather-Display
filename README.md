@@ -109,19 +109,6 @@ See [device/SETUP.md](device/SETUP.md) for the full walkthrough. Quick version:
 5. Copy `device/secrets.py.template` to `device/secrets.py`, fill in credentials, copy to `CIRCUITPY/secrets.py`
 6. Copy `device/code.py` to `CIRCUITPY/code.py`
 
-### 4. (Optional) Run the browser simulator
-
-The simulator renders the display in a browser canvas at 10× scale, useful for development without hardware.
-
-```bash
-cd simulator
-cp .env.template .env
-# Edit .env with your API keys
-pip install -r requirements.txt   # if first time
-python3 server.py
-# Open http://localhost:8000
-```
-
 ---
 
 ## Project Structure
@@ -139,13 +126,6 @@ proxy/
   server.py               HTTP proxy + AIS WebSocket listener
   config.json.template    Configuration template (copy to config.json)
   API.md                  Full proxy API reference
-
-simulator/
-  simulator.html          Browser-based pixel-exact display replica
-  server.py               Dev server (proxies API calls, serves HTML)
-  screenshot.py           Playwright regression screenshot tester
-  extract_fonts.py        BDF font extractor (run with device mounted)
-  .env.template           Simulator configuration template
 ```
 
 ---

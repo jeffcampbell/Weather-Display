@@ -7,7 +7,6 @@ proxy/config.json
 # Runtime logs
 proxy/device.log
 proxy/sightings.db
-simulator/device.log
 
 # Python
 .venv/
@@ -21,4 +20,3 @@ __pycache__/
 # Test / generated output
 bugs/
 plane_bbox_map.png
-simulator/screenshots/*.png

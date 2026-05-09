@@ -35,7 +35,7 @@ The display uses two BDF bitmap fonts. Copy these onto `CIRCUITPY/` (root, not l
 - `4x6.bdf` — small font (conditions, wind, tide time)
 - `5x8.bdf` — medium font (temperature, clock, route)
 
-These ship with CircuitPython releases and the Adafruit bundle. You can also extract them with `simulator/extract_fonts.py` if the device is already mounted.
+These ship with CircuitPython releases and the Adafruit bundle.
 
 ## 4. Copy Data Files
 

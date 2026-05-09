@@ -31,9 +31,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-NOAA_STATION = secrets.get("noaa_station", "8445425")
-LAT = float(secrets.get("latitude", 42.142039))
-LON = float(secrets.get("longitude", -70.693353))
+NOAA_STATION = secrets["noaa_station"]
+LAT = float(secrets["latitude"])
+LON = float(secrets["longitude"])
 OWM_KEY = secrets["openweather_key"]
 TIMEZONE = secrets.get("timezone", "America/New_York")
 OPENSKY_USER = secrets.get("opensky_user", "")
