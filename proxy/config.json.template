@@ -12,5 +12,8 @@
 
   "aisstream_key": "YOUR_AISSTREAM_API_KEY",
 
-  "flightaware_key": ""
+  "flightaware_key": "",
+
+  "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
+  "device_secret": ""
 }

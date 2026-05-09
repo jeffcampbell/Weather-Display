@@ -49,6 +49,10 @@ DEMO_INTERVAL = 30      # seconds per view in demo mode
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
 PROXY_HOST = secrets.get("proxy_host", "")       # e.g. "http://YOUR_PI_IP:6590"
+# Shared secret sent as X-Device-Secret on POST /api/devicelog. Must match
+# the proxy's device_secret. Empty here = device sends no header (proxy
+# only enforces if its config also has device_secret set).
+DEVICE_SECRET = secrets.get("device_secret", "")
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths
@@ -619,10 +623,13 @@ def flush_device_log():
     try:
         gc.collect()
         body = json.dumps({"msgs": msgs}).encode()
+        headers = {"Content-Type": "application/json"}
+        if DEVICE_SECRET:
+            headers["X-Device-Secret"] = DEVICE_SECRET
         resp = mp.network.requests.post(
             "{}/api/devicelog".format(PROXY_HOST),
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         resp.close()
         del body

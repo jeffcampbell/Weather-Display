@@ -46,6 +46,7 @@ OPENSKY_PASS = _config.get("opensky_pass", "")
 OWM_KEY = _config.get("openweather_key", "")
 AISSTREAM_KEY = _config.get("aisstream_key", "")
 FLIGHTAWARE_KEY = _config.get("flightaware_key", "")
+DEVICE_SECRET = _config.get("device_secret", "")
 LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
@@ -810,9 +811,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         if path == "/api/devicelog":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            status, response = handle_devicelog_post(body)
+            # When DEVICE_SECRET is configured, require a matching header. The
+            # endpoint is otherwise unauthenticated and reachable from anyone
+            # who can hit the proxy's port.
+            if DEVICE_SECRET and self.headers.get("X-Device-Secret", "") != DEVICE_SECRET:
+                status, response = 401, json.dumps({"error": "bad device secret"}).encode()
+            else:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                status, response = handle_devicelog_post(body)
         else:
             status, response = 404, json.dumps({"error": "not found"}).encode()
         self.send_response(status)

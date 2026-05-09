@@ -348,6 +348,8 @@ Returns the tail of the device log file.
 
 Appends device-side log entries. Called by the MatrixPortal roughly every 5 minutes to flush its local buffer.
 
+**Authentication:** If `device_secret` is configured in `config.json`, requests must include a matching `X-Device-Secret` header. If `device_secret` is empty, no auth is required (recommended only when the port is not exposed to the public internet).
+
 **Request body:**
 
 ```json
@@ -367,6 +369,7 @@ The log file is rotated automatically: if it grows past 10 000 lines, the oldest
 | Status | Body |
 |--------|------|
 | 400 | `{"error": "no msgs"}` or JSON parse error |
+| 401 | `{"error": "bad device secret"}` — header missing or mismatched |
 | 500 | `{"error": "..."}` on disk write failure |
 
 ---
@@ -419,5 +422,6 @@ Liveness check.
 | `opensky_user` / `opensky_pass` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky Basic Auth (anonymous requests are rate-limited harder) |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). If missing, falls back to OpenSky / adsbdb. |
+| `device_secret` | `POST /api/devicelog` | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check. |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).
