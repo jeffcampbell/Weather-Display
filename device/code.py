@@ -579,7 +579,10 @@ def fetch_json(url):
     reboot — adafruit_requests can get into an unrecoverable SSL/socket
     state that only a CPU reset clears."""
     global _consecutive_fetch_errs
-    resp = mp.network.fetch(url)
+    headers = None
+    if DEVICE_SECRET and PROXY_HOST and url.startswith(PROXY_HOST):
+        headers = {"X-Device-Secret": DEVICE_SECRET}
+    resp = mp.network.fetch(url, headers=headers) if headers else mp.network.fetch(url)
     try:
         data = resp.json()
         _consecutive_fetch_errs = 0  # success resets the counter

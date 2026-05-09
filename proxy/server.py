@@ -783,7 +783,24 @@ ROUTES = {
 # ---------------------------------------------------------------------------
 
 class ProxyHandler(BaseHTTPRequestHandler):
+    def _check_auth(self):
+        """Return True if request is authorized. When DEVICE_SECRET is empty,
+        no auth is enforced (back-compat for LAN-only deployments)."""
+        if not DEVICE_SECRET:
+            return True
+        return self.headers.get("X-Device-Secret", "") == DEVICE_SECRET
+
+    def _send_json(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if not self._check_auth():
+            self._send_json(401, json.dumps({"error": "bad device secret"}).encode())
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
@@ -791,42 +808,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
         handler = ROUTES.get(path)
         if handler:
             status, body = handler(params)
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
         else:
-            # List available routes
             body = json.dumps({
                 "error": "not found",
                 "available_routes": list(ROUTES.keys()),
             }).encode()
-            self.send_response(404)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
+            status = 404
+        self._send_json(status, body)
 
     def do_POST(self):
+        if not self._check_auth():
+            self._send_json(401, json.dumps({"error": "bad device secret"}).encode())
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         if path == "/api/devicelog":
-            # When DEVICE_SECRET is configured, require a matching header. The
-            # endpoint is otherwise unauthenticated and reachable from anyone
-            # who can hit the proxy's port.
-            if DEVICE_SECRET and self.headers.get("X-Device-Secret", "") != DEVICE_SECRET:
-                status, response = 401, json.dumps({"error": "bad device secret"}).encode()
-            else:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                status, response = handle_devicelog_post(body)
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            status, response = handle_devicelog_post(body)
         else:
             status, response = 404, json.dumps({"error": "not found"}).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(response))
-        self.end_headers()
-        self.wfile.write(response)
+        self._send_json(status, response)
 
     def log_message(self, fmt, *args):
         ts = time.strftime("%H:%M:%S")

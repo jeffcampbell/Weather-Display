@@ -4,6 +4,10 @@ Base URL (Raspberry Pi): `http://YOUR_PI_IP:6590`
 
 All responses are `application/json`. All endpoints are `GET` unless noted.
 
+## Authentication
+
+When `device_secret` is set in the proxy's `config.json`, **every endpoint** requires a matching `X-Device-Secret` header — auth is global, not per-route. When `device_secret` is empty (or omitted), no auth is enforced. Mismatched or missing header on a configured proxy returns `401 {"error": "bad device secret"}`.
+
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /api/planes` | Aircraft within bounding box (slim, device-friendly) |
@@ -348,8 +352,6 @@ Returns the tail of the device log file.
 
 Appends device-side log entries. Called by the MatrixPortal roughly every 5 minutes to flush its local buffer.
 
-**Authentication:** If `device_secret` is configured in `config.json`, requests must include a matching `X-Device-Secret` header. If `device_secret` is empty, no auth is required (recommended only when the port is not exposed to the public internet).
-
 **Request body:**
 
 ```json
@@ -422,6 +424,6 @@ Liveness check.
 | `opensky_user` / `opensky_pass` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky Basic Auth (anonymous requests are rate-limited harder) |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). If missing, falls back to OpenSky / adsbdb. |
-| `device_secret` | `POST /api/devicelog` | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check. |
+| `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).
