@@ -208,7 +208,7 @@ def handle_planes(params):
     a lot to the SAMD51 device: smaller parse = less heap fragmentation."""
 
     cache_key = "planes"
-    cached = cache_get(cache_key, max_age_sec=30)
+    cached = cache_get(cache_key, max_age_sec=55)
     if cached:
         return 200, cached
 
@@ -259,7 +259,7 @@ def handle_planes(params):
             planes.append(entry)
             log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
-        cache_set(cache_key, body, age_override=30)
+        cache_set(cache_key, body, age_override=55)
         return 200, body
     except Exception as e:
         return 500, json.dumps({"error": str(e)}).encode()
