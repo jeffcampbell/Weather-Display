@@ -123,82 +123,6 @@ FONT = terminalio.FONT
 FONT_SMALL = bitmap_font.load_font("4x6.bdf")
 FONT_MID = bitmap_font.load_font("5x8.bdf")
 
-# ---------------------------------------------------------------------------
-# Icon bitmaps (8x8, 2 colors: transparent + icon color)
-# Each icon is stored as 8 bytes, one per row, 8 bits per row
-# ---------------------------------------------------------------------------
-
-# fmt: off
-ICON_SUN = bytes([
-    0b00010000,
-    0b10010010,
-    0b01000100,
-    0b00111000,
-    0b10111010,
-    0b01000100,
-    0b10010010,
-    0b00010000,
-])
-ICON_CLOUD = bytes([
-    0b00000000,
-    0b00110000,
-    0b01111000,
-    0b01111100,
-    0b11111110,
-    0b11111110,
-    0b01111100,
-    0b00000000,
-])
-ICON_RAIN = bytes([
-    0b00110000,
-    0b01111000,
-    0b11111100,
-    0b01111100,
-    0b00000000,
-    0b01010100,
-    0b10101000,
-    0b00010000,
-])
-ICON_SNOW = bytes([
-    0b00110000,
-    0b01111000,
-    0b11111100,
-    0b01111100,
-    0b00000000,
-    0b01001000,
-    0b00100100,
-    0b01001000,
-])
-ICON_STORM = bytes([
-    0b00110000,
-    0b01111000,
-    0b11111100,
-    0b11111110,
-    0b00011000,
-    0b00110000,
-    0b00010000,
-    0b00001000,
-])
-ICON_FOG = bytes([
-    0b00000000,
-    0b11111110,
-    0b00000000,
-    0b01111100,
-    0b00000000,
-    0b11111110,
-    0b00000000,
-    0b01111100,
-])
-# fmt: on
-
-# Weather condition -> icon mapping
-def _get_icon_for(cond):
-    if cond == "Clear": return ICON_SUN
-    if cond == "Clouds": return ICON_CLOUD
-    if cond in ("Rain", "Drizzle"): return ICON_RAIN
-    if cond == "Snow": return ICON_SNOW
-    if cond == "Thunderstorm": return ICON_STORM
-    return ICON_FOG
 
 # Airline lookup — reads from airlines.csv on disk, caches only recent entries
 # Saves ~6 KB RAM vs inline dict on SAMD51
@@ -264,20 +188,6 @@ def heading_to_compass(hdg):
 # Display groups and labels
 # ---------------------------------------------------------------------------
 
-def make_icon_tg(icon_data, width, height, color, x=0, y=0):
-    """Create a TileGrid from 1-bit icon data."""
-    bmp = displayio.Bitmap(width, height, 2)
-    pal = displayio.Palette(2)
-    pal[0] = 0x000000
-    pal.make_transparent(0)
-    pal[1] = color
-    for row in range(height):
-        byte = icon_data[row]
-        for col in range(width):
-            if byte & (1 << (7 - col)):
-                bmp[col, row] = 1
-    tg = displayio.TileGrid(bmp, pixel_shader=pal, x=x, y=y)
-    return tg, bmp, pal
 
 # ---------------------------------------------------------------------------
 # Background bitmaps — colored zones to fill the display
@@ -805,8 +715,6 @@ clock_label = Label(FONT_MID, text="", color=0xFFFFFF, x=22, y=4)
 weather_group.append(clock_label)
 
 # Row 2 (y=12): Weather icon + temperature — mid font, bright yellow
-wx_icon_tg, wx_icon_bmp, wx_icon_pal = make_icon_tg(ICON_SUN, 8, 8, 0xFFCC00, x=22, y=9)
-weather_group.append(wx_icon_tg)
 
 temp_label = Label(FONT_MID, text="", color=0xFFDD00, x=32, y=12)
 weather_group.append(temp_label)
@@ -919,30 +827,6 @@ _demo_last_switch  = 0
 
 device_log("Boot OK")
 
-# ---------------------------------------------------------------------------
-# Icon update helper
-# ---------------------------------------------------------------------------
-
-def update_weather_icon(cond_main):
-    """Rebuild the weather icon bitmap for the given condition."""
-    icon_data = _get_icon_for(cond_main)
-    if cond_main == "Clear":
-        c = 0xFFCC00
-    elif cond_main in ("Rain", "Drizzle"):
-        c = 0x4488FF
-    elif cond_main == "Snow":
-        c = 0xCCDDFF
-    elif cond_main == "Thunderstorm":
-        c = 0xAAAA00
-    elif cond_main in ("Mist", "Fog", "Haze", "Smoke", "Dust"):
-        c = 0x888888
-    else:
-        c = 0xAAAAAA
-    wx_icon_pal[1] = c
-    for row in range(8):
-        byte = icon_data[row]
-        for col in range(8):
-            wx_icon_bmp[col, row] = 1 if (byte & (1 << (7 - col))) else 0
 
 def switch_screen(name):
     """Switch which display group is shown."""
@@ -1269,7 +1153,6 @@ def show_weather_tides():
     a label-realloc MemoryError just skips this render instead of crashing."""
     try:
         switch_screen("weather")
-        wx_icon_tg.hidden = True
         _center_mid(temp_label, weather_str)
         try:
             temp_val = int(weather_str.split(chr(176))[0])
