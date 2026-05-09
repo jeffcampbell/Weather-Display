@@ -56,6 +56,7 @@ BBOX = float(_config.get("bbox", 0.1))
 
 _cache = {}       # key -> {"data": bytes, "time": float}
 _cache_lock = Lock()
+_started_at = time.time()
 
 
 def cache_get(key, max_age_sec):
@@ -402,21 +403,21 @@ def handle_aircraft(params):
 def handle_forecast(params):
     """Fetch 3-day weather forecast from OpenWeatherMap 5-day forecast.
     Returns today, tomorrow, and day-after with hi/lo/condition/wind.
-    Cached for 1 hour."""
-
-    cache_key = "forecast"
-    cached = cache_get(cache_key, max_age_sec=3600)
-    if cached:
-        return 200, cached
+    Cached for 1 hour per (lat,lon)."""
 
     if not OWM_KEY:
         return 500, json.dumps({"error": "no openweather_key configured"}).encode()
 
-    import datetime
-    import math
-
     lat = float(params.get("lat", [LATITUDE])[0])
     lon = float(params.get("lon", [LONGITUDE])[0])
+
+    cache_key = f"forecast:{lat},{lon}"
+    cached = cache_get(cache_key, max_age_sec=3600)
+    if cached:
+        return 200, cached
+
+    import datetime
+
     url = (
         f"https://api.openweathermap.org/data/2.5/forecast"
         f"?lat={lat}&lon={lon}&appid={OWM_KEY}&units=imperial"
@@ -651,7 +652,7 @@ def handle_health(params):
         "status": "ok",
         "cache_entries": len(_cache),
         "ships_tracked": len(_ships),
-        "uptime_approx": "use /api/health to verify proxy is reachable",
+        "uptime_seconds": int(time.time() - _started_at),
     }).encode()
 
 

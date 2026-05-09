@@ -27,7 +27,10 @@ NOAA_STATION = secrets["noaa_station"]
 LAT = float(secrets["latitude"])
 LON = float(secrets["longitude"])
 OWM_KEY = secrets["openweather_key"]
-TIMEZONE = secrets.get("timezone", "America/New_York")
+# Static UTC offset used at boot. After the first weather fetch, the
+# OpenWeatherMap response carries the accurate offset (DST-aware) and the
+# RTC re-syncs automatically, so this only needs to be roughly right.
+TZ_OFFSET_HOURS = int(secrets.get("tz_offset_hours", -5))
 
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
@@ -756,19 +759,19 @@ display.root_group = loading_group
 
 
 # ---------------------------------------------------------------------------
-# Time sync — NTP direct (Adafruit IO requires aio_username/aio_key we don't have)
+# Time sync — NTP at boot, RTC kept in local time. The applied UTC offset
+# is tracked in _tz_offset_secs so fetch_weather can re-sync to whatever
+# OpenWeatherMap reports for the configured location (DST-correct, every TZ).
 # ---------------------------------------------------------------------------
+_tz_offset_secs = TZ_OFFSET_HOURS * 3600
 print("Syncing time via NTP...")
 try:
     import socketpool, wifi as _wifi_mod, adafruit_ntp, rtc as _rtc_mod
     _pool = socketpool.SocketPool(_wifi_mod.radio)
     _ntp = adafruit_ntp.NTP(_pool, tz_offset=0)
-    _utc = _ntp.datetime
-    # America/New_York: EDT (UTC-4) March-October, EST (UTC-5) otherwise
-    _tz_off = -4 if 3 <= _utc.tm_mon <= 10 else -5
-    _local_secs = time.mktime(_utc) + _tz_off * 3600
+    _local_secs = time.mktime(_ntp.datetime) + _tz_offset_secs
     _rtc_mod.RTC().datetime = time.localtime(_local_secs)
-    print("Time synced (UTC{:+d}):".format(_tz_off), time.localtime())
+    print("Time synced (UTC{:+d}):".format(TZ_OFFSET_HOURS), time.localtime())
 except Exception as e:
     print("NTP sync failed:", e)
 
@@ -846,7 +849,8 @@ def get_condition_text(cond_id, fallback):
 
 
 def fetch_weather():
-    global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed, _sunrise_mins, _sunset_mins
+    global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed
+    global _sunrise_mins, _sunset_mins, _tz_offset_secs
     gc.collect()
     try:
         url = (
@@ -865,8 +869,20 @@ def fetch_weather():
         wind_deg = data.get("wind", {}).get("deg", 0)
         wind_dir = heading_to_compass(wind_deg)
         wind_str = "{}mph {}".format(_wind_speed, wind_dir)
+        # OWM reports the location's current UTC offset in seconds (DST-aware).
+        # If it differs from what we last applied, slide the RTC by the delta
+        # so the device clock follows DST without manual intervention.
+        tz_off = data.get("timezone", _tz_offset_secs)
+        delta = tz_off - _tz_offset_secs
+        if delta:
+            try:
+                import rtc as _rtc_mod
+                _rtc_mod.RTC().datetime = time.localtime(time.mktime(time.localtime()) + delta)
+                _tz_offset_secs = tz_off
+                device_log("TZ shift {}s (UTC{:+d})".format(delta, tz_off // 3600))
+            except Exception as e:
+                print("TZ resync err:", e)
         # Sunrise/sunset for brightness control (local time as minutes)
-        tz_off = data.get("timezone", -14400)  # seconds offset from UTC
         sr = data.get("sys", {}).get("sunrise", 0)
         ss = data.get("sys", {}).get("sunset", 0)
         if sr and ss:

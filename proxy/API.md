@@ -381,7 +381,8 @@ Liveness check.
 {
   "status": "ok",
   "cache_entries": 12,
-  "ships_tracked": 3
+  "ships_tracked": 3,
+  "uptime_seconds": 8412
 }
 ```
 
@@ -390,6 +391,7 @@ Liveness check.
 | `status` | string | Always `"ok"` if the proxy is running |
 | `cache_entries` | int | Active entries in the in-memory cache |
 | `ships_tracked` | int | Total ships in the AIS cache (before filtering) |
+| `uptime_seconds` | int | Seconds since the proxy process started |
 
 ---
 

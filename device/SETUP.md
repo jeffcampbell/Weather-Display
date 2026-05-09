@@ -58,7 +58,7 @@ Copy `device/secrets.py.template` to `device/secrets.py` and fill in your values
 | `openweather_key` | [openweathermap.org/api](https://openweathermap.org/api) — free |
 | `noaa_station` | [tidesandcurrents.noaa.gov/stations.html](https://tidesandcurrents.noaa.gov/stations.html) — find the station nearest you |
 | `latitude` / `longitude` | Your location in decimal degrees |
-| `timezone` | Olson timezone name, e.g. `America/New_York` |
+| `tz_offset_hours` | Static UTC offset used at boot. The device auto-re-syncs to the OWM-reported (DST-aware) offset on every weather fetch, so this just needs to be approximately right. |
 | `proxy_host` | `http://YOUR_PI_IP:6590` — see proxy setup in root README |
 
 ## 6. Deploy code.py
