@@ -14,6 +14,11 @@ import displayio
 from adafruit_matrixportal.matrixportal import MatrixPortal
 from adafruit_display_text.label import Label
 from adafruit_bitmap_font import bitmap_font
+try:
+    from watchdog import WatchDogMode
+    _WATCHDOG_OK = True
+except ImportError:
+    _WATCHDOG_OK = False
 
 try:
     from secrets import secrets
@@ -35,6 +40,7 @@ TZ_OFFSET_HOURS = int(secrets.get("tz_offset_hours", -5))
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
 HEALTH_INTERVAL = 300       # poll proxy /api/health every 5 minutes
+WATCHDOG_TIMEOUT = 90       # hard-reset if the main loop hasn't fed for this long
 PLANE_CYCLE_SECS = 5
 PLANE_MAX_SECS = 600          # max continuous time on plane screen
 PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
@@ -852,6 +858,20 @@ _demo_last_switch  = 0
 
 device_log("Boot OK")
 
+# Watchdog — hard-resets the device if the main loop hasn't fed it for
+# WATCHDOG_TIMEOUT seconds. Recovers automatically from cases where a
+# network call hangs indefinitely (the web workflow stays responsive at
+# supervisor level even when user code is blocked, so a hung fetch can
+# silently freeze the display until manual intervention).
+if _WATCHDOG_OK:
+    try:
+        microcontroller.watchdog.timeout = WATCHDOG_TIMEOUT
+        microcontroller.watchdog.mode = WatchDogMode.RESET
+        device_log("Watchdog: {}s".format(WATCHDOG_TIMEOUT))
+    except Exception as _e:
+        print("Watchdog setup failed:", _e)
+        _WATCHDOG_OK = False
+
 
 def switch_screen(name):
     """Switch which display group is shown."""
@@ -1568,5 +1588,13 @@ while True:
     if not btn_up.value:                  # pressed (active low)
         force_weather_screen()
         time.sleep(0.3)                   # debounce
+
+    # Pet the watchdog. If we never get here (network hang, infinite loop,
+    # etc.), the device hard-resets after WATCHDOG_TIMEOUT seconds.
+    if _WATCHDOG_OK:
+        try:
+            microcontroller.watchdog.feed()
+        except Exception:
+            pass
 
     time.sleep(1)
