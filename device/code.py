@@ -51,9 +51,41 @@ SHIPS_ENABLED = True    # Set True to enable ship tracking
 SHIPS_TEST = False
 SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
+DEMO_MODE = False       # Set True to auto-cycle test fixtures (no network needed)
+DEMO_INTERVAL = 30      # seconds per view in demo mode
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
 PROXY_HOST = "http://YOUR_PROXY_HOST:6590"
+
+# ---------------------------------------------------------------------------
+# Demo fixtures — varied conditions to exercise all display paths
+# (temp_str, cond_str, cond_main, wind_spd, wind_dir, tide_level, tide_type)
+_DEMO_WEATHER = (
+    ("72\xb0F",  "Clear Sky",  "Clear",        5, "SW", 0.8, "H"),
+    ("-5\xb0F",  "Heavy Snow", "Snow",         18, "NW", 0.5, "L"),
+    ("95\xb0F",  "Thndrstm",   "Thunderstorm", 28, "S",  0.2, "L"),
+    ("55\xb0F",  "Heavy Rain", "Rain",         22, "NE", 0.6, "H"),
+    ("68\xb0F",  "Fog",        "Fog",           3, "W",  0.4, "L"),
+    ("82\xb0F",  "Sctd Cloud", "Clouds",       12, "E",  0.9, "H"),
+)
+# (callsign, alt_ft, spd_kt, hdg, origin, dest, actype, reg)
+_DEMO_PLANES = (
+    ("UAL1234", 35000, 450, 270, "BOS", "SFO", "B739", "N12345"),
+    ("DAL567",  28000, 420, 180, "BOS", "ATL", "A321", "N567DL"),
+    ("JBU42",   18000, 380,  90, "BOS", "FLL", "A320", "N42JB"),
+    ("BAW213",  38000, 490,  45, "BOS", "LHR", "B789", "G-ZBKA"),
+    ("AAL100",  32000, 440, 250, "BOS", "DFW", "B738", "N100AA"),
+)
+_DEMO_SHIPS = (
+    {"name": "IYANOUGH", "type": 40, "type_name": "HighSpeed",
+     "destination": "NANTUCKET", "length": 47,  "distance_mi": 2.3, "heading": 135},
+    {"name": "MSC FLORA", "type": 70, "type_name": "Cargo",
+     "destination": "NEW YORK",  "length": 280, "distance_mi": 8.1, "heading": 220},
+    {"name": "SEA TITAN", "type": 80, "type_name": "Tanker",
+     "destination": "HOUSTON",   "length": 220, "distance_mi": 5.7, "heading": 45},
+    {"name": "FREEDOM",   "type": 50, "type_name": "Special",
+     "destination": "BOSTON",    "length": 80,  "distance_mi": 5.1, "heading": 315},
+)
 
 # ---------------------------------------------------------------------------
 # Buttons — UP and DOWN on the Matrix Portal M4
@@ -659,6 +691,12 @@ last_sky_fetch = -OPENSKY_INTERVAL
 last_plane_cycle = 0
 current_screen = "loading"
 
+_demo_step         = 2   # _demo_advance() increments first, so step 0 = weather fires first
+_demo_weather_idx  = 0
+_demo_plane_idx    = 0
+_demo_ship_idx     = 0
+_demo_last_switch  = 0
+
 
 # ---------------------------------------------------------------------------
 # Icon update helper
@@ -1087,6 +1125,40 @@ def show_plane(plane):
         gc.collect()
 
 
+def _demo_advance():
+    """Advance to the next demo view: weather → plane → ship → weather…"""
+    global _demo_step, _demo_weather_idx, _demo_plane_idx, _demo_ship_idx
+    global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed
+    global tide_str, tide_type_val, _tide_level, _tide_predictions
+    global planes, ships, showing_planes, _showing_ship
+    _demo_step = (_demo_step + 1) % 3
+    if _demo_step == 0:                        # weather
+        w = _DEMO_WEATHER[_demo_weather_idx % len(_DEMO_WEATHER)]
+        _demo_weather_idx += 1
+        weather_str = w[0]; weather_cond = w[1]; weather_cond_main = w[2]
+        _wind_speed = w[3]; wind_str = "{}mph {}".format(w[3], w[4])
+        _tide_level = w[5]; tide_type_val = w[6]
+        tide_str = "4:30"; _tide_predictions = []
+        planes = []; ships = []
+        showing_planes = False; _showing_ship = False
+        show_weather_tides()
+        print("Demo weather:", weather_str, weather_cond)
+    elif _demo_step == 1:                      # plane
+        p = _DEMO_PLANES[_demo_plane_idx % len(_DEMO_PLANES)]
+        _demo_plane_idx += 1
+        call = p[0]
+        planes = [[call, "", p[1], p[2], p[3], 0]]
+        flight_cache[call] = {"origin": p[4], "dest": p[5], "type": p[6], "reg": p[7]}
+        showing_planes = True; _showing_ship = False
+        show_plane(planes[0])
+        print("Demo plane:", call, p[4], ">", p[5])
+    else:                                      # ship
+        s = _DEMO_SHIPS[_demo_ship_idx % len(_DEMO_SHIPS)]
+        _demo_ship_idx += 1
+        ships = [s]; planes = []
+        showing_planes = False; _showing_ship = True
+        show_ship(s)
+        print("Demo ship:", s["name"])
 
 
 
@@ -1110,6 +1182,12 @@ if SHIPS_TEST:
     display.brightness = 1.0
     print("SHIPS_TEST: injected", len(ships), "test ships, showing first")
 
+if DEMO_MODE:
+    print("DEMO MODE — cycling test fixtures, no network needed")
+    display.brightness = 1.0
+    _demo_advance()
+    _demo_last_switch = time.monotonic()
+
 while True:
     gc.collect()
     now = time.monotonic()
@@ -1123,83 +1201,88 @@ while True:
         time.sleep(1)
         microcontroller.reset()
 
-    # --- Weather + Tides refresh ---
-    if now - last_weather_fetch >= WEATHER_INTERVAL:
-        fetch_weather()
-        fetch_tides()
-        last_weather_fetch = now
-        if not showing_planes:
+    if DEMO_MODE:
+        if now - _demo_last_switch >= DEMO_INTERVAL:
+            _demo_advance()
+            _demo_last_switch = now
+    else:
+        # --- Weather + Tides refresh ---
+        if now - last_weather_fetch >= WEATHER_INTERVAL:
+            fetch_weather()
+            fetch_tides()
+            last_weather_fetch = now
+            if not showing_planes:
+                show_weather_tides()
+
+        # --- OpenSky check ---
+        # Skip plane fetches during quiet hours to save FlightAware API calls.
+        # Clears any cached planes so the display falls back to weather/tides.
+        _hr = time.localtime().tm_hour
+        _quiet = PLANE_QUIET_START_HR <= _hr < PLANE_QUIET_END_HR
+        if PLANES_ENABLED and not _quiet and now - last_sky_fetch >= OPENSKY_INTERVAL:
+            fetch_planes()
+            last_sky_fetch = now
+        elif _quiet and planes:
+            planes = []
+
+        # Only show planes that have route data
+        display_planes = get_displayable_planes() if PLANES_ENABLED else []
+
+        # Safeguard: if a plane has been on screen for PLANE_MAX_SECS straight
+        # (e.g. fetch issue, hovering aircraft, stale ADS-B data), force a
+        # weather break so the user is never permanently stuck on a plane.
+        if showing_planes and now - plane_screen_started_at >= PLANE_MAX_SECS:
+            print("Plane screen max duration reached, weather break")
+            showing_planes = False
+            plane_cooldown_until = now + PLANE_COOLDOWN_SECS
             show_weather_tides()
 
-    # --- OpenSky check ---
-    # Skip plane fetches during quiet hours to save FlightAware API calls.
-    # Clears any cached planes so the display falls back to weather/tides.
-    _hr = time.localtime().tm_hour
-    _quiet = PLANE_QUIET_START_HR <= _hr < PLANE_QUIET_END_HR
-    if PLANES_ENABLED and not _quiet and now - last_sky_fetch >= OPENSKY_INTERVAL:
-        fetch_planes()
-        last_sky_fetch = now
-    elif _quiet and planes:
-        planes = []
-
-    # Only show planes that have route data
-    display_planes = get_displayable_planes() if PLANES_ENABLED else []
-
-    # Safeguard: if a plane has been on screen for PLANE_MAX_SECS straight
-    # (e.g. fetch issue, hovering aircraft, stale ADS-B data), force a
-    # weather break so the user is never permanently stuck on a plane.
-    if showing_planes and now - plane_screen_started_at >= PLANE_MAX_SECS:
-        print("Plane screen max duration reached, weather break")
-        showing_planes = False
-        plane_cooldown_until = now + PLANE_COOLDOWN_SECS
-        show_weather_tides()
-
-    if display_planes and not showing_planes and now >= plane_cooldown_until:
-        showing_planes = True
-        plane_idx = 0
-        last_plane_cycle = now
-        plane_screen_started_at = now
-        show_plane(display_planes[0])
-    elif not display_planes and showing_planes:
-        showing_planes = False
-        show_weather_tides()
-
-    # --- Cycle through multiple planes ---
-    if showing_planes and len(display_planes) > 1:
-        if now - last_plane_cycle >= PLANE_CYCLE_SECS:
-            plane_idx = (plane_idx + 1) % len(display_planes)
-            show_plane(display_planes[plane_idx])
+        if display_planes and not showing_planes and now >= plane_cooldown_until:
+            showing_planes = True
+            plane_idx = 0
             last_plane_cycle = now
+            plane_screen_started_at = now
+            show_plane(display_planes[0])
+        elif not display_planes and showing_planes:
+            showing_planes = False
+            show_weather_tides()
 
-    # --- Ship tracking ---
-    if SHIPS_ENABLED and not showing_planes:
-        if not SHIPS_TEST and now - last_ship_fetch >= SHIP_INTERVAL:
-            fetch_ships()
-            last_ship_fetch = now
-            if ships and _ship_cycle_start == 0:
-                _ship_cycle_start = now
+        # --- Cycle through multiple planes ---
+        if showing_planes and len(display_planes) > 1:
+            if now - last_plane_cycle >= PLANE_CYCLE_SECS:
+                plane_idx = (plane_idx + 1) % len(display_planes)
+                show_plane(display_planes[plane_idx])
+                last_plane_cycle = now
 
-        # Weather/ship cycling: 30s weather, 5s per ship, repeat
-        if ships:
-            ship_display_total = len(ships) * 15
-            cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + ship_display_total)
-            if cycle_pos < SHIP_WEATHER_SECS:
-                # Weather phase
-                if _showing_ship:
-                    _showing_ship = False
-                    show_weather_tides()
-            else:
-                # Ship phase
-                if not _showing_ship:
-                    _showing_ship = True
-                    ship_idx = 0
-                    show_ship(ships[ship_idx])
-                elif len(ships) > 1:
-                    ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
-                    expected_idx = int(ship_phase_elapsed / 15) % len(ships)
-                    if expected_idx != ship_idx:
-                        ship_idx = expected_idx
+        # --- Ship tracking ---
+        if SHIPS_ENABLED and not showing_planes:
+            if not SHIPS_TEST and now - last_ship_fetch >= SHIP_INTERVAL:
+                fetch_ships()
+                last_ship_fetch = now
+                if ships and _ship_cycle_start == 0:
+                    _ship_cycle_start = now
+
+            # Weather/ship cycling: 30s weather, 5s per ship, repeat
+            if ships:
+                ship_display_total = len(ships) * 15
+                cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + ship_display_total)
+                if cycle_pos < SHIP_WEATHER_SECS:
+                    # Weather phase
+                    if _showing_ship:
+                        _showing_ship = False
+                        show_weather_tides()
+                else:
+                    # Ship phase
+                    if not _showing_ship:
+                        _showing_ship = True
+                        ship_idx = 0
                         show_ship(ships[ship_idx])
+                    elif len(ships) > 1:
+                        ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
+                        expected_idx = int(ship_phase_elapsed / 15) % len(ships)
+                        if expected_idx != ship_idx:
+                            ship_idx = expected_idx
+                            show_ship(ships[ship_idx])
 
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame
@@ -1242,7 +1325,10 @@ while True:
 
     # --- Button handling ---
     if not btn_down.value:  # pressed (active low)
-        if PLANES_ENABLED:
+        if DEMO_MODE:
+            _demo_advance()
+            _demo_last_switch = now
+        elif PLANES_ENABLED:
             inject_test_plane()
         else:
             inject_test_weather()

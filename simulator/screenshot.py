@@ -45,6 +45,9 @@ def take_screenshots(page, with_guides=False):
     shots = {}
     suffix = "_guides" if with_guides else ""
 
+    # Freeze live clock so weather screenshots are deterministic
+    page.evaluate("testClockStr = '10:30 AM'")
+
     if with_guides:
         page.evaluate("if (!overlayEnabled) toggleOverlay()")
     else:
@@ -54,13 +57,20 @@ def take_screenshots(page, with_guides=False):
         page.evaluate("clearAll()")               # clean slate before each sequence
         page.evaluate(f"{idx_var} = 0")           # reset cycle to fixture 0
         for i in range(count):
+            # Freeze animation state so every shot is deterministic regardless
+            # of how long the previous fixture took to render.
+            page.evaluate("_basin_tick = 0; _sep_pixel_y = 16")
             page.evaluate(f"{func}()")
-            page.wait_for_timeout(120)            # a few render frames
+            page.wait_for_timeout(80)             # settle one render at tick=0
+            page.evaluate("_basin_tick = 0; _sep_pixel_y = 16")  # hold frozen
+            page.wait_for_timeout(40)
             name = f"{prefix}_{i + 1}{suffix}"
             path = SHOTS_DIR / f"{name}.png"
             page.locator("#wrapper").screenshot(path=str(path))
             shots[name] = path
 
+    # Restore live clock
+    page.evaluate("testClockStr = null")
     return shots
 
 

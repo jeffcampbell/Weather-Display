@@ -52,6 +52,7 @@
   <button onclick="injectWorstWeather()">Worst Weather</button>
   <button onclick="injectWorstPlane()">Worst Plane</button>
   <button onclick="injectWorstShip()">Worst Ship</button>
+  <button id="btnDemo" onclick="demoToggle()">Demo OFF</button>
 </div>
 <div id="log"></div>
 
@@ -430,6 +431,7 @@ let weather_str = "", weather_cond = "", weather_condMain = "";
 let wind_str = "", _wind_speed = 0;
 let tide_str = "", tide_type_val = "";  // "H" or "L"
 let _tide_level = 0.5, _basin_tick = 0;
+let testClockStr = null;  // set to 'H:MM XM' to freeze clock for screenshot tests
 let _tide_predictions = [];  // [(total_mins, type, h, m_str), ...]
 let _sep_pixel_y = 16;       // tide direction pixel y position along x=20
 let _tide_at_slack = false;  // true when within 15 min of a tide peak
@@ -646,11 +648,16 @@ function composeWeather(timestamp) {
   }
 
   // Clock — centered in right panel, mid font, y=4
-  const now = new Date();
-  let h = now.getHours() % 12 || 12;
-  const m = now.getMinutes().toString().padStart(2, '0');
-  const ap = now.getHours() < 12 ? 'A' : 'P';
-  const clockStr = `${h}:${m} ${ap}M`;
+  let clockStr;
+  if (testClockStr) {
+    clockStr = testClockStr;
+  } else {
+    const now = new Date();
+    const h = now.getHours() % 12 || 12;
+    const m = now.getMinutes().toString().padStart(2, '0');
+    const ap = now.getHours() < 12 ? 'A' : 'P';
+    clockStr = `${h}:${m} ${ap}M`;
+  }
   drawTextMid(clockStr, centerMidX(clockStr), 4, 0xFFFFFF);
 
   // Weather icon + temp — positioned as a pair, centered in right panel
@@ -961,6 +968,24 @@ function getDisplayablePlanes() {
 async function logicTick() {
   const now = monotonic();
 
+  if (demoMode) {
+    if (_demoLastSwitch === 0 || now - _demoLastSwitch >= DEMO_INTERVAL) {
+      demoAdvance();
+      _demoLastSwitch = now;
+    }
+    // Still update tide direction pixel so the basin animates on weather view
+    const nowMins2 = new Date().getHours() * 60 + new Date().getMinutes();
+    _tide_at_slack = false;
+    for (const p of _tide_predictions) {
+      if (Math.abs(p[0] - nowMins2) <= 15) { _tide_at_slack = true; break; }
+    }
+    if (!_tide_at_slack) {
+      if (tide_type_val === 'H') _sep_pixel_y = (_sep_pixel_y - 1 + 32) % 32;
+      else if (tide_type_val === 'L') _sep_pixel_y = (_sep_pixel_y + 1) % 32;
+    }
+    return;  // skip API fetches
+  }
+
   if (now - last_weather_fetch >= WEATHER_INTERVAL) {
     await fetchWeather();
     await fetchTides();
@@ -1147,9 +1172,9 @@ const WORST_PLANES = [
   // Long callsign (7 chars), known airline, all fields — tests row 2 type+name overlap
   {call:'DAL2247', icao24:'a1b2c3', alt:37000, spd:450, hdg:270,
    origin:'BOS', dest:'LAX', type:'B788', reg:'N867DA'},
-  // ???>??? missing route — displays fallback
-  {call:'UAL5001', icao24:'b2c3d4', alt:28500, spd:420, hdg:90,
-   origin:'???', dest:'???', type:'',    reg:''},
+  // Slow climb, no type/reg — tests empty row 4
+  {call:'UAL5001', icao24:'b2c3d4', alt:4200,  spd:220, hdg:90,
+   origin:'BOS', dest:'ORD', type:'',    reg:''},
   // Short ICAO airline, 5-char type — tests right-align of type label
   {call:'EIN104',  icao24:'4ca2c3', alt:40000, spd:480, hdg:100,
    origin:'BOS', dest:'DUB', type:'A333', reg:'EI-DUZ'},
@@ -1189,6 +1214,51 @@ function injectWorstShip() {
   _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;
   dataLoaded = true;
   log(`Worst ship: "${ws.name}" (${ws.name.length} chars) ${ws.length}m dest="${ws.destination}"`);
+}
+
+// =========================================================================
+// Demo mode — auto-cycles weather/plane/ship every 30s, no API calls
+// =========================================================================
+const DEMO_INTERVAL = 30;  // seconds per view
+
+let demoMode       = false;
+let _demoStep      = 2;    // increments before use, so 0=weather fires first
+let _demoWeatherIdx = 0, _demoPlanIdx = 0, _demoShipIdx = 0;
+let _demoLastSwitch = 0;
+
+function demoAdvance() {
+  _demoStep = (_demoStep + 1) % 3;
+  if (_demoStep === 0) {
+    const tw = TEST_WEATHER[_demoWeatherIdx++ % TEST_WEATHER.length];
+    weather_str=tw.temp; weather_cond=tw.cond; weather_condMain=tw.main;
+    wind_str=tw.wind; _wind_speed=tw.ws; _tide_level=tw.tl;
+    tide_str="4:30"; tide_type_val="H"; ships=[]; planes=[]; showing_planes=false;
+    dataLoaded = true;
+    log(`Demo weather: ${tw.temp} ${tw.cond} | wind ${tw.wind}`);
+  } else if (_demoStep === 1) {
+    const tp = TEST_PLANES[_demoPlanIdx++ % TEST_PLANES.length];
+    planes = [[tp.call, tp.icao24, tp.alt, tp.spd, tp.hdg, 0]];
+    flightCache[tp.call] = {origin:tp.origin, dest:tp.dest, type:tp.type, reg:tp.reg};
+    showing_planes = true; plane_idx = 0; dataLoaded = true;
+    log(`Demo plane: ${tp.call} ${tp.origin}>${tp.dest} ${tp.type}`);
+  } else {
+    const ts = TEST_SHIPS[_demoShipIdx++ % TEST_SHIPS.length];
+    ships = [ts]; planes = []; showing_planes = false;
+    _ship_cycle_start = monotonic() - SHIP_WEATHER_SECS;
+    dataLoaded = true;
+    log(`Demo ship: ${ts.name} (${ts.type_name})`);
+  }
+}
+
+function demoToggle() {
+  demoMode = !demoMode;
+  document.getElementById('btnDemo').textContent = demoMode ? 'Demo ON' : 'Demo OFF';
+  if (demoMode) {
+    _demoStep = 2; _demoLastSwitch = 0;  // fire immediately on next logicTick
+    log('Demo mode started — cycling every ' + DEMO_INTERVAL + 's');
+  } else {
+    log('Demo mode stopped');
+  }
 }
 
 // =========================================================================
