@@ -230,7 +230,9 @@ def handle_planes(params):
         return 200, empty
 
     if status != 200:
-        return status, data
+        # Always return valid JSON — a non-JSON upstream body (HTML 503, etc.)
+        # would cause resp.json() to raise on the device, triggering fetch_failed().
+        return 200, json.dumps({"time": 0, "planes": [], "upstream_error": status}).encode()
 
     try:
         raw = json.loads(data)
@@ -241,28 +243,31 @@ def handle_planes(params):
         # per plane, that's ~180 bytes saved per plane in device heap.
         planes = []
         for s in states:
-            if s[8]:                                # on_ground
-                continue
-            callsign = (s[1] or "").strip()
-            if not callsign:
-                continue
-            alt_m = s[7] or s[13] or 0              # baro_altitude or geo
-            p_lat, p_lon = s[6] or 0, s[5] or 0
-            entry = [
-                callsign[:8],
-                s[0] or "",                         # icao24
-                int(alt_m * 3.281),                 # alt (ft)
-                int((s[9] or 0) * 1.944),           # spd (kt)
-                int(s[10] or 0),                    # hdg
-                int(s[11] or 0),                    # vrate
-            ]
-            planes.append(entry)
-            log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
+            try:
+                if s[8]:                                # on_ground
+                    continue
+                callsign = (s[1] or "").strip()
+                if not callsign:
+                    continue
+                alt_m = s[7] or s[13] or 0              # baro_altitude or geo
+                p_lat, p_lon = s[6] or 0, s[5] or 0
+                entry = [
+                    callsign[:8],
+                    s[0] or "",                         # icao24
+                    int(alt_m * 3.281),                 # alt (ft)
+                    int((s[9] or 0) * 1.944),           # spd (kt)
+                    int(s[10] or 0),                    # hdg
+                    int(s[11] or 0),                    # vrate
+                ]
+                planes.append(entry)
+                log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
+            except Exception:
+                continue                                 # skip malformed rows, keep the rest
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
         cache_set(cache_key, body, age_override=55)
         return 200, body
     except Exception as e:
-        return 500, json.dumps({"error": str(e)}).encode()
+        return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
 
 
 def handle_route(params):
@@ -439,11 +444,15 @@ def handle_forecast(params):
                 "conditions": {}, "cond_id": 800,
                 "wind_speeds": [], "wind_degs": [],
             })
-            temp = item["main"]["temp"]
+            main = item.get("main") or {}
+            temp = main.get("temp")
+            if temp is None:
+                continue
             entry["hi"] = max(entry["hi"], temp)
             entry["lo"] = min(entry["lo"], temp)
-            cid = item["weather"][0]["id"]
-            cmain = item["weather"][0]["main"]
+            weather = (item.get("weather") or [{}])[0]
+            cid = weather.get("id", 800)
+            cmain = weather.get("main", "Clear")
             entry["conditions"][cmain] = entry["conditions"].get(cmain, 0) + 1
             entry["cond_id"] = cid
             wind = item.get("wind", {})
@@ -619,9 +628,17 @@ def handle_ships(params):
             dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
             if dist > SHIP_MAX_MILES:
                 continue
-            s["distance_mi"] = round(dist, 1)
-            ship_list.append(s)
-            log_ship(s)
+            dist_mi = round(dist, 1)
+            log_ship({**s, "distance_mi": dist_mi})
+            ship_list.append({
+                "name":        s.get("name", ""),
+                "type":        s.get("type", 0),
+                "type_name":   s.get("type_name", "Vessel"),
+                "destination": s.get("destination", ""),
+                "length":      s.get("length", 0),
+                "heading":     s.get("heading", 0),
+                "distance_mi": dist_mi,
+            })
         # Sort by distance
         ship_list.sort(key=lambda s: s.get("distance_mi", 999))
     body = json.dumps({"ships": ship_list}).encode()
