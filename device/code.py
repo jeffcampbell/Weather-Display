@@ -899,7 +899,7 @@ _ship_cycle_start = 0
 _showing_ship = False
 _ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship ocean animation
 _ship_anim_tick = 0
-_ship_name_w = 0           # pixel width of current ship name (5 * chars)
+_ship_name_full = ""       # full ship name for character-window marquee
 _ship_name_phase = 0       # marquee tick counter
 planes = []
 showing_planes = False
@@ -1141,6 +1141,15 @@ def get_ship_type_color(type_code):
     return SHIP_TYPE_COLORS.get(decade, 0x666688)
 
 
+def _ship_display_secs(name):
+    """Seconds to show this ship: enough for the name to fully scroll + 2s end pause."""
+    n = len(name)
+    if n <= 9:
+        return 15
+    # 2s start pause + one tick per scroll step + 2s end pause
+    return max(15, 2 + (n - 9) + 2)
+
+
 def fetch_ships():
     """Fetch nearby ships from proxy."""
     global ships
@@ -1213,18 +1222,23 @@ def show_ship(ship):
         logo_label.text = ""
         route_label.text = ""
 
-        global _ship_name_w, _ship_name_phase
+        global _ship_name_full, _ship_name_phase
         # Upgrade to mid font for ship name/type/dest rows
         airline_label.font = FONT_MID
         alt_label.font = FONT_MID
         reg_label.font = FONT_MID
 
-        _ship_name_w = len(name) * 5
+        _ship_name_full = name
         _ship_name_phase = 0
-        airline_label.text = name
+        _n = len(name)
+        if _n <= 9:
+            airline_label.text = name
+            airline_label.x = 16 + (48 - _n * 5) // 2
+        else:
+            airline_label.text = name[:9]
+            airline_label.x = 16
         airline_label.color = 0xFFFFFF
         airline_label.y = 5
-        airline_label.x = 16 if _ship_name_w > 48 else 16 + (48 - _ship_name_w) // 2
 
         _center_ship_mid(reg_label, type_name[:9])
         reg_label.color = color
@@ -1498,9 +1512,10 @@ while True:
                 if ships and _ship_cycle_start == 0:
                     _ship_cycle_start = now
 
-            # Weather/ship cycling: 30s weather, 5s per ship, repeat
+            # Weather/ship cycling: 30s weather, then each ship for its computed duration, repeat
             if ships:
-                ship_display_total = len(ships) * 15
+                _ship_secs = [_ship_display_secs(s.get("name", "")) for s in ships]
+                ship_display_total = sum(_ship_secs)
                 cycle_pos = (now - _ship_cycle_start) % (SHIP_WEATHER_SECS + ship_display_total)
                 if cycle_pos < SHIP_WEATHER_SECS:
                     # Weather phase
@@ -1508,18 +1523,23 @@ while True:
                         _showing_ship = False
                         show_weather_tides()
                 else:
-                    # Ship phase
+                    # Ship phase — find which ship based on cumulative display time
+                    ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
+                    cumulative = 0
+                    expected_idx = len(ships) - 1
+                    for _i, _d in enumerate(_ship_secs):
+                        if ship_phase_elapsed < cumulative + _d:
+                            expected_idx = _i
+                            break
+                        cumulative += _d
                     if not _showing_ship:
                         _showing_ship = True
-                        ship_idx = 0
-                        device_log("Ship:{} {}mi".format(ships[0].get("name","?")[:12], ships[0].get("distance_mi","?")))
+                        ship_idx = expected_idx
+                        device_log("Ship:{} {}mi".format(ships[ship_idx].get("name","?")[:12], ships[ship_idx].get("distance_mi","?")))
                         show_ship(ships[ship_idx])
-                    elif len(ships) > 1:
-                        ship_phase_elapsed = cycle_pos - SHIP_WEATHER_SECS
-                        expected_idx = int(ship_phase_elapsed / 15) % len(ships)
-                        if expected_idx != ship_idx:
-                            ship_idx = expected_idx
-                            show_ship(ships[ship_idx])
+                    elif expected_idx != ship_idx:
+                        ship_idx = expected_idx
+                        show_ship(ships[ship_idx])
 
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame
@@ -1565,18 +1585,21 @@ while True:
             gc.collect()
             _ship_anim_tick += 1
             update_ship_ocean(_ship_anim_tick)
-            _overflow = _ship_name_w - 48
-            if _overflow > 0:
+            _n = len(_ship_name_full)
+            if _n > 9:
                 _ship_name_phase += 1
-                _scroll_ticks = (_overflow + 1) // 2   # ceil(overflow / 2px-per-tick)
-                _cycle_len = 2 + _scroll_ticks + 2     # pause-start + scroll + pause-end
+                _scroll_steps = _n - 9
+                _cycle_len = 2 + _scroll_steps + 2
                 _pos = _ship_name_phase % _cycle_len
                 if _pos < 2:
-                    airline_label.x = 16
-                elif _pos < 2 + _scroll_ticks:
-                    airline_label.x = 16 - min((_pos - 2) * 2, _overflow)
+                    _char_start = 0
+                elif _pos < 2 + _scroll_steps:
+                    _char_start = _pos - 2
                 else:
-                    airline_label.x = 16 - _overflow
+                    _char_start = _scroll_steps
+                _new_text = _ship_name_full[_char_start:_char_start + 9]
+                if airline_label.text != _new_text:
+                    airline_label.text = _new_text
         except MemoryError as _e:
             print("ship-anim MemoryError:", _e)
             gc.collect()
