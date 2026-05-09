@@ -59,17 +59,21 @@ _cache_lock = Lock()
 
 
 def cache_get(key, max_age_sec):
-    """Return cached bytes if fresh, else None."""
+    """Return cached bytes if fresh, else None. Respects age_override set by cache_set."""
     with _cache_lock:
         entry = _cache.get(key)
-        if entry and (time.time() - entry["time"]) < max_age_sec:
+        if not entry:
+            return None
+        ttl = entry.get("age_override") or max_age_sec
+        if (time.time() - entry["time"]) < ttl:
             return entry["data"]
     return None
 
 
-def cache_set(key, data):
+def cache_set(key, data, age_override=None):
+    """Cache data. age_override pins the TTL regardless of what cache_get requests."""
     with _cache_lock:
-        _cache[key] = {"data": data, "time": time.time()}
+        _cache[key] = {"data": data, "time": time.time(), "age_override": age_override}
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +222,13 @@ def handle_planes(params):
         f"&lamax={lat+bbox}&lomax={lon+bbox}"
     )
     status, data = fetch(url, headers=opensky_headers())
+
+    if status == 429:
+        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
+        cache_set(cache_key, empty, age_override=3600)  # back off for 1 hour
+        print("OpenSky rate-limited (429) — caching empty response for 1 hour")
+        return 200, empty
+
     if status != 200:
         return status, data
 
