@@ -413,10 +413,10 @@ def _sky_lightning(x, y, c, wt):
     _sp(x,     y + 3, c, wt); _sp(x + 1, y + 3, c, wt)
 
 
-def _sky_snow(x, y, wt):
-    """Three + pattern snowflakes in a row."""
+def _sky_snow(x, y, wt, count=3):
+    """+ pattern snowflakes in a row (count flakes, default 3)."""
     c = 8
-    for i in range(3):
+    for i in range(count):
         xx = x + i * 5
         _sp(xx + 1, y,     c, wt)
         _sp(xx,     y + 1, c, wt); _sp(xx + 1, y + 1, c, wt); _sp(xx + 2, y + 1, c, wt)
@@ -447,25 +447,25 @@ def _draw_weather_sky(water_top):
             _sky_moon(4, 2, SUN, water_top)
         else:
             _sky_sun(4, 2, SUN, water_top)
-        _sky_cloud(9, 0, 10, CLD, water_top)
+        _sky_cloud(8, 0, 11, CLD, water_top)
 
     elif cond in ("Rain", "Drizzle"):
         if cond == "Drizzle":
-            _sky_cloud(3, 0, 10, CLD, water_top)
-            for i in range(5):
-                _sp(3 + i * 3, 5, RN, water_top)
+            _sky_cloud(2, 0, 16, CLD, water_top)
+            for i in range(6):
+                _sp(2 + i * 3, 5, RN, water_top)
         else:
-            _sky_cloud(1, 0, 14, CLD, water_top)
-            _sky_rain(2, 4, 5, RN, water_top)
-            _sky_rain(3, 6, 4, RN, water_top)
+            _sky_cloud(1, 0, 18, CLD, water_top)
+            _sky_rain(2, 4, 6, RN, water_top)
+            _sky_rain(3, 6, 5, RN, water_top)
 
     elif cond == "Snow":
-        _sky_cloud(1, 0, 14, CLD, water_top)
-        _sky_snow(2, 4, water_top)
+        _sky_cloud(1, 0, 18, CLD, water_top)
+        _sky_snow(2, 4, water_top, 4)
 
     elif cond == "Thunderstorm":
-        _sky_cloud(1, 0, 14, CLD, water_top)
-        _sky_rain(4, 6, 4, RN, water_top)
+        _sky_cloud(1, 0, 18, CLD, water_top)
+        _sky_rain(4, 6, 5, RN, water_top)
         _sky_lightning(8, 3, SUN, water_top)
 
     else:

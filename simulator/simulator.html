@@ -598,8 +598,8 @@ function drawWeatherSky(waterTop) {
     sp(x+2, y, c); sp(x+1, y+1, c); sp(x+2, y+1, c);
     sp(x+1, y+2, c); sp(x, y+3, c); sp(x+1, y+3, c);
   }
-  function skySnow(x, y) {
-    for (let i = 0; i < 3; i++) {
+  function skySnow(x, y, count = 3) {
+    for (let i = 0; i < count; i++) {
       const xx = x + i * 5;
       sp(xx+1, y, CLD); sp(xx, y+1, CLD); sp(xx+1, y+1, CLD); sp(xx+2, y+1, CLD); sp(xx+1, y+2, CLD);
     }
@@ -616,20 +616,20 @@ function drawWeatherSky(waterTop) {
     }
   } else if (cond === 'Clouds') {
     if (night) skyMoon(4, 2, SUN); else skySun(4, 2, SUN);
-    skyCloud(9, 0, 10, CLD);
+    skyCloud(8, 0, 11, CLD);
   } else if (cond === 'Rain') {
-    skyCloud(1, 0, 14, CLD);
-    skyRain(2, 4, 5, RN);
-    skyRain(3, 6, 4, RN);
+    skyCloud(1, 0, 18, CLD);
+    skyRain(2, 4, 6, RN);
+    skyRain(3, 6, 5, RN);
   } else if (cond === 'Drizzle') {
-    skyCloud(3, 0, 10, CLD);
-    for (let i = 0; i < 5; i++) sp(3 + i*3, 5, RN);
+    skyCloud(2, 0, 16, CLD);
+    for (let i = 0; i < 6; i++) sp(2 + i*3, 5, RN);
   } else if (cond === 'Snow') {
-    skyCloud(1, 0, 14, CLD);
-    skySnow(2, 4);
+    skyCloud(1, 0, 18, CLD);
+    skySnow(2, 4, 4);
   } else if (cond === 'Thunderstorm') {
-    skyCloud(1, 0, 14, CLD);
-    skyRain(4, 6, 4, RN);
+    skyCloud(1, 0, 18, CLD);
+    skyRain(4, 6, 5, RN);
     skyLightning(8, 3, SUN);
   } else {
     // Fog / Mist / Haze / Smoke — horizontal dot lines
