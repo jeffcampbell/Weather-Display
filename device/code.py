@@ -34,6 +34,7 @@ TZ_OFFSET_HOURS = int(secrets.get("tz_offset_hours", -5))
 
 WEATHER_INTERVAL = 600
 OPENSKY_INTERVAL = 60
+HEALTH_INTERVAL = 300       # poll proxy /api/health every 5 minutes
 PLANE_CYCLE_SECS = 5
 PLANE_MAX_SECS = 600          # max continuous time on plane screen
 PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
@@ -764,6 +765,29 @@ loading_group = displayio.Group()
 loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=12)
 loading_group.append(loading_label)
 
+# --- Health indicator: 1 px red dot at (63, 31) ---
+# Visible when /api/health reports a non-empty `issues` list (or when the
+# proxy is unreachable). One TileGrid per group because displayio doesn't
+# allow a TileGrid to be a child of multiple parents — they share the
+# same bitmap and palette so this stays cheap.
+_health_bmp = displayio.Bitmap(1, 1, 2)
+_health_pal = displayio.Palette(2)
+_health_pal[0] = 0x000000
+_health_pal.make_transparent(0)
+_health_pal[1] = 0xFF0000
+_health_bmp[0, 0] = 1
+_health_pixels = []
+for _grp in (weather_group, plane_group, loading_group):
+    _tg = displayio.TileGrid(_health_bmp, pixel_shader=_health_pal, x=63, y=31)
+    _tg.hidden = True
+    _grp.append(_tg)
+    _health_pixels.append(_tg)
+
+def set_health_indicator(visible):
+    """Show or hide the bottom-right red pixel across all screens."""
+    for _tg in _health_pixels:
+        _tg.hidden = not visible
+
 # Start with loading screen
 display.root_group = loading_group
 
@@ -815,6 +839,7 @@ plane_cooldown_until = 0      # don't re-show plane screen before this ts
 plane_idx = 0
 last_weather_fetch = -WEATHER_INTERVAL
 last_sky_fetch = -OPENSKY_INTERVAL
+last_health_fetch = -HEALTH_INTERVAL
 last_plane_cycle = 0
 current_screen = "loading"
 
@@ -980,7 +1005,12 @@ def fetch_planes():
         # Proxy returns positional arrays: [call, icao24, alt, spd, hdg, vrate]
         # Avoids ~180 bytes/plane of string-key interning vs named-key dicts.
         planes = data.get("planes") or []
-        device_log("Planes:{}".format(len(planes)))
+        if data.get("rate_limited"):
+            device_log("Planes:rate-limited")
+        elif data.get("upstream_error"):
+            device_log("Planes:upstream {}".format(data["upstream_error"]))
+        else:
+            device_log("Planes:{}".format(len(planes)))
     except MemoryError:
         device_log("Planes: response too large")
         fetch_failed()
@@ -990,6 +1020,29 @@ def fetch_planes():
         fetch_failed()
         planes = []
     gc.collect()
+
+
+_last_health_issues = None  # last known issue list — used to log only on change
+
+def fetch_health():
+    """Poll /api/health and toggle the bottom-right red pixel based on the
+    proxy's reported issues. Logs on state changes only, not every poll."""
+    global _last_health_issues
+    try:
+        url = "{}/api/health".format(PROXY_HOST)
+        data = fetch_json(url)
+        issues = data.get("issues") or []
+        set_health_indicator(bool(issues))
+        if issues != _last_health_issues:
+            device_log("Health:{}".format(",".join(issues) if issues else "ok"))
+            _last_health_issues = issues
+    except Exception as e:
+        # Can't reach the proxy → that's also a problem worth flagging.
+        set_health_indicator(True)
+        marker = ["proxy_unreachable"]
+        if marker != _last_health_issues:
+            device_log("Health err:{}".format(e))
+            _last_health_issues = marker
 
 
 # ---------------------------------------------------------------------------
@@ -1358,6 +1411,11 @@ while True:
             last_weather_fetch = now
             if not showing_planes:
                 show_weather_tides()
+
+        # --- Proxy health check (drives the bottom-right red pixel) ---
+        if PROXY_HOST and now - last_health_fetch >= HEALTH_INTERVAL:
+            fetch_health()
+            last_health_fetch = now
 
         # --- OpenSky check ---
         # Skip plane fetches during quiet hours to save FlightAware API calls.

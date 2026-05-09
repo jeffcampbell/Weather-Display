@@ -681,9 +681,15 @@ def handle_ships(params):
 
 
 def handle_health(params):
-    """Health check endpoint."""
+    """Health check endpoint. issues=[] means everything is healthy;
+    a non-empty list means an upstream is degraded — the device uses
+    this to show a small indicator on the display."""
+    issues = []
+    if _opensky_429_streak:
+        issues.append("opensky_rate_limited")
     return 200, json.dumps({
         "status": "ok",
+        "issues": issues,
         "cache_entries": len(_cache),
         "ships_tracked": len(_ships),
         "uptime_seconds": int(time.time() - _started_at),

@@ -385,6 +385,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
+  "issues": ["opensky_rate_limited"],
   "cache_entries": 12,
   "ships_tracked": 3,
   "uptime_seconds": 8412
@@ -394,9 +395,12 @@ Liveness check.
 | Field | Type | Description |
 |-------|------|-------------|
 | `status` | string | Always `"ok"` if the proxy is running |
+| `issues` | array | Tags for currently-degraded upstreams. Empty array = healthy. |
 | `cache_entries` | int | Active entries in the in-memory cache |
 | `ships_tracked` | int | Total ships in the AIS cache (before filtering) |
 | `uptime_seconds` | int | Seconds since the proxy process started |
+
+Known `issues` values: `opensky_rate_limited`. (List grows as more upstream checks are added.)
 
 ---
 
