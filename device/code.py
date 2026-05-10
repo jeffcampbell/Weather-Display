@@ -386,8 +386,24 @@ def _draw_weather_sky(water_top):
                 _sp(x, 2 + y_off * 2, CLD, water_top)
 
 
+_last_water_top = -1
+_last_weather_cond_drawn = None
+_last_has_ship_drawn = None
+_last_night_drawn = None
+
+
 def update_basin_water(level, tick):
-    """Redraw water column with tide level. Wave intensity driven by wind."""
+    """Redraw water column with tide level. Wave intensity driven by wind.
+
+    Sky pixels (sun/moon/clouds/etc.) are static between weather updates,
+    so we only clear and redraw them when something that affects the sky
+    actually changes — tide level moved, weather flipped, ship arrived or
+    departed, or day/night crossed. Without that gating, the per-tick
+    clear-then-redraw briefly flashes the sky to black and the weather
+    art appears to blink."""
+    global _last_water_top, _last_weather_cond_drawn
+    global _last_has_ship_drawn, _last_night_drawn
+
     water_top = int(30 - level * 22)
     water_top = max(8, min(30, water_top))
 
@@ -406,7 +422,8 @@ def update_basin_water(level, tick):
     # Precompute ship row spans so they can be drawn in a single pass,
     # avoiding a two-pass blink where water briefly overwrites the ship.
     # Each entry: (abs_row, x1_inclusive, x2_inclusive, palette_idx)
-    if ships:
+    has_ship = bool(ships)
+    if has_ship:
         cx = BASIN_W // 2  # = 10
         ship_spans = (
             (water_top - 3, cx - 1, cx,     5),  # funnel  2px  amber
@@ -417,6 +434,15 @@ def update_basin_water(level, tick):
         )
     else:
         ship_spans = ()
+
+    # Did anything that affects the sky change since the last call?
+    _t = time.localtime()
+    _now_mins = _t.tm_hour * 60 + _t.tm_min
+    night = _now_mins < _sunrise_mins or _now_mins > _sunset_mins
+    sky_dirty = (water_top != _last_water_top
+                 or weather_cond_main != _last_weather_cond_drawn
+                 or has_ship != _last_has_ship_drawn
+                 or night != _last_night_drawn)
 
     for row in range(BASIN_H):
         # Find ship span for this row (if any)
@@ -433,7 +459,11 @@ def update_basin_water(level, tick):
             if ship_x1 <= col <= ship_x2:
                 basin_bmp[col, row] = ship_pal
             elif row < water_top - extra_rows:
-                basin_bmp[col, row] = 0  # air
+                # Sky region — only clear when something forces a redraw.
+                # Otherwise leave the previously-drawn sky art alone so the
+                # weather doesn't flash to black on every tick.
+                if sky_dirty:
+                    basin_bmp[col, row] = 0
             elif row <= water_top:
                 if calm:
                     basin_bmp[col, row] = 3  # flat surface line
@@ -464,8 +494,15 @@ def update_basin_water(level, tick):
                 if 0 <= py < BASIN_H:
                     basin_bmp[px, py] = 2  # mid-water tone — subtle against deep
 
-    # Weather sky art (sun/moon/clouds/rain/lightning/snow/fog)
-    _draw_weather_sky(water_top)
+    # Weather sky art (sun/moon/clouds/rain/lightning/snow/fog) — only
+    # redraw on transitions; otherwise the cleared sky pixels above keep
+    # whatever was last drawn there, no flashing.
+    if sky_dirty:
+        _draw_weather_sky(water_top)
+        _last_water_top = water_top
+        _last_weather_cond_drawn = weather_cond_main
+        _last_has_ship_drawn = has_ship
+        _last_night_drawn = night
 
 def interpolate_tide_level():
     """Calculate current tide basin fill (0.0-1.0) from predictions.
