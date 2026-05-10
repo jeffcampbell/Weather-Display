@@ -895,6 +895,16 @@ _ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship oce
 _ship_anim_tick = 0
 _ship_name_full = ""       # full ship name for character-window marquee
 _ship_name_phase = 0       # marquee tick counter
+# Row-2 (type / length) alternation. When the AIS feed gives a real type AND
+# we know the vessel's length, we alternate between "Cargo" and "525ft" every
+# 3 s on the type row. When only one of the two is known, we show that one
+# fixed. "Vessel" is the AIS placeholder for type=0 — never displayed when we
+# have a length to show instead.
+_ship_alt_enabled = False
+_ship_alt_type_text = ""
+_ship_alt_length_text = ""
+_ship_alt_showing_type = True
+_ship_alt_last_switch = 0.0
 planes = []
 showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
@@ -1270,7 +1280,26 @@ def show_ship(ship):
         airline_label.color = 0xFFFFFF
         airline_label.y = 5
 
-        _center_ship_mid(reg_label, type_name[:9])
+        # Row 2: type name and/or length in feet. AIS reports length in
+        # meters; we convert and round. "Vessel" is the placeholder for
+        # type=0/unknown — when length is known we show that instead.
+        global _ship_alt_enabled, _ship_alt_type_text, _ship_alt_length_text
+        global _ship_alt_showing_type, _ship_alt_last_switch
+        length_ft = int(length * 3.28084) if length else 0
+        type_known = bool(type_name) and type_name != "Vessel" and type_code != 0
+        if type_known and length_ft:
+            _ship_alt_enabled = True
+            _ship_alt_type_text = type_name[:9]
+            _ship_alt_length_text = "{}ft".format(length_ft)
+            _ship_alt_showing_type = True
+            _ship_alt_last_switch = time.monotonic()
+            _center_ship_mid(reg_label, _ship_alt_type_text)
+        elif length_ft:
+            _ship_alt_enabled = False
+            _center_ship_mid(reg_label, "{}ft".format(length_ft))
+        else:
+            _ship_alt_enabled = False
+            _center_ship_mid(reg_label, type_name[:9])
         reg_label.color = color
         reg_label.y = 13
 
@@ -1632,6 +1661,13 @@ while True:
             gc.collect()
             _ship_anim_tick += 1
             update_ship_ocean(_ship_anim_tick)
+            if _ship_alt_enabled and time.monotonic() - _ship_alt_last_switch >= 3.0:
+                _ship_alt_showing_type = not _ship_alt_showing_type
+                _ship_alt_last_switch = time.monotonic()
+                _center_ship_mid(
+                    reg_label,
+                    _ship_alt_type_text if _ship_alt_showing_type else _ship_alt_length_text,
+                )
             _n = len(_ship_name_full)
             if _n > 9:
                 _ship_name_phase += 1
