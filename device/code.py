@@ -1101,22 +1101,29 @@ def fetch_planes():
 
 
 _last_health_issues = None  # last known issue list — used to log only on change
+_consecutive_bad_polls = 0  # pixel only lights after 2 in a row, to absorb blips
 
 def fetch_health():
     """Poll /api/health and toggle the bottom-right red pixel based on the
-    proxy's reported issues. Logs on state changes only, not every poll."""
-    global _last_health_issues
+    proxy's reported issues. Requires 2 consecutive bad polls before lighting
+    the pixel; one good poll clears it. Logs every state change."""
+    global _last_health_issues, _consecutive_bad_polls
     try:
         url = "{}/api/health".format(PROXY_HOST)
         data = fetch_json(url)
         issues = data.get("issues") or []
-        set_health_indicator(bool(issues))
+        if issues:
+            _consecutive_bad_polls += 1
+        else:
+            _consecutive_bad_polls = 0
+        set_health_indicator(_consecutive_bad_polls >= 2)
         if issues != _last_health_issues:
             device_log("Health:{}".format(",".join(issues) if issues else "ok"))
             _last_health_issues = issues
     except Exception as e:
         # Can't reach the proxy → that's also a problem worth flagging.
-        set_health_indicator(True)
+        _consecutive_bad_polls += 1
+        set_health_indicator(_consecutive_bad_polls >= 2)
         marker = ["proxy_unreachable"]
         if marker != _last_health_issues:
             device_log("Health err:{}".format(e))
