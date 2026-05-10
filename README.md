@@ -71,7 +71,9 @@ Full proxy API: [proxy/API.md](proxy/API.md).
 | AISStream.io | For ships | Yes | https://aisstream.io |
 | FlightAware AeroAPI | Better routes | Paid | https://flightaware.com/aeroapi |
 
-OpenSky works without auth but is rate-limited harder. Without an AISStream key, the ship screen is disabled and you can ignore the WebSocket dependency below.
+**OpenSky** uses OAuth2 client credentials (Basic Auth was deprecated in 2024). After making an account, go to **Account → API Client** and create a new client — you'll get a `clientId` and `clientSecret`. Drop those into `proxy/config.json` as `opensky_client_id` / `opensky_client_secret`. The proxy exchanges them for a short-lived bearer token (~30 min) and refreshes automatically; you never deal with the token yourself. Anonymous OpenSky requests still work but the credit budget is tiny — expect frequent 429s.
+
+Without an AISStream key, the ship screen is disabled and you can ignore the WebSocket dependency below.
 
 ### 2. Set up the Raspberry Pi proxy
 

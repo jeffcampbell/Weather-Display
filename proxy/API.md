@@ -23,13 +23,31 @@ When `device_secret` is set in the proxy's `config.json`, **every endpoint** req
 
 ---
 
+## OpenSky authentication
+
+`/api/planes`, `/api/route` (OpenSky fallback), and `/api/aircraft` all hit OpenSky Network using **OAuth2 client credentials**. OpenSky deprecated Basic Auth in 2024; anonymous and legacy-Basic-Auth requests get the smallest credit budget and 429 quickly.
+
+**Setup:** create an API client at https://opensky-network.org → **Account → API Client**. Put the resulting `clientId` and `clientSecret` in `proxy/config.json` as `opensky_client_id` and `opensky_client_secret`.
+
+**How the proxy uses them:** on the first OpenSky-bound request after startup (or after the cached token is within 60 s of expiring), the proxy POSTs the credentials to OpenSky's Keycloak token endpoint and caches the returned bearer token in memory:
+
+```
+POST https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+grant_type=client_credentials&client_id=...&client_secret=...
+```
+
+Tokens are good for ~30 minutes. The cache is process-local; restarting the proxy forces a fresh token. If the credentials are missing or the token exchange fails, OpenSky calls go out unauthenticated and you'll see `opensky_rate_limited` in `/api/health` quickly.
+
+---
+
 ## `GET /api/planes`
 
 Returns aircraft currently within the configured bounding box, proxied from OpenSky Network and reshaped into a compact device-friendly form.
 
 **Query parameters:** none (uses `latitude`/`longitude`/`bbox` from `config.json`)
 
-**Cache TTL:** 55 seconds. On a 429 rate-limit, an empty response is cached for 1 hour.
+**Cache TTL:** 55 seconds. On a 429 rate-limit, an empty response is cached for 1 hour, then 2 hours on each successive 429 (logged via `_log_proxy_event`).
 
 **Upstream:** `https://opensky-network.org/api/states/all`
 
