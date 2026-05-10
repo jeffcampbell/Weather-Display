@@ -1520,6 +1520,10 @@ while True:
 
         if display_planes and not showing_planes and now >= plane_cooldown_until:
             showing_planes = True
+            # If a ship was on screen when the plane preempted it, clear the
+            # flag — otherwise the ship per-tick block keeps animating
+            # update_ship_ocean over pl_bg_bmp, clobbering the plane logo.
+            _showing_ship = False
             plane_idx = 0
             last_plane_cycle = now
             plane_screen_started_at = now
