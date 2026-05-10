@@ -139,6 +139,20 @@ def _db_init():
                 distance_mi REAL
             )
         """)
+        # Persistent vessel static data — survives proxy restarts so MMSIs
+        # we've seen before always carry full context. Destination is NOT
+        # cached (voyage data, changes every trip).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS vessel_static (
+                mmsi         TEXT PRIMARY KEY,
+                name         TEXT,
+                type         INTEGER,
+                type_name    TEXT,
+                callsign     TEXT,
+                length       INTEGER,
+                last_updated INTEGER
+            )
+        """)
         con.execute("CREATE INDEX IF NOT EXISTS ships_ts  ON ships(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS planes_ts ON planes(ts)")
 
@@ -570,6 +584,56 @@ def handle_forecast(params):
 
 _ships = {}         # MMSI -> ship info dict
 _ships_lock = Lock()
+
+# Persistent static-data cache, mirrored to disk via vessel_static table.
+# Keyed by MMSI. Holds name/type/type_name/callsign/length only — destination
+# is voyage data and is intentionally never cached here.
+_vessel_static_cache = {}
+_vessel_cache_lock = Lock()
+
+
+def _vessel_cache_load():
+    """Populate _vessel_static_cache from disk at startup. Cheap full scan —
+    the table is small (one row per unique vessel we've ever seen)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "SELECT mmsi,name,type,type_name,callsign,length FROM vessel_static"
+        )
+        for mmsi, name, type_, type_name, callsign, length in cur:
+            _vessel_static_cache[mmsi] = {
+                "name": name or "",
+                "type": type_ or 0,
+                "type_name": type_name or "",
+                "callsign": callsign or "",
+                "length": length or 0,
+            }
+    print("Vessel static cache: {} loaded".format(len(_vessel_static_cache)))
+
+
+def _vessel_cache_upsert(mmsi, fields):
+    """Merge non-empty static fields into the cache for this MMSI and persist
+    to disk. Empty/zero values are ignored so partial reports don't blow away
+    previously-known data."""
+    if not mmsi or not any(v for v in fields.values()):
+        return
+    with _vessel_cache_lock:
+        existing = _vessel_static_cache.setdefault(mmsi, {})
+        for k, v in fields.items():
+            if v:
+                existing[k] = v
+        snapshot = dict(existing)
+    with _db_lock:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO vessel_static "
+                "(mmsi,name,type,type_name,callsign,length,last_updated) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (mmsi, snapshot.get("name", ""), snapshot.get("type", 0),
+                 snapshot.get("type_name", ""), snapshot.get("callsign", ""),
+                 snapshot.get("length", 0), int(time.time()))
+            )
+
+
 SHIP_STALE_SECS = 600  # remove ships not seen in 10 min
 SHIP_MIN_LENGTH = 30   # meters — filter out small vessels
 SHIP_CENTER_LAT = LATITUDE   # center of ship search radius (same as home location)
@@ -642,6 +706,7 @@ def _process_ais_message(msg):
         mmsi = str(pos.get("UserID", ""))
         if not mmsi:
             return
+        new_name = ""
         with _ships_lock:
             ship = _ships.setdefault(mmsi, {"mmsi": mmsi})
             ship["lat"] = pos.get("Latitude", 0)
@@ -651,27 +716,43 @@ def _process_ais_message(msg):
             ship["last_seen"] = time.time()
             # MetaData often has ship name
             if meta.get("ShipName") and meta["ShipName"].strip():
-                ship["name"] = meta["ShipName"].strip()
+                new_name = meta["ShipName"].strip()
+                ship["name"] = new_name
+        if new_name:
+            _vessel_cache_upsert(mmsi, {"name": new_name})
 
     elif msg_type == "ShipStaticData":
         static = message.get("ShipStaticData", {})
         mmsi = str(static.get("UserID", ""))
         if not mmsi:
             return
+        name = static.get("Name", "").strip()
+        type_ = static.get("Type", 0)
+        type_name = get_ship_type(type_)
+        callsign = static.get("CallSign", "").strip()
+        dim = static.get("Dimension", {})
+        length = (dim.get("A", 0) or 0) + (dim.get("B", 0) or 0)
+        dest = static.get("Destination", "").strip()
         with _ships_lock:
             ship = _ships.setdefault(mmsi, {"mmsi": mmsi})
-            name = static.get("Name", "").strip()
             if name:
                 ship["name"] = name
-            ship["type"] = static.get("Type", 0)
-            ship["type_name"] = get_ship_type(static.get("Type", 0))
-            dest = static.get("Destination", "").strip()
+            ship["type"] = type_
+            ship["type_name"] = type_name
             if dest:
                 ship["destination"] = dest
-            ship["callsign"] = static.get("CallSign", "").strip()
-            dim = static.get("Dimension", {})
-            ship["length"] = (dim.get("A", 0) or 0) + (dim.get("B", 0) or 0)
+            ship["callsign"] = callsign
+            ship["length"] = length
             ship["last_seen"] = time.time()
+        # Persist the static (non-voyage) fields. Destination is voyage data
+        # and is intentionally NOT cached — it changes every trip.
+        _vessel_cache_upsert(mmsi, {
+            "name": name,
+            "type": type_,
+            "type_name": type_name,
+            "callsign": callsign,
+            "length": length,
+        })
 
 
 def _prune_stale_ships():
@@ -685,40 +766,53 @@ def _prune_stale_ships():
 
 
 def handle_ships(params):
-    """Return list of nearby ships — filtered by size and distance."""
+    """Return list of nearby ships — filtered by size and distance.
+    Static fields (name/type/type_name/callsign/length) missing from the
+    live AIS feed are filled in from the persistent vessel_static cache,
+    so vessels we've seen before always carry full context even when
+    today's WebSocket session hasn't received a fresh Type 5 message."""
     _prune_stale_ships()
     with _ships_lock:
-        ship_list = []
-        for s in _ships.values():
-            if not s.get("name"):
+        live_snapshot = [dict(s) for s in _ships.values()]
+    # Merge cached static fields where the live data is missing them. Live
+    # data always wins when present; cache only fills gaps.
+    with _vessel_cache_lock:
+        for s in live_snapshot:
+            cached = _vessel_static_cache.get(s.get("mmsi", ""))
+            if not cached:
                 continue
-            # Minimum length filter — only exclude if length was reported and is small
-            length = s.get("length", 0)
-            if length and length < SHIP_MIN_LENGTH:
-                continue
-            # Require a valid position fix before including
-            lat = s.get("lat", 0)
-            lon = s.get("lon", 0)
-            if not lat or not lon:
-                continue
-            dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
-            if dist > SHIP_MAX_MILES:
-                continue
-            dist_mi = round(dist, 1)
-            log_ship({**s, "distance_mi": dist_mi})
-            ship_list.append({
-                "name":        s.get("name", ""),
-                "type":        s.get("type", 0),
-                "type_name":   s.get("type_name", "Vessel"),
-                "destination": s.get("destination", ""),
-                "length":      s.get("length", 0),
-                "heading":     s.get("heading", 0),
-                "distance_mi": dist_mi,
-            })
-        # Sort by distance
-        ship_list.sort(key=lambda s: s.get("distance_mi", 999))
-    body = json.dumps({"ships": ship_list}).encode()
-    return 200, body
+            for field in ("name", "type", "type_name", "callsign", "length"):
+                if not s.get(field) and cached.get(field):
+                    s[field] = cached[field]
+    ship_list = []
+    for s in live_snapshot:
+        if not s.get("name"):
+            continue
+        # Minimum length filter — only exclude if length was reported and is small
+        length = s.get("length", 0)
+        if length and length < SHIP_MIN_LENGTH:
+            continue
+        # Require a valid position fix before including
+        lat = s.get("lat", 0)
+        lon = s.get("lon", 0)
+        if not lat or not lon:
+            continue
+        dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
+        if dist > SHIP_MAX_MILES:
+            continue
+        dist_mi = round(dist, 1)
+        log_ship({**s, "distance_mi": dist_mi})
+        ship_list.append({
+            "name":        s.get("name", ""),
+            "type":        s.get("type", 0),
+            "type_name":   s.get("type_name", "Vessel"),
+            "destination": s.get("destination", ""),
+            "length":      s.get("length", 0),
+            "heading":     s.get("heading", 0),
+            "distance_mi": dist_mi,
+        })
+    ship_list.sort(key=lambda s: s.get("distance_mi", 999))
+    return 200, json.dumps({"ships": ship_list}).encode()
 
 
 def handle_health(params):
@@ -933,6 +1027,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     _db_init()
+    _vessel_cache_load()
     print(f"Matrix Portal Proxy — port {PORT}")
     print(f"Config: {CONFIG_FILE}")
     print(f"Routes: {', '.join(ROUTES.keys())}")

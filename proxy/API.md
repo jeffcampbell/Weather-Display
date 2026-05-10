@@ -229,6 +229,8 @@ Returns up to 3 days of weather (today + next 2) computed from OpenWeatherMap's 
 
 Returns nearby vessels from the live AIS WebSocket feed (aisstream.io). Filters: must have a name, must have a valid position fix, length must be ≥30 m if reported, distance must be ≤10 mi from the configured location. Sorted nearest-first.
 
+Static fields (`name`, `type`, `type_name`, `callsign`, `length`) missing from the live feed are filled in from the persistent `vessel_static` table in `sightings.db`. Each time we receive a Type 5 static report we UPSERT those fields for that MMSI, so vessels we've seen before always carry full context — even after a proxy restart, and even if today's WebSocket session hasn't received a fresh Type 5 yet. `destination` is intentionally **not** cached: it's voyage data and changes every trip, so we'd risk showing a stale port.
+
 **Query parameters:** none
 
 **Cache TTL:** none (live in-memory snapshot from the WebSocket listener)
