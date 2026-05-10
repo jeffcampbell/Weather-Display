@@ -837,24 +837,40 @@ display.root_group = loading_group
 
 
 # ---------------------------------------------------------------------------
-# Time sync — NTP at boot if reachable; otherwise we wait until the first
-# weather fetch and use OWM's authoritative `dt` (UTC unix timestamp) to
-# set the RTC. _rtc_known tracks whether the RTC's current offset matches
-# _tz_offset_secs — only then is the delta-based DST resync safe.
+# Time sync — single source of truth is the Pi proxy's /api/time endpoint.
+# The Pi is NTP-synced via systemd-timesyncd, so it's authoritative; HTTP
+# over LAN avoids the UDP-NTP-blocked-by-Wi-Fi failure mode and is more
+# current than OWM's slightly-stale `dt` field. TZ_OFFSET_HOURS from
+# secrets.py is a static fallback used until the first proxy sync lands.
 # ---------------------------------------------------------------------------
 _tz_offset_secs = TZ_OFFSET_HOURS * 3600
 _rtc_known = False
-print("Syncing time via NTP...")
-try:
-    import socketpool, wifi as _wifi_mod, adafruit_ntp, rtc as _rtc_mod
-    _pool = socketpool.SocketPool(_wifi_mod.radio)
-    _ntp = adafruit_ntp.NTP(_pool, tz_offset=0)
-    _local_secs = time.mktime(_ntp.datetime) + _tz_offset_secs
-    _rtc_mod.RTC().datetime = time.localtime(_local_secs)
-    _rtc_known = True
-    print("Time synced (UTC{:+d}):".format(TZ_OFFSET_HOURS), time.localtime())
-except Exception as e:
-    print("NTP sync failed:", e)
+
+
+def _try_proxy_time_sync():
+    """Set the device RTC from the proxy's /api/time response and update
+    _tz_offset_secs from the proxy's reported local offset (which already
+    bakes in DST). Returns True on success. Safe to call repeatedly —
+    each call absolutely re-syncs the RTC, so DST flips and small drift
+    are corrected for free without any delta-nudge logic."""
+    global _rtc_known, _tz_offset_secs
+    try:
+        data = fetch_json(PROXY_HOST + "/api/time")
+        utc = int(data["utc"])
+        tz_off = int(data["tz_offset_secs"])
+        import rtc as _rtc_mod
+        _rtc_mod.RTC().datetime = time.localtime(utc + tz_off)
+        _tz_offset_secs = tz_off
+        _rtc_known = True
+        return True
+    except Exception as e:
+        print("Proxy time sync failed:", e)
+        return False
+
+
+print("Syncing time from proxy...")
+if _try_proxy_time_sync():
+    print("Time synced (UTC{:+d}):".format(_tz_offset_secs // 3600), time.localtime())
 
 # ---------------------------------------------------------------------------
 # State
@@ -966,41 +982,20 @@ def fetch_weather():
         wind_deg = data.get("wind", {}).get("deg", 0)
         wind_dir = heading_to_compass(wind_deg)
         wind_str = "{}mph {}".format(_wind_speed, wind_dir)
-        # Time / DST sync. Two cases:
-        #   - _rtc_known=False (NTP failed at boot, or this is the first
-        #     fetch after a soft-reload that lost track of the RTC offset):
-        #     use OWM's `dt` (UTC unix timestamp) to set the RTC absolutely.
-        #     Authoritative, no dependence on prior state.
-        #   - _rtc_known=True: the RTC's offset matches _tz_offset_secs, so
-        #     the DST flip can be handled with a small delta nudge — avoids
-        #     the small backward jump from re-reading OWM's slightly-stale dt.
-        tz_off = data.get("timezone", _tz_offset_secs)
-        utc_secs = data.get("dt", 0)
-        if not _rtc_known:
-            if utc_secs:
-                try:
-                    import rtc as _rtc_mod
-                    _rtc_mod.RTC().datetime = time.localtime(utc_secs + tz_off)
-                    _tz_offset_secs = tz_off
-                    _rtc_known = True
-                    device_log("RTC sync (UTC{:+d})".format(tz_off // 3600))
-                except Exception as e:
-                    print("RTC sync err:", e)
-        elif tz_off != _tz_offset_secs:
-            delta = tz_off - _tz_offset_secs
-            try:
-                import rtc as _rtc_mod
-                _rtc_mod.RTC().datetime = time.localtime(time.mktime(time.localtime()) + delta)
-                _tz_offset_secs = tz_off
-                device_log("TZ shift {}s (UTC{:+d})".format(delta, tz_off // 3600))
-            except Exception as e:
-                print("TZ resync err:", e)
+        # Time + DST sync via the proxy. Each call absolute-resets the RTC,
+        # so DST flips and small drift are picked up automatically. If the
+        # proxy is unreachable the existing _tz_offset_secs (either the
+        # static secrets value or the last-known-good proxy value) is good
+        # enough until the next attempt.
+        prev_tz = _tz_offset_secs
+        if _try_proxy_time_sync() and _tz_offset_secs != prev_tz:
+            device_log("TZ shift (UTC{:+d})".format(_tz_offset_secs // 3600))
         # Sunrise/sunset for brightness control (local time as minutes)
         sr = data.get("sys", {}).get("sunrise", 0)
         ss = data.get("sys", {}).get("sunset", 0)
         if sr and ss:
-            sr_local = (sr + tz_off) % 86400  # seconds into local day
-            ss_local = (ss + tz_off) % 86400
+            sr_local = (sr + _tz_offset_secs) % 86400  # seconds into local day
+            ss_local = (ss + _tz_offset_secs) % 86400
             _sunrise_mins = sr_local // 60
             _sunset_mins = ss_local // 60
         device_log("Wx:{} {} {}".format(weather_str, weather_cond, wind_str))

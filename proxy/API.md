@@ -20,6 +20,7 @@ When `device_secret` is set in the proxy's `config.json`, **every endpoint** req
 | `GET /api/devicelog` | Tail of device log entries |
 | `POST /api/devicelog` | Append device log entries |
 | `GET /api/health` | Liveness check |
+| `GET /api/time` | Current UTC + the proxy's local TZ offset (the device's clock source) |
 
 ---
 
@@ -419,6 +420,30 @@ Liveness check.
 | `uptime_seconds` | int | Seconds since the proxy process started |
 
 Known `issues` values: `opensky_rate_limited`. (List grows as more upstream checks are added.)
+
+---
+
+## `GET /api/time`
+
+Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The MatrixPortal calls this at boot and on every weather refresh — it's the device's only clock source.
+
+**Response:**
+
+```json
+{
+  "utc": 1778437800,
+  "tz_offset_secs": -14400
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `utc` | int | Current UTC time as Unix seconds |
+| `tz_offset_secs` | int | Seconds to add to UTC to get the proxy's local time. Includes DST. |
+
+**Why this exists:** the device used to NTP-sync at boot and fall back to OWM's `dt` field if NTP failed. NTP over UDP gets blocked on some Wi-Fi networks; OWM's `dt` is the data calculation time, not the response time, and can be 5–10 min stale on free-tier accounts. The proxy is on the LAN and runs `systemd-timesyncd`, so it's the most reliable clock source available to the device.
+
+**Cache TTL:** none.
 
 ---
 

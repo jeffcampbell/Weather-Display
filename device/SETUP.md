@@ -23,7 +23,6 @@ adafruit_bus_device/
 adafruit_connection_manager/
 adafruit_esp32spi/        # M4 only (not needed on S3)
 adafruit_requests/
-adafruit_ntp.mpy
 neopixel.mpy
 ```
 

@@ -737,6 +737,21 @@ def handle_health(params):
     }).encode()
 
 
+def handle_time(params):
+    """Return current UTC seconds plus the proxy's local TZ offset.
+    The device uses this as its sole time source — the Pi runs
+    systemd-timesyncd, so it's NTP-authoritative, and HTTP over LAN
+    is more reliable than UDP NTP from the device (some Wi-Fi networks
+    block port 123) and more current than OWM's `dt` field (cached
+    5–10 min on free-tier accounts)."""
+    is_dst = time.localtime().tm_isdst > 0
+    tz_offset = -time.altzone if is_dst else -time.timezone
+    return 200, json.dumps({
+        "utc": int(time.time()),
+        "tz_offset_secs": tz_offset,
+    }).encode()
+
+
 def handle_ships_debug(params):
     """Return raw ship data without filtering, for diagnostics."""
     _prune_stale_ships()
@@ -855,6 +870,7 @@ ROUTES = {
     "/api/sightings":   handle_sightings,
     "/api/devicelog":   handle_devicelog_get,
     "/api/health":      handle_health,
+    "/api/time":        handle_time,
 }
 
 
