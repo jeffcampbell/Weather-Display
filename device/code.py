@@ -1310,10 +1310,9 @@ def show_weather_tides():
         except (ValueError, IndexError):
             temp_val = 60
         if temp_val >= 90:   tc = 0xFF2222
-        elif temp_val >= 80: tc = 0xFF8800
-        elif temp_val >= 60: tc = 0xFFDD00
-        elif temp_val >= 40: tc = 0x88FFCC
-        elif temp_val >= 20: tc = 0x44AAFF
+        elif temp_val >= 70: tc = 0xFFDD00
+        elif temp_val >= 50: tc = 0x88FFCC
+        elif temp_val >= 30: tc = 0x44AAFF
         else:                tc = 0x2255CC
         temp_label.color = tc
         _center_small(cond_label, weather_cond[:10])
