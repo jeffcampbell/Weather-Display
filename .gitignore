@@ -2,7 +2,6 @@
 .env
 device/secrets.py
 device/settings.toml
-device/credentials.json
 proxy/config.json
 
 # Runtime logs

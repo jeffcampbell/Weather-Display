@@ -7,8 +7,8 @@
 
   "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",
 
-  "opensky_user": "YOUR_OPENSKY_USERNAME",
-  "opensky_pass": "YOUR_OPENSKY_PASSWORD",
+  "opensky_client_id":     "YOUR_OPENSKY_CLIENT_ID",
+  "opensky_client_secret": "YOUR_OPENSKY_CLIENT_SECRET",
 
   "aisstream_key": "YOUR_AISSTREAM_API_KEY",
 

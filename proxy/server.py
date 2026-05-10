@@ -22,7 +22,7 @@ import asyncio
 import threading
 import urllib.request
 import urllib.error
-import base64
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -41,8 +41,8 @@ if CONFIG_FILE.exists():
     with open(CONFIG_FILE) as f:
         _config = json.load(f)
 
-OPENSKY_USER = _config.get("opensky_user", "")
-OPENSKY_PASS = _config.get("opensky_pass", "")
+OPENSKY_CLIENT_ID = _config.get("opensky_client_id", "")
+OPENSKY_CLIENT_SECRET = _config.get("opensky_client_secret", "")
 OWM_KEY = _config.get("openweather_key", "")
 AISSTREAM_KEY = _config.get("aisstream_key", "")
 FLIGHTAWARE_KEY = _config.get("flightaware_key", "")
@@ -208,12 +208,53 @@ def fetch(url, headers=None, timeout=15):
         return 502, json.dumps({"error": str(e)}).encode()
 
 
+_OPENSKY_TOKEN_URL = (
+    "https://auth.opensky-network.org/auth/realms/opensky-network"
+    "/protocol/openid-connect/token"
+)
+_opensky_token = None        # current access token
+_opensky_token_exp = 0.0     # epoch seconds when current token expires
+_opensky_token_lock = Lock()
+
+
+def _fetch_opensky_token():
+    """Exchange client_id/client_secret for a bearer token. Returns None on failure."""
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": OPENSKY_CLIENT_ID,
+        "client_secret": OPENSKY_CLIENT_SECRET,
+    }).encode()
+    req = urllib.request.Request(
+        _OPENSKY_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read())
+        return payload.get("access_token"), int(payload.get("expires_in", 1800))
+    except Exception as e:
+        _log_proxy_event("OpenSky token fetch failed: {}".format(e))
+        return None, 0
+
+
 def opensky_headers():
-    """Build auth headers for OpenSky if credentials are configured."""
-    if OPENSKY_USER and OPENSKY_PASS:
-        cred = base64.b64encode(f"{OPENSKY_USER}:{OPENSKY_PASS}".encode()).decode()
-        return {"Authorization": f"Basic {cred}"}
-    return {}
+    """Return a Bearer auth header for OpenSky, fetching/refreshing the
+    OAuth2 token as needed. Returns {} if no client credentials configured
+    or token fetch fails — caller will get a 401/429 and fall through to
+    the existing empty-response handling."""
+    if not (OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET):
+        return {}
+    global _opensky_token, _opensky_token_exp
+    with _opensky_token_lock:
+        # Refresh if expired or within 60s of expiry.
+        if not _opensky_token or time.time() >= _opensky_token_exp - 60:
+            token, ttl = _fetch_opensky_token()
+            if not token:
+                return {}
+            _opensky_token = token
+            _opensky_token_exp = time.time() + ttl
+        return {"Authorization": "Bearer {}".format(_opensky_token)}
 
 
 # ---------------------------------------------------------------------------

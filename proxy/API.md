@@ -412,11 +412,11 @@ Known `issues` values: `opensky_rate_limited`. (List grows as more upstream chec
   "longitude": -71.06,
   "bbox":      0.1,
 
-  "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",
-  "opensky_user":    "YOUR_OPENSKY_USERNAME",
-  "opensky_pass":    "YOUR_OPENSKY_PASSWORD",
-  "aisstream_key":   "YOUR_AISSTREAM_API_KEY",
-  "flightaware_key": ""
+  "openweather_key":        "YOUR_OPENWEATHERMAP_API_KEY",
+  "opensky_client_id":      "YOUR_OPENSKY_CLIENT_ID",
+  "opensky_client_secret":  "YOUR_OPENSKY_CLIENT_SECRET",
+  "aisstream_key":          "YOUR_AISSTREAM_API_KEY",
+  "flightaware_key":        ""
 }
 ```
 
@@ -425,7 +425,7 @@ Known `issues` values: `opensky_rate_limited`. (List grows as more upstream chec
 | `latitude` / `longitude` | All endpoints | Home location — center of the plane bounding box, the AIS subscription box, and ship distance calculations |
 | `bbox` | `/api/planes` | Half-width of the plane search box in degrees (default `0.1` ≈ 7 mi) |
 | `openweather_key` | `/api/forecast` | OpenWeatherMap API key |
-| `opensky_user` / `opensky_pass` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky Basic Auth (anonymous requests are rate-limited harder) |
+| `opensky_client_id` / `opensky_client_secret` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky OAuth2 client credentials (generate at opensky-network.org → Account → API Client). The proxy exchanges them for short-lived bearer tokens automatically. |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). If missing, falls back to OpenSky / adsbdb. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
