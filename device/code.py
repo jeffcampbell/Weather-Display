@@ -1572,6 +1572,16 @@ while True:
                     elif expected_idx != ship_idx:
                         ship_idx = expected_idx
                         show_ship(ships[ship_idx])
+            elif _showing_ship:
+                # Ship sailed out of range. The cycling logic above only runs
+                # while `ships` is non-empty, so without this branch we'd be
+                # stuck on the ship screen forever — the per-tick clock/basin
+                # block is gated on `not _showing_ship`, so the display would
+                # freeze on the last-rendered ship frame.
+                _showing_ship = False
+                _ship_cycle_start = 0
+                show_weather_tides()
+                device_log("Ship gone, weather")
 
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame
