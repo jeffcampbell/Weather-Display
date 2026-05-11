@@ -585,6 +585,26 @@ def handle_forecast(params):
 _ships = {}         # MMSI -> ship info dict
 _ships_lock = Lock()
 
+
+def _normalize_length(length, ais_type):
+    """AIS dimensions are specified in meters per spec, but some small-vessel
+    operators misconfigure their transponders and broadcast dimensions in feet
+    instead. This shows up as suspiciously large values for vessel types that
+    are never that big in real life — e.g. a tug (type 52) reporting length=131
+    is impossible at 131 m (≈ 430 ft, larger than a destroyer) but matches a
+    real-world tug at 131 ft.
+
+    For AIS types 30–59 (fishing, high-speed, towing, pilot, special craft),
+    if the value exceeds 75 m we treat it as a feet reading and convert back
+    to meters. Cargo/tanker/passenger (60+) never trigger — those vessels
+    routinely exceed 75 m legitimately."""
+    if not length:
+        return length
+    if 30 <= ais_type < 60 and length > 75:
+        return round(length / 3.28084)
+    return length
+
+
 # Persistent static-data cache, mirrored to disk via vessel_static table.
 # Keyed by MMSI. Holds name/type/type_name/callsign/length only — destination
 # is voyage data and is intentionally never cached here.
@@ -605,7 +625,7 @@ def _vessel_cache_load():
                 "type": type_ or 0,
                 "type_name": type_name or "",
                 "callsign": callsign or "",
-                "length": length or 0,
+                "length": _normalize_length(length or 0, type_ or 0),
             }
     print("Vessel static cache: {} loaded".format(len(_vessel_static_cache)))
 
@@ -732,6 +752,7 @@ def _process_ais_message(msg):
         callsign = static.get("CallSign", "").strip()
         dim = static.get("Dimension", {})
         length = (dim.get("A", 0) or 0) + (dim.get("B", 0) or 0)
+        length = _normalize_length(length, type_)
         dest = static.get("Destination", "").strip()
         with _ships_lock:
             ship = _ships.setdefault(mmsi, {"mmsi": mmsi})
