@@ -606,9 +606,12 @@ def update_ship_ocean(tick):
                 pl_bg_bmp[x, y] = pal_idx
 
 
-# Route cache: callsign -> {"origin": "BOS", "dest": "JFK"}
+# Route cache: callsign -> {"origin": "BOS", "dest": "JFK", "type":..., "reg":...}
+# Sized for a full day of traffic in the bbox — too small and fetch_route
+# starts evicting the currently-displayed plane mid-iteration of
+# get_displayable_planes(), leaving show_plane() with an empty lookup.
 flight_cache = {}
-_FLIGHT_CACHE_MAX = 10
+_FLIGHT_CACHE_MAX = 50
 
 
 _consecutive_fetch_errs = 0
@@ -1407,7 +1410,14 @@ def show_plane(plane):
         bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
         logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
 
+        # Safety net: if the cache entry is gone (evicted by a sibling
+        # fetch_route call during get_displayable_planes' iteration) or
+        # empty for any other reason, repopulate it synchronously so the
+        # display never shows a callsign with blank origin/dest/type/reg.
         route = flight_cache.get(callsign, {})
+        if not route.get("origin") or route.get("origin") == "???":
+            fetch_route(callsign, plane[1])
+            route = flight_cache.get(callsign, {})
         route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
 
         airline_label.text = name[:8]
