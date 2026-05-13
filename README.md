@@ -45,7 +45,7 @@ You also need an always-on Linux box on the same network to run the proxy — a 
 
 ### 3D-printed case
 
-A printable enclosure for the MatrixPortal + 64×32 panel is included in [`stl/weather_display_case.stl`](stl/weather_display_case.stl). Print it on any FDM printer — a 0.4 mm nozzle and 0.2 mm layer height work fine. No supports needed.
+A printable enclosure for the MatrixPortal + 64×32 panel is included in [`stl/weather_display_case.stl`](stl/weather_display_case.stl). Print it on any FDM printer — a 0.4 mm nozzle and 0.2 mm layer height work fine.
 
 ---
 
