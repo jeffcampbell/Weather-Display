@@ -1,4 +1,4 @@
-# Matrix Portal Tracker
+# LED Matrix Display for Weather, Tide, and Flight/Marine Traffic
 
 ![Weather and tide screen](img/normal_weather.jpg)
 
