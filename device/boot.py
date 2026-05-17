@@ -18,5 +18,5 @@ try:
 except ImportError:
     pass  # no native Wi-Fi → no web workflow → keep USB drive enabled
 else:
-    # storage.disable_usb_drive()  # uncomment + hard-reset to re-enable web workflow writes
-    pass
+    storage.disable_usb_drive()
+    # ^ comment out + hard-reset if you need the USB CIRCUITPY drive back
