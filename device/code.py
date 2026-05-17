@@ -100,10 +100,6 @@ btn_up.switch_to_input(pull=digitalio.Pull.UP)
 btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
 btn_down.switch_to_input(pull=digitalio.Pull.UP)
 
-# Onboard ALS-PT19 ambient light sensor on board.LIGHT. Raw 16-bit reading:
-# higher = brighter. Drives display brightness via update_brightness().
-light_sensor = analogio.AnalogIn(board.LIGHT)
-
 # BTN_UP forces the weather screen back on, even if a plane is currently
 # being shown. Defined here so the button-poll block at the bottom of the
 # file can reach it; show_weather_tides is defined before that block runs.
@@ -116,15 +112,26 @@ def force_weather_screen():
 # ---------------------------------------------------------------------------
 # Display setup — 64x32, using displayio directly for icons + text
 # ---------------------------------------------------------------------------
-# status_neopixel intentionally omitted — the onboard NeoPixel is bright
-# enough to be distracting at night, and the matrix panel itself already
-# conveys state. The small red D13 LED is forced off below for the same
-# reason. The power LED is wired to the regulator and can't be disabled
-# in software.
+# status_neopixel intentionally omitted to keep the onboard NeoPixel dark.
+# The small red D13 LED is forced off below for the same reason.
 mp = MatrixPortal(bit_depth=4, debug=False)
 
-_d13 = digitalio.DigitalInOut(board.LED)
-_d13.switch_to_output(value=False)
+try:
+    _d13 = digitalio.DigitalInOut(board.LED)
+    _d13.switch_to_output(value=False)
+except (AttributeError, ValueError) as _e:
+    print("D13 LED not available:", _e)
+
+# Try to grab the onboard ALS-PT19 ambient light sensor. If anything about
+# this fails (pin missing on this firmware, already in use, etc.) we just
+# leave light_sensor=None and the rest of the file falls back to whatever
+# brightness logic doesn't depend on it.
+try:
+    light_sensor = analogio.AnalogIn(board.LIGHT)
+    print("ALS init OK, raw=", light_sensor.value)
+except Exception as _e:
+    print("ALS init failed:", _e)
+    light_sensor = None
 
 # Clear MatrixPortal's default group so we manage our own layout
 root = mp.display.root_group
@@ -243,32 +250,36 @@ _sep_pixel_y = 16       # current y of the tide direction indicator pixel
 
 BRIGHTNESS_MAX = 1.0
 BRIGHTNESS_MIN = 0.08   # dimmest without going off
-# Raw ALS-PT19 readings (0..65535) that map to MIN and MAX brightness. Anything
-# below LIGHT_RAW_DARK clamps to MIN; above LIGHT_RAW_BRIGHT clamps to MAX.
-# Tune these after observing real-world values in the deployed location.
+# ALS-PT19 raw readings (0..65535). Anything <= DARK clamps to MIN; >= BRIGHT
+# clamps to MAX. Tune to taste after watching real readings.
 LIGHT_RAW_DARK = 500
 LIGHT_RAW_BRIGHT = 25000
 LIGHT_EMA_ALPHA = 0.1   # smoothing factor: lower = steadier, slower to react
 
-_light_ema = None       # exponential moving average of raw sensor reading
+_light_ema = None       # smoothed sensor value, lazy-init on first reading
 
 def update_brightness():
-    """Adjust display brightness from a smoothed ambient-light reading."""
+    """Adjust display brightness from a smoothed ambient-light reading.
+    Wrapped in try/except so a flaky sensor read never crashes the main
+    loop — on failure we leave the previous brightness in place."""
     global _light_ema
-    raw = light_sensor.value
-    if _light_ema is None:
-        _light_ema = raw
-    else:
-        _light_ema = (1 - LIGHT_EMA_ALPHA) * _light_ema + LIGHT_EMA_ALPHA * raw
-
-    span = LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK
-    frac = (_light_ema - LIGHT_RAW_DARK) / span if span > 0 else 1.0
-    if frac < 0:
-        frac = 0
-    elif frac > 1:
-        frac = 1
-    b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
-    display.brightness = b
+    if light_sensor is None:
+        return
+    try:
+        raw = light_sensor.value
+        if _light_ema is None:
+            _light_ema = raw
+        else:
+            _light_ema = (1 - LIGHT_EMA_ALPHA) * _light_ema + LIGHT_EMA_ALPHA * raw
+        span = LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK
+        frac = (_light_ema - LIGHT_RAW_DARK) / span if span > 0 else 1.0
+        if frac < 0:
+            frac = 0
+        elif frac > 1:
+            frac = 1
+        display.brightness = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
+    except Exception as _e:
+        print("update_brightness err:", _e)
 
 # ---------------------------------------------------------------------------
 # Weather sky art helpers — draw into basin_bmp sky area (y < water_top)
@@ -822,16 +833,18 @@ plane_group.append(reg_label)
 # --- Loading screen group ---
 # Shows "LOADING..." plus the device's IP address so the web workflow
 # (https://code.circuitpython.org/) is reachable without hunting for it.
-# IP lookup is best-effort: native-WiFi boards (S3) expose it via the
-# `wifi` module; on boards without it the line stays blank.
+# IP lookup is best-effort: any failure (no native wifi module, radio not
+# yet associated) just leaves the line blank — never fatal at module load.
 loading_group = displayio.Group()
 loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=8)
 loading_group.append(loading_label)
 
 try:
     import wifi as _wifi
-    _ip_text = str(_wifi.radio.ipv4_address) if _wifi.radio.ipv4_address else ""
-except ImportError:
+    _ip_addr = _wifi.radio.ipv4_address
+    _ip_text = str(_ip_addr) if _ip_addr else ""
+except Exception as _e:
+    print("IP label skipped:", _e)
     _ip_text = ""
 ip_label = Label(FONT_SMALL, text=_ip_text, color=0x00AAFF, x=6, y=22)
 loading_group.append(ip_label)
@@ -937,10 +950,8 @@ showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
 plane_cooldown_until = 0      # don't re-show plane screen before this ts
 plane_idx = 0
-# Initial fetch offsets stagger first-tick load: weather+tides land first
-# (the always-on display content), then planes/ships/health roll in over the
-# next ~30 s. Without this, all four fetches plus per-plane route lookups
-# fire on the same loop iteration and can stall the ESP/network stack.
+# Stagger first-tick load: weather+tides at t=0, planes at t=10s,
+# ships at t=20s (set above), health at t=30s.
 last_weather_fetch = -WEATHER_INTERVAL          # t=0
 last_sky_fetch = -OPENSKY_INTERVAL + 10         # t=10
 last_health_fetch = -HEALTH_INTERVAL + 30       # t=30
@@ -1689,13 +1700,10 @@ while True:
                 elif tide_type_val == "L":
                     _sep_pixel_y = (_sep_pixel_y + 1) % 32
                 sep_pixel_tg.y = _sep_pixel_y
+            update_brightness()
         except MemoryError as _e:
             print("per-tick MemoryError:", _e)
             gc.collect()
-
-    # Brightness tracks ambient light every tick, regardless of which view is
-    # active — otherwise it would freeze while a plane or ship is on screen.
-    update_brightness()
 
     if _showing_ship:
         try:
