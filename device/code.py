@@ -9,6 +9,7 @@ import math
 import board
 import microcontroller
 import digitalio
+import analogio
 import terminalio
 import displayio
 from adafruit_matrixportal.matrixportal import MatrixPortal
@@ -98,6 +99,10 @@ btn_up = digitalio.DigitalInOut(board.BUTTON_UP)
 btn_up.switch_to_input(pull=digitalio.Pull.UP)
 btn_down = digitalio.DigitalInOut(board.BUTTON_DOWN)
 btn_down.switch_to_input(pull=digitalio.Pull.UP)
+
+# Onboard ALS-PT19 ambient light sensor on board.LIGHT. Raw 16-bit reading:
+# higher = brighter. Drives display brightness via update_brightness().
+light_sensor = analogio.AnalogIn(board.LIGHT)
 
 # BTN_UP forces the weather screen back on, even if a plane is currently
 # being shown. Defined here so the button-poll block at the bottom of the
@@ -230,33 +235,32 @@ _sep_pixel_y = 16       # current y of the tide direction indicator pixel
 
 BRIGHTNESS_MAX = 1.0
 BRIGHTNESS_MIN = 0.08   # dimmest without going off
-BRIGHTNESS_RAMP = 60    # minutes to ramp up/down
+# Raw ALS-PT19 readings (0..65535) that map to MIN and MAX brightness. Anything
+# below LIGHT_RAW_DARK clamps to MIN; above LIGHT_RAW_BRIGHT clamps to MAX.
+# Tune these after observing real-world values in the deployed location.
+LIGHT_RAW_DARK = 500
+LIGHT_RAW_BRIGHT = 25000
+LIGHT_EMA_ALPHA = 0.1   # smoothing factor: lower = steadier, slower to react
+
+_light_ema = None       # exponential moving average of raw sensor reading
 
 def update_brightness():
-    """Adjust display brightness based on sun position."""
-    t = time.localtime()
-    now_mins = t.tm_hour * 60 + t.tm_min
-
-    if _sunrise_mins <= now_mins <= _sunset_mins:
-        # Daytime — check if we're in the ramp-up or ramp-down window
-        mins_after_sunrise = now_mins - _sunrise_mins
-        mins_before_sunset = _sunset_mins - now_mins
-
-        if mins_after_sunrise < BRIGHTNESS_RAMP:
-            # Ramping up after sunrise
-            frac = mins_after_sunrise / BRIGHTNESS_RAMP
-            b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
-        elif mins_before_sunset < BRIGHTNESS_RAMP:
-            # Ramping down before sunset
-            frac = mins_before_sunset / BRIGHTNESS_RAMP
-            b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
-        else:
-            b = BRIGHTNESS_MAX
+    """Adjust display brightness from a smoothed ambient-light reading."""
+    global _light_ema
+    raw = light_sensor.value
+    if _light_ema is None:
+        _light_ema = raw
     else:
-        # Nighttime
-        b = BRIGHTNESS_MIN
+        _light_ema = (1 - LIGHT_EMA_ALPHA) * _light_ema + LIGHT_EMA_ALPHA * raw
 
-    display.brightness = max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, b))
+    span = LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK
+    frac = (_light_ema - LIGHT_RAW_DARK) / span if span > 0 else 1.0
+    if frac < 0:
+        frac = 0
+    elif frac > 1:
+        frac = 1
+    b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
+    display.brightness = b
 
 # ---------------------------------------------------------------------------
 # Weather sky art helpers — draw into basin_bmp sky area (y < water_top)
@@ -808,9 +812,21 @@ plane_group.append(reg_label)
 # show_ship() switches to "plane" screen and repurposes the labels
 
 # --- Loading screen group ---
+# Shows "LOADING..." plus the device's IP address so the web workflow
+# (https://code.circuitpython.org/) is reachable without hunting for it.
+# IP lookup is best-effort: native-WiFi boards (S3) expose it via the
+# `wifi` module; on boards without it the line stays blank.
 loading_group = displayio.Group()
-loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=12)
+loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=8)
 loading_group.append(loading_label)
+
+try:
+    import wifi as _wifi
+    _ip_text = str(_wifi.radio.ipv4_address) if _wifi.radio.ipv4_address else ""
+except ImportError:
+    _ip_text = ""
+ip_label = Label(FONT_SMALL, text=_ip_text, color=0x00AAFF, x=6, y=22)
+loading_group.append(ip_label)
 
 # --- Health indicator: 1 px red dot at (63, 31) ---
 # Visible when /api/health reports a non-empty `issues` list (or when the
@@ -891,7 +907,7 @@ _sunrise_mins = 5 * 60 + 30
 _sunset_mins = 19 * 60 + 30
 ships = []
 ship_idx = 0
-last_ship_fetch = -SHIP_INTERVAL
+last_ship_fetch = -SHIP_INTERVAL + 20  # stagger: ships fire ~20s after boot
 _ship_cycle_start = 0
 _showing_ship = False
 _ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship ocean animation
@@ -913,9 +929,13 @@ showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
 plane_cooldown_until = 0      # don't re-show plane screen before this ts
 plane_idx = 0
-last_weather_fetch = -WEATHER_INTERVAL
-last_sky_fetch = -OPENSKY_INTERVAL
-last_health_fetch = -HEALTH_INTERVAL
+# Initial fetch offsets stagger first-tick load: weather+tides land first
+# (the always-on display content), then planes/ships/health roll in over the
+# next ~30 s. Without this, all four fetches plus per-plane route lookups
+# fire on the same loop iteration and can stall the ESP/network stack.
+last_weather_fetch = -WEATHER_INTERVAL          # t=0
+last_sky_fetch = -OPENSKY_INTERVAL + 10         # t=10
+last_health_fetch = -HEALTH_INTERVAL + 30       # t=30
 last_plane_cycle = 0
 current_screen = "loading"
 
@@ -1661,10 +1681,13 @@ while True:
                 elif tide_type_val == "L":
                     _sep_pixel_y = (_sep_pixel_y + 1) % 32
                 sep_pixel_tg.y = _sep_pixel_y
-            update_brightness()
         except MemoryError as _e:
             print("per-tick MemoryError:", _e)
             gc.collect()
+
+    # Brightness tracks ambient light every tick, regardless of which view is
+    # active — otherwise it would freeze while a plane or ship is on screen.
+    update_brightness()
 
     if _showing_ship:
         try:
