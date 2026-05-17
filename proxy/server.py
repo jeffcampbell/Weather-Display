@@ -16,6 +16,7 @@ Usage:
 
 import json
 import os
+import socket
 import sqlite3
 import time
 import asyncio
@@ -23,10 +24,14 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from threading import Lock
+
+# Floor for any socket read/write that doesn't pass an explicit timeout —
+# without this a stuck TLS handshake on an upstream could pin a thread forever.
+socket.setdefaulttimeout(20)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -1063,7 +1068,7 @@ if __name__ == "__main__":
     else:
         print("AIS: No aisstream_key configured, ship tracking disabled")
 
-    server = HTTPServer(("", PORT), ProxyHandler)
+    server = ThreadingHTTPServer(("", PORT), ProxyHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
