@@ -116,7 +116,15 @@ def force_weather_screen():
 # ---------------------------------------------------------------------------
 # Display setup — 64x32, using displayio directly for icons + text
 # ---------------------------------------------------------------------------
-mp = MatrixPortal(status_neopixel=board.NEOPIXEL, bit_depth=4, debug=False)
+# status_neopixel intentionally omitted — the onboard NeoPixel is bright
+# enough to be distracting at night, and the matrix panel itself already
+# conveys state. The small red D13 LED is forced off below for the same
+# reason. The power LED is wired to the regulator and can't be disabled
+# in software.
+mp = MatrixPortal(bit_depth=4, debug=False)
+
+_d13 = digitalio.DigitalInOut(board.LED)
+_d13.switch_to_output(value=False)
 
 # Clear MatrixPortal's default group so we manage our own layout
 root = mp.display.root_group
