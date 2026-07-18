@@ -7,6 +7,9 @@
 
   "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",
 
+  "_noaa_station_comment": "Default NOAA CO-OPS station for /api/tides if the device omits ?station=. Must be a harmonic/reference station (has full predictions), not a subordinate/offset-only station.",
+  "noaa_station": "8443970",
+
   "opensky_client_id":     "YOUR_OPENSKY_CLIENT_ID",
   "opensky_client_secret": "YOUR_OPENSKY_CLIENT_SECRET",
 

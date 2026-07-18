@@ -18,6 +18,7 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
 import time
 import asyncio
 import threading
@@ -49,6 +50,7 @@ if CONFIG_FILE.exists():
 OPENSKY_CLIENT_ID = _config.get("opensky_client_id", "")
 OPENSKY_CLIENT_SECRET = _config.get("opensky_client_secret", "")
 OWM_KEY = _config.get("openweather_key", "")
+NOAA_STATION = _config.get("noaa_station", "8443970")
 AISSTREAM_KEY = _config.get("aisstream_key", "")
 FLIGHTAWARE_KEY = _config.get("flightaware_key", "")
 DEVICE_SECRET = _config.get("device_secret", "")
@@ -583,6 +585,175 @@ def handle_forecast(params):
         return 500, json.dumps({"error": str(e)}).encode()
 
 
+TIDE_FETCH_DAYS = 30   # NOAA allows up to 1 year per request for hilo predictions
+TIDE_CACHE_SEC = 86400        # re-fetch from NOAA at most once/day
+TIDE_STALE_CACHE_SEC = 25 * 86400  # predictions don't decay — safe to serve
+                                    # most of the fetched window if NOAA is down
+
+# Local harmonic-prediction fallback (pytides-py3), used only when NOAA's
+# live predictions API fails AND there's no usable cache left. Runs as a
+# separate subprocess in its own venv rather than importing numpy/scipy
+# into this always-on process — this Pi is a Zero 2 W with 512MB total, so
+# that dependency weight is only worth paying for the few seconds a
+# fallback prediction actually takes, not for the process's entire uptime.
+TIDE_DIR = Path(__file__).parent
+TIDE_VENV_PYTHON = TIDE_DIR / "tide_venv" / "bin" / "python3"
+TIDE_PREDICT_SCRIPT = TIDE_DIR / "tide_predict.py"
+TIDE_PREDICT_TIMEOUT_SEC = 45   # observed ~15s for a full 37-constituent,
+                                 # 30-day run on this hardware; generous margin
+
+
+def _harmonics_path(station):
+    return TIDE_DIR / f"harmonics_{station}.json"
+
+
+def _fetch_and_cache_harmonics(station):
+    """One-time bootstrap: fetch a station's published harmonic constituents
+    from NOAA's metadata API and cache them to disk indefinitely — this is
+    what makes the local pytides fallback possible without any further
+    NOAA dependency. Called opportunistically after a successful live tide
+    fetch (proof NOAA is reachable); no-ops if already cached, so it's a
+    true one-time cost, not a recurring one."""
+    path = _harmonics_path(station)
+    if path.exists():
+        return True
+
+    url = (
+        "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/"
+        f"{station}/harcon.json?units=english"
+    )
+    status, data = fetch(url, timeout=10)
+    if status != 200:
+        _log_proxy_event(f"Harmonics fetch failed for station {station} (status={status})")
+        return False
+
+    try:
+        raw = json.loads(data).get("HarmonicConstituents", [])
+        consts = [
+            {"name": c["name"], "amplitude": c["amplitude"], "phase_GMT": c["phase_GMT"]}
+            for c in raw
+        ]
+        if not consts:
+            raise ValueError("empty HarmonicConstituents")
+        path.write_text(json.dumps(consts))
+        _log_proxy_event(f"Cached {len(consts)} harmonic constituents for station {station}")
+        return True
+    except Exception as e:
+        _log_proxy_event(f"Harmonics parse failed for station {station}: {e}")
+        return False
+
+
+def _local_harmonic_predict(station, begin_date, end_date):
+    """Run the isolated pytides subprocess against cached harmonic
+    constituents. Returns predictions JSON bytes, or None if unavailable
+    (no venv/script/harmonics yet, or the subprocess failed)."""
+    harmonics = _harmonics_path(station)
+    if not (TIDE_VENV_PYTHON.exists() and TIDE_PREDICT_SCRIPT.exists() and harmonics.exists()):
+        return None
+
+    # No hard RLIMIT_AS here on purpose — numpy/scipy reserve a lot of
+    # virtual address space (shared libs, BLAS/LAPACK, mmap'd allocator
+    # arenas) far in excess of what they actually touch, so an address-space
+    # cap kills the interpreter during import well before real memory
+    # pressure — measured on this hardware: ~73MB peak RSS for a full
+    # 37-constituent/30-day run, comfortably safe on its own. The timeout
+    # below is the actual runaway-computation guard.
+    try:
+        result = subprocess.run(
+            [str(TIDE_VENV_PYTHON), str(TIDE_PREDICT_SCRIPT),
+             str(harmonics), f"{begin_date:%Y-%m-%d}", f"{end_date:%Y-%m-%d}"],
+            capture_output=True, timeout=TIDE_PREDICT_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        _log_proxy_event(f"Local tide prediction subprocess failed to start: {e}")
+        return None
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")[-300:]
+        _log_proxy_event(f"Local tide prediction failed (rc={result.returncode}): {stderr}")
+        return None
+
+    try:
+        parsed = json.loads(result.stdout)
+        if not parsed.get("predictions"):
+            return None
+        return result.stdout
+    except Exception as e:
+        _log_proxy_event(f"Local tide prediction returned bad JSON: {e}")
+        return None
+
+
+def handle_tides(params):
+    """Fetch a rolling 30-day window of tide predictions from NOAA CO-OPS
+    and return them in the same shape the device already parses. Cached
+    1 day — tide predictions are deterministic astronomical data, not
+    live conditions, so a day-old (or even a couple-weeks-old) fetch is
+    just as correct as a fresh one within its window.
+
+    NOAA's API is fronted by AWS API Gateway and was intermittently hanging
+    the ESP32-S3's constrained TLS stack for long enough to trip the
+    device's 90s watchdog and reboot the whole thing — moving the fetch
+    here means a bad NOAA connection only ties up one Pi thread, and on
+    failure we serve the last good cache instead of an error so the
+    device's display never has to fall back to N/A. Fetching a full month
+    at once and caching it for a day also means an extended NOAA outage
+    (like the one that prompted this) has to last nearly a month before
+    the device runs out of valid cached predictions."""
+    import datetime
+
+    station = params.get("station", [NOAA_STATION])[0]
+    cache_key = f"tides:{station}"
+    cached = cache_get(cache_key, max_age_sec=TIDE_CACHE_SEC)
+    if cached:
+        return 200, cached
+
+    today = datetime.date.today()
+    end = today + datetime.timedelta(days=TIDE_FETCH_DAYS)
+    url = (
+        "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+        f"?begin_date={today:%Y%m%d}&end_date={end:%Y%m%d}"
+        f"&station={station}&product=predictions&datum=MLLW"
+        "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
+    )
+    status, data = fetch(url, timeout=10)
+
+    if status == 200:
+        try:
+            if "predictions" in json.loads(data):
+                cache_set(cache_key, data)
+                # Opportunistic one-time bootstrap for the local prediction
+                # fallback below — no-ops instantly if already cached, so
+                # this costs nothing on the 364 days a year NOAA is up.
+                _fetch_and_cache_harmonics(station)
+                return 200, data
+        except Exception:
+            pass
+
+    # Upstream failed or returned something unexpected (e.g. NOAA's
+    # {"error": ...} body) — serve a somewhat-stale cache rather than an
+    # error, so the device keeps showing the last known-good tide instead
+    # of falling back to N/A. Always return valid JSON either way — a
+    # non-JSON/error body would make resp.json() raise on the device.
+    stale = cache_get(cache_key, max_age_sec=TIDE_STALE_CACHE_SEC)
+    if stale:
+        _log_proxy_event(f"Tides upstream failed (status={status}), serving stale cache")
+        return 200, stale
+
+    # No live data and no cache left (e.g. a NOAA outage longer than
+    # TIDE_STALE_CACHE_SEC, or this station's very first-ever request
+    # happening during an outage) — fall back to predictions computed
+    # locally from NOAA's own published harmonic constituents. Less
+    # precise than NOAA's live engine, but needs no network at all.
+    local = _local_harmonic_predict(station, today, end)
+    if local:
+        cache_set(cache_key, local, age_override=TIDE_CACHE_SEC)
+        _log_proxy_event(f"Tides upstream failed (status={status}), serving local harmonic prediction")
+        return 200, local
+
+    _log_proxy_event(f"Tides upstream failed (status={status}), no cache or local fallback available")
+    return 200, json.dumps({"predictions": [], "upstream_error": status}).encode()
+
+
 # ---------------------------------------------------------------------------
 # AIS Ship Tracking — WebSocket listener + HTTP endpoint
 # ---------------------------------------------------------------------------
@@ -985,6 +1156,7 @@ ROUTES = {
     "/api/route":       handle_route,
     "/api/aircraft":    handle_aircraft,
     "/api/forecast":    handle_forecast,
+    "/api/tides":       handle_tides,
     "/api/ships":       handle_ships,
     "/api/ships/debug": handle_ships_debug,
     "/api/sightings":   handle_sightings,

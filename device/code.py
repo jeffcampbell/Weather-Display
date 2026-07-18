@@ -640,7 +640,7 @@ _FLIGHT_CACHE_MAX = 50
 _consecutive_fetch_errs = 0
 _FETCH_ERR_RESET_THRESHOLD = 12  # auto-reboot after this many fetch/render errors in a row
 
-def fetch_json(url):
+def fetch_json(url, timeout=10):
     """Fetch a URL and return parsed JSON. Always closes the socket — without
     try/finally, a MemoryError mid-parse leaks the socket and the next fetch
     fails with 'existing socket already connected' until reboot.
@@ -648,12 +648,18 @@ def fetch_json(url):
     Also tracks a consecutive-error counter; if a fetch raises (caller's
     except block calls fetch_failed), repeated failures trigger a hard
     reboot — adafruit_requests can get into an unrecoverable SSL/socket
-    state that only a CPU reset clears."""
+    state that only a CPU reset clears.
+
+    `timeout` bounds how long a single fetch can block. Some hosts (e.g.
+    NOAA's AWS-API-Gateway-fronted tide API) have occasionally hung well
+    past the library's own default, taking the whole device down with
+    them once WATCHDOG_TIMEOUT elapsed — callers hitting a flaky host
+    should pass a shorter timeout so they fail fast instead."""
     global _consecutive_fetch_errs
     headers = None
     if DEVICE_SECRET and PROXY_HOST and url.startswith(PROXY_HOST):
         headers = {"X-Device-Secret": DEVICE_SECRET}
-    resp = mp.network.fetch(url, headers=headers) if headers else mp.network.fetch(url)
+    resp = mp.network.fetch(url, headers=headers, timeout=timeout)
     try:
         data = resp.json()
         _consecutive_fetch_errs = 0  # success resets the counter
@@ -1063,50 +1069,61 @@ def fetch_weather():
 
 
 def fetch_tides():
-    """Fetch today + tomorrow's tide predictions from NOAA in one request and
-    store them as (abs_secs, type, hour, minute_str). Using a 2-day window
-    means the next upcoming tide is always in the list (no fall-through to a
-    second request) and the basin-level interpolation works across midnight.
+    """Fetch tide predictions and store them as (abs_secs, type, hour,
+    minute_str). The proxy returns a rolling ~30-day window (see
+    TIDE_FETCH_DAYS in proxy/server.py) so the next upcoming tide is
+    always in the list and the basin-level interpolation works across
+    midnight — the device doesn't need to know or care about the window
+    size, it just consumes whatever predictions come back.
 
-    NOTE: NOAA's `date` param only accepts `today`, `latest`, `recent`. To get
-    a specific day or range you must use `begin_date`/`end_date` — passing
-    `date=tomorrow` silently returns today's data."""
+    Routed through the Pi proxy's /api/tides rather than hitting NOAA
+    directly — NOAA's AWS-fronted API was intermittently hanging the
+    ESP32-S3's TLS stack long enough to trip the watchdog and reboot the
+    whole device. The proxy does the NOAA call itself (with its own
+    timeout) and always returns valid JSON, serving a cached response if
+    NOAA is down, so this call behaves like the other proxy-routed
+    fetches (planes/ships) instead of like a flaky direct external call."""
     global tide_str, tide_type_val, _tide_predictions
     gc.collect()
     try:
-        now = time.localtime()
-        today_str = "{:04d}{:02d}{:02d}".format(now.tm_year, now.tm_mon, now.tm_mday)
-        tmr = time.localtime(time.mktime(now) + 86400)
-        tmr_str = "{:04d}{:02d}{:02d}".format(tmr.tm_year, tmr.tm_mon, tmr.tm_mday)
-        url = (
-            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-            "?begin_date={}&end_date={}&station={}&product=predictions&datum=MLLW"
-            "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
-        ).format(today_str, tmr_str, NOAA_STATION)
-        preds = fetch_json(url).get("predictions", [])
-        now_secs = time.mktime(now)
+        # timeout=15: comfortably longer than the proxy's own 10s upstream
+        # NOAA timeout (proxy/server.py TIDE fetch()), so a device-side
+        # timeout can't race and fire right as the proxy was about to
+        # return its safe fallback response.
+        url = "{}/api/tides?station={}".format(PROXY_HOST, NOAA_STATION)
+        preds = fetch_json(url, timeout=15).get("predictions", [])
 
-        _tide_predictions = []
-        for p in preds:
-            ts = p["t"]                        # e.g. "2026-05-09 18:12"
-            d_part, t_part = ts.split(" ")
-            y, mo, d = [int(x) for x in d_part.split("-")]
-            h_str, m_str = t_part.split(":")
-            h, m = int(h_str), int(m_str)
-            secs = time.mktime((y, mo, d, h, m, 0, 0, 0, 0))
-            _tide_predictions.append((secs, p.get("type", ""), h, m_str))
-
+        # Only replace _tide_predictions when the fetch actually returned
+        # data. An empty response (e.g. the proxy's safe fallback while
+        # NOAA is down) is a clean, non-exceptional result — but wiping
+        # _tide_predictions/tide_str to N/A on every one of those would
+        # blank a perfectly good display. Keep showing the last known-good
+        # tide until a fetch actually brings back fresh predictions.
         next_p = None
-        for p in _tide_predictions:
-            if p[0] >= now_secs:
-                next_p = p
-                break
+        if preds:
+            new_predictions = []
+            for p in preds:
+                ts = p["t"]                        # e.g. "2026-05-09 18:12"
+                d_part, t_part = ts.split(" ")
+                y, mo, d = [int(x) for x in d_part.split("-")]
+                h_str, m_str = t_part.split(":")
+                h, m = int(h_str), int(m_str)
+                secs = time.mktime((y, mo, d, h, m, 0, 0, 0, 0))
+                new_predictions.append((secs, p.get("type", ""), h, m_str))
+
+            now_secs = time.mktime(time.localtime())
+            for p in new_predictions:
+                if p[0] >= now_secs:
+                    next_p = p
+                    break
+            _tide_predictions = new_predictions
+
         if next_p:
             tide_type_val = next_p[1]
             h12 = next_p[2] % 12 or 12
             tide_str = "{}:{}".format(h12, next_p[3])
             device_log("Tide:{} {}".format(tide_type_val, tide_str))
-        else:
+        elif not tide_str:
             tide_str = "N/A"
             tide_type_val = ""
         # Calculate basin level — the per-tick block redraws it each frame
