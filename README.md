@@ -53,9 +53,9 @@ A printable enclosure for the MatrixPortal + 64×32 panel is included in [`stl/w
 
 ```
 [MatrixPortal device]  ── Wi-Fi ──►  OpenWeatherMap  (weather, every 10 min)
-                                 ──►  NOAA Tides API  (tides, every 10 min)
                                  ──►  [Raspberry Pi proxy :6590]
                                            │
+                                           ├──► NOAA Tides API       (tide predictions)
                                            ├──► OpenSky Network      (aircraft positions)
                                            ├──► FlightAware AeroAPI  (routes, optional paid)
                                            └──► AISStream WebSocket  (live AIS ship feed)
@@ -65,6 +65,7 @@ The proxy handles everything the MatrixPortal can't do directly:
 - **TLS to picky upstreams** — the M4's ESP32 co-processor can't negotiate TLS with all APIs; even on the S3 it's easier to terminate TLS on Linux.
 - **AIS WebSocket** — persistent connection to AISStream.io for live ship positions.
 - **Response caching** — single source of truth means one upstream call serves many polls. AIS static data (vessel name/type/length) is persisted to SQLite so context survives proxy restarts.
+- **Tide resilience** — NOAA's predictions API goes down for days at a time, so tides are served from a rolling 30-day cache with an optional fully-offline fallback that computes predictions from the station's published harmonic constituents. See [proxy/API.md](proxy/API.md#get-apitides).
 - **Authoritative clock** — the device reads UTC + TZ from `/api/time` instead of UDP NTP, which is more reliable on Wi-Fi networks that block port 123.
 - **Device logging** — receives periodic log POSTs from the device so you can tail it remotely without a serial cable.
 

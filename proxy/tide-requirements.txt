@@ -1,0 +1,17 @@
+# Dependency for the OPTIONAL local tide-prediction fallback (proxy/tide_predict.py).
+#
+# The proxy itself is pure standard library; this is the only third-party
+# dependency in the project, and it is deliberately isolated in its own venv
+# so numpy/scipy are never imported into the always-on proxy process. It is
+# only loaded, in a short-lived subprocess, when NOAA's live predictions API
+# AND the proxy's cache are both unavailable.
+#
+# Setup (see proxy/API.md → "GET /api/tides"):
+#   cd proxy
+#   python3 -m venv tide_venv
+#   ./tide_venv/bin/pip install -r tide-requirements.txt
+#
+# pytides-py3 pulls in numpy + scipy. Tested on a Raspberry Pi Zero 2 W with
+# pytides-py3 0.8.1 / numpy 2.5.1 / scipy 1.18.0 (Python 3.11+); ~73 MB peak
+# RSS, ~15 s for a 30-day / 37-constituent run.
+pytides-py3

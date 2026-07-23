@@ -8,6 +8,10 @@ proxy/config.json
 proxy/device.log
 proxy/sightings.db
 
+# Local tide-fallback runtime artifacts (see proxy/API.md → GET /api/tides)
+proxy/tide_venv/
+proxy/harmonics_*.json
+
 # Python
 .venv/
 __pycache__/

@@ -14,6 +14,7 @@ When `device_secret` is set in the proxy's `config.json`, **every endpoint** req
 | `GET /api/route` | Flight route + aircraft type/registration |
 | `GET /api/aircraft` | Raw OpenSky aircraft metadata by ICAO24 |
 | `GET /api/forecast` | 3-day weather forecast from OpenWeatherMap |
+| `GET /api/tides` | Tide predictions (rolling 30-day window) with cache + offline fallback |
 | `GET /api/ships` | Nearby vessels from the live AIS feed |
 | `GET /api/ships/debug` | Unfiltered ship data for diagnostics |
 | `GET /api/sightings` | Historical ship + plane log (SQLite) |
@@ -222,6 +223,75 @@ Returns up to 3 days of weather (today + next 2) computed from OpenWeatherMap's 
 |--------|------|---------|
 | 500 | `{"error": "no openweather_key configured"}` | `openweather_key` missing from `config.json` |
 | 500 | `{"error": "..."}` | Forecast parse error |
+
+---
+
+## `GET /api/tides`
+
+Returns a rolling 30-day window of high/low tide predictions for a NOAA CO-OPS
+station, in the shape NOAA's own `datagetter` returns. The device fetches this
+instead of calling NOAA directly, so a slow or hung NOAA connection only ties
+up one Pi thread instead of tripping the device's watchdog.
+
+**Query parameters:**
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| `station` | no | NOAA station ID. Defaults to `noaa_station` in `config.json`. Must be a harmonic/reference station (subordinate/offset-only stations don't support the predictions product). |
+
+**Cache TTL:** 1 day fresh; served up to ~25 days stale if NOAA is unreachable.
+Tide predictions are deterministic astronomical data, so a day-old (or even a
+weeks-old) fetch within its window is just as correct as a fresh one.
+
+**Upstream:** `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter` (predictions, `interval=hilo`, `datum=MLLW`, `time_zone=lst_ldt`)
+
+**Success response (200):**
+
+```json
+{
+  "predictions": [
+    { "t": "2026-07-18 09:29", "v": "-0.5", "type": "L" },
+    { "t": "2026-07-18 15:47", "v": "9.8",  "type": "H" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `t` | string | Local time of the extreme (`YYYY-MM-DD HH:MM`) |
+| `v` | string | Predicted height at the extreme (ft, relative to MLLW) |
+| `type` | string | `H` (high) or `L` (low) |
+
+**Fallback chain.** NOAA's predictions engine goes down platform-wide for days
+at a time (it returns HTTP 200 with a misleading `"No Predictions data was
+found"` body). To keep the display from ever blanking to N/A, the endpoint
+degrades through three tiers and **always returns valid JSON**:
+
+1. **Live NOAA** — fetched and cached (1 day).
+2. **Stale cache** — the last good fetch, served for up to ~25 days.
+3. **Local harmonic prediction** — computed offline from the station's own
+   published harmonic constituents (fetched once from NOAA's metadata API and
+   cached to `harmonics_<station>.json`). See below.
+
+If all three are unavailable it returns `{"predictions": [], "upstream_error": <status>}`.
+
+### Optional: local offline fallback (`pytides`)
+
+Tier 3 is optional and self-contained. If its venv isn't set up, the endpoint
+simply skips it (tiers 1–2 still work). To enable it:
+
+```sh
+cd proxy
+python3 -m venv tide_venv
+./tide_venv/bin/pip install -r tide-requirements.txt
+```
+
+`proxy/tide_predict.py` runs in that venv as a **short-lived subprocess** (never
+imported into the always-on proxy — numpy/scipy stay out of its resident
+memory), computing hi/lo extrema from NOAA's published constituents with no
+network at all. The constituents are bootstrapped automatically: after any
+successful live fetch, and also on-demand from NOAA's metadata/`harcon`
+endpoint (which usually stays up even when the predictions engine is down).
 
 ---
 
@@ -458,6 +528,7 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
   "bbox":      0.1,
 
   "openweather_key":        "YOUR_OPENWEATHERMAP_API_KEY",
+  "noaa_station":           "8443970",
   "opensky_client_id":      "YOUR_OPENSKY_CLIENT_ID",
   "opensky_client_secret":  "YOUR_OPENSKY_CLIENT_SECRET",
   "aisstream_key":          "YOUR_AISSTREAM_API_KEY",
@@ -470,6 +541,7 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
 | `latitude` / `longitude` | All endpoints | Home location — center of the plane bounding box, the AIS subscription box, and ship distance calculations |
 | `bbox` | `/api/planes` | Half-width of the plane search box in degrees (default `0.1` ≈ 7 mi) |
 | `openweather_key` | `/api/forecast` | OpenWeatherMap API key |
+| `noaa_station` | `/api/tides` | Default NOAA CO-OPS station when the device omits `?station=`. Must be a harmonic/reference station (not a subordinate/offset-only one). No API key needed. |
 | `opensky_client_id` / `opensky_client_secret` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky OAuth2 client credentials (generate at opensky-network.org → Account → API Client). The proxy exchanges them for short-lived bearer tokens automatically. |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). If missing, falls back to OpenSky / adsbdb. |

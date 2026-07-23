@@ -744,6 +744,14 @@ def handle_tides(params):
     # happening during an outage) — fall back to predictions computed
     # locally from NOAA's own published harmonic constituents. Less
     # precise than NOAA's live engine, but needs no network at all.
+    #
+    # Ensure the constituents are cached first. Normally that happened after
+    # a past successful live fetch, but on a fresh install whose very first
+    # requests all land during an outage, it never did — and NOAA's separate
+    # metadata/harcon endpoint tends to stay up even when the predictions
+    # engine is down, so we can still bootstrap here and self-heal. No-ops if
+    # already cached.
+    _fetch_and_cache_harmonics(station)
     local = _local_harmonic_predict(station, today, end)
     if local:
         cache_set(cache_key, local, age_override=TIDE_CACHE_SEC)
