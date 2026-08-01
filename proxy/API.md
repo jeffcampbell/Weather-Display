@@ -295,6 +295,48 @@ endpoint (which usually stays up even when the predictions engine is down).
 
 ---
 
+## v2 API — named locations (`GET /api/v2/...`)
+
+The v2 endpoints add per-location support keyed by a `?loc=<name>` parameter that
+resolves against the `locations` block in `config.json`. Each entry supplies
+`lat`, `lon`, and `bbox` (omitted keys fall back to the top-level globals). The v1
+endpoints are untouched and keep using the single `latitude`/`longitude`/`bbox`
+config, so existing devices keep working unchanged. Only planes, forecast, and sky
+are offered in v2 — ships/route/aircraft/time/health/devicelog are
+location-independent (or single-bbox by design) and are not duplicated.
+
+**Common query parameter:**
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| `loc` | yes | Name of an entry in the `locations` config block, e.g. `beach` |
+
+An unknown or missing `loc` returns `400` with `{"error": ..., "available": [...]}`
+listing the configured location names.
+
+### `GET /api/v2/planes`
+
+Per-location aircraft fetch. Same response shape as `/api/planes`. Cached 90 s per
+location (vs. 55 s in v1) to halve OpenSky burn across locations, and it honours the
+same OpenSky 429 backoff as v1 (empty `rate_limited` body while throttled).
+
+### `GET /api/v2/forecast`
+
+Per-location 3-day forecast. Same response shape as `/api/forecast`. Requires
+`openweather_key`.
+
+### `GET /api/v2/sky`
+
+Tonight's naked-eye planet visibility for the location, plus sun, moon, and cloud
+outlook, computed locally with `skyfield`. Returns `503` with
+`{"error": "skyfield unavailable", ...}` if the astronomy dependency isn't installed
+on the proxy. Response includes `tonight` (ISO date), `cond`/`cloud_score` (from the
+evening forecast), `sun`/`moon` (altitude, azimuth, illumination/phase), and a
+`planets` array with each visible planet's best altitude/azimuth/time, rise/set, and
+magnitude-based brightness label.
+
+---
+
 ## `GET /api/ships`
 
 Returns nearby vessels from the live AIS WebSocket feed (aisstream.io). Filters: must have a name, must have a valid position fix, length must be ≥30 m if reported, distance must be ≤10 mi from the configured location. Sorted nearest-first.

@@ -5,6 +5,11 @@
   "longitude": -71.06,
   "bbox": 0.1,
 
+  "_locations_comment": "Named locations for the /api/v2 endpoints (?loc=<name>). The v1 endpoints ignore this and keep using latitude/longitude/bbox above. Each entry may set lat, lon, and bbox; omitted keys fall back to the globals.",
+  "locations": {
+    "home": { "lat": 42.36, "lon": -71.06, "bbox": 0.1 }
+  },
+
   "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",
 
   "_noaa_station_comment": "Default NOAA CO-OPS station for /api/tides if the device omits ?station=. Must be a harmonic/reference station (has full predictions), not a subordinate/offset-only station.",
