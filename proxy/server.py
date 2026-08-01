@@ -15,6 +15,7 @@ Usage:
 """
 
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -55,6 +56,35 @@ DEVICE_SECRET = _config.get("device_secret", "")
 LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
+
+# Named locations for the v2 API. v1 endpoints ignore this and continue using
+# the LATITUDE/LONGITUDE/BBOX globals above — leaving v1 behavior untouched.
+LOCATIONS = _config.get("locations") or {}
+
+
+def resolve_location(params):
+    """Resolve ?loc=<name> against the LOCATIONS config block. Returns
+    (lat, lon, bbox, name) on success or (None, None, None, error_body) on
+    failure, where error_body is a bytes JSON payload ready to return."""
+    loc = params.get("loc", [""])[0].strip()
+    if not loc:
+        return None, None, None, json.dumps({
+            "error": "missing loc",
+            "available": sorted(LOCATIONS.keys()),
+        }).encode()
+    entry = LOCATIONS.get(loc)
+    if not entry:
+        return None, None, None, json.dumps({
+            "error": "unknown location",
+            "loc": loc,
+            "available": sorted(LOCATIONS.keys()),
+        }).encode()
+    return (
+        float(entry.get("lat", LATITUDE)),
+        float(entry.get("lon", LONGITUDE)),
+        float(entry.get("bbox", BBOX)),
+        loc,
+    )
 
 # ---------------------------------------------------------------------------
 # Cache
@@ -365,28 +395,81 @@ def handle_planes(params):
         return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
 
 
+ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
+ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
+
+# A bare N-number is a tail registration, not a flight ident. FlightAware's
+# /flights/{ident} essentially never resolves these to a scheduled route, and
+# GA aircraft loiter in the bbox for hours, so querying them is pure spend.
+def _is_ga_registration(callsign):
+    return callsign[:1] == "N" and callsign[1:2].isdigit()
+
+
 def handle_route(params):
     """Proxy route + aircraft type lookup. Falls through:
-        FlightAware (real-time, paid)  ->  OpenSky routes  ->  adsbdb
-    FlightAware data reflects what the aircraft is *actually* doing right now,
-    whereas the OpenSky/adsbdb route DBs return scheduled-callsign data which
-    can be stale or wrong (e.g. callsign reused later in the day for a
-    different leg). Cached for 1 hour per callsign+icao24 pair."""
+        OpenSky routes  ->  adsbdb  ->  FlightAware (real-time, paid)
+
+    The free scheduled-route DBs are tried first; FlightAware is the paid
+    last resort, consulted only when neither has an answer. Its data is the
+    most accurate — it reflects what the aircraft is *actually* doing right
+    now, whereas the DBs return scheduled-callsign data that can be stale or
+    wrong (e.g. callsign reused later in the day for a different leg) — but
+    at roughly a cent a query it isn't worth spending when a free source
+    already answered.
+
+    Both outcomes are cached per callsign+icao24 pair: hits for 1h, misses
+    for 6h. Caching the misses matters more than caching the hits — the
+    device re-polls every ~60s, and an uncached miss meant a fresh billable
+    FlightAware call on every single poll for as long as the plane stayed in
+    the bbox."""
 
     callsign = params.get("callsign", [""])[0].strip()
     icao24 = params.get("icao24", [""])[0].strip()
     if not callsign:
         return 400, json.dumps({"error": "missing callsign"}).encode()
 
+    not_found = json.dumps({"error": "route not found", "callsign": callsign}).encode()
+
     cache_key = f"route:{callsign}:{icao24}" if icao24 else f"route:{callsign}"
-    cached = cache_get(cache_key, max_age_sec=3600)
+    cached = cache_get(cache_key, max_age_sec=ROUTE_CACHE_TTL_HIT)
     if cached:
-        return 200, cached
+        # Misses are cached too, so a hit isn't automatically a 200.
+        try:
+            if json.loads(cached).get("route"):
+                return 200, cached
+        except Exception:
+            pass
+        return 404, not_found
 
     result = {"callsign": callsign, "route": [], "typecode": "", "registration": ""}
 
-    # 1. FlightAware AeroAPI — real-time flight data. Best accuracy.
-    if FLIGHTAWARE_KEY:
+    # 1. OpenSky route DB (scheduled, free)
+    url = f"https://opensky-network.org/api/routes?callsign={callsign}"
+    status, data = fetch(url, headers=opensky_headers())
+    if status == 200 and data:
+        try:
+            route_data = json.loads(data)
+            result["route"] = route_data.get("route", [])
+        except Exception:
+            pass
+
+    # 2. adsbdb (scheduled, free, alt source)
+    if not result["route"]:
+        ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
+        ads_status, ads_data = fetch(ads_url)
+        if ads_status == 200 and ads_data:
+            try:
+                ads = json.loads(ads_data)
+                fr = ads.get("response", {}).get("flightroute", {})
+                origin_icao = fr.get("origin", {}).get("icao_code", "")
+                dest_icao = fr.get("destination", {}).get("icao_code", "")
+                if origin_icao and dest_icao:
+                    result["route"] = [origin_icao, dest_icao]
+            except Exception:
+                pass
+
+    # 3. FlightAware AeroAPI — paid, best accuracy. Last resort only.
+    if not result["route"] and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
         fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
         if fa_status == 200 and fa_data:
@@ -417,32 +500,6 @@ def handle_route(params):
             except Exception as e:
                 print(f"FlightAware parse err for {callsign}: {e}")
 
-    # 2. OpenSky route DB (scheduled)
-    if not result["route"]:
-        url = f"https://opensky-network.org/api/routes?callsign={callsign}"
-        status, data = fetch(url, headers=opensky_headers())
-        if status == 200 and data:
-            try:
-                route_data = json.loads(data)
-                result["route"] = route_data.get("route", [])
-            except Exception:
-                pass
-
-    # 3. adsbdb (scheduled, alt source)
-    if not result["route"]:
-        ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
-        ads_status, ads_data = fetch(ads_url)
-        if ads_status == 200 and ads_data:
-            try:
-                ads = json.loads(ads_data)
-                fr = ads.get("response", {}).get("flightroute", {})
-                origin_icao = fr.get("origin", {}).get("icao_code", "")
-                dest_icao = fr.get("destination", {}).get("icao_code", "")
-                if origin_icao and dest_icao:
-                    result["route"] = [origin_icao, dest_icao]
-            except Exception:
-                pass
-
     # Fetch aircraft type from hexdb.io (free, no auth, reliable)
     if icao24:
         ac_cache_key = f"aircraft:{icao24}"
@@ -470,7 +527,10 @@ def handle_route(params):
     if result["route"]:
         cache_set(cache_key, body)
         return 200, body
-    return 404, json.dumps({"error": "route not found", "callsign": callsign}).encode()
+    # Cache the miss as well, on a longer TTL, so a plane with no resolvable
+    # route doesn't re-run this whole chain once a minute while it loiters.
+    cache_set(cache_key, body, age_override=ROUTE_CACHE_TTL_MISS)
+    return 404, not_found
 
 
 def handle_aircraft(params):
@@ -584,6 +644,357 @@ def handle_forecast(params):
 
 
 # ---------------------------------------------------------------------------
+# v2 API handlers
+# ---------------------------------------------------------------------------
+# v2 adds per-location support for planes + forecast, keyed by named entries
+# in the "locations" config block. v1 handlers above are untouched so existing
+# devices keep working unchanged. Ships and route/aircraft/time/health/devicelog
+# are not duplicated in v2 — devices using v2 still hit the v1 versions for
+# those (location-independent or single-bbox by design).
+
+V2_PLANES_CACHE_TTL = 90  # vs. 55s in v1 — halves OpenSky burn per location
+
+
+def handle_v2_planes(params):
+    """Per-location aircraft fetch. Same response shape as /api/planes."""
+
+    lat, lon, bbox, loc_or_err = resolve_location(params)
+    if lat is None:
+        return 400, loc_or_err
+
+    cache_key = f"v2:planes:{loc_or_err}"
+    cached = cache_get(cache_key, max_age_sec=V2_PLANES_CACHE_TTL)
+    if cached:
+        return 200, cached
+
+    # Respect the v1 OpenSky backoff streak — if the home location is being
+    # throttled, the second location is on the same OAuth2 quota and will hit
+    # 429s too. Cache an empty rate_limited body per loc so we don't burn the
+    # account's remaining credits hammering upstream.
+    if _opensky_429_streak > 0:
+        backoff_secs = 7200 if _opensky_429_streak >= 2 else 3600
+        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
+        cache_set(cache_key, empty, age_override=backoff_secs)
+        return 200, empty
+
+    url = (
+        f"https://opensky-network.org/api/states/all"
+        f"?lamin={lat-bbox}&lomin={lon-bbox}"
+        f"&lamax={lat+bbox}&lomax={lon+bbox}"
+    )
+    status, data = fetch(url, headers=opensky_headers())
+
+    if status == 429:
+        # Mirror v1's backoff: empty rate_limited body, 1h floor. We don't
+        # mutate _opensky_429_streak from v2 — v1 owns that counter.
+        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
+        cache_set(cache_key, empty, age_override=3600)
+        _log_proxy_event(f"OpenSky 429 on v2 planes (loc={loc_or_err}) — backing off 1h")
+        return 200, empty
+
+    if status != 200:
+        return 200, json.dumps({"time": 0, "planes": [], "upstream_error": status}).encode()
+
+    try:
+        raw = json.loads(data)
+        states = raw.get("states") or []
+        planes = []
+        for s in states:
+            try:
+                if s[8]:
+                    continue
+                callsign = (s[1] or "").strip()
+                if not callsign:
+                    continue
+                alt_m = s[7] or s[13] or 0
+                entry = [
+                    callsign[:8],
+                    s[0] or "",
+                    int(alt_m * 3.281),
+                    int((s[9] or 0) * 1.944),
+                    int(s[10] or 0),
+                    int(s[11] or 0),
+                ]
+                planes.append(entry)
+            except Exception:
+                continue
+        body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
+        cache_set(cache_key, body, age_override=V2_PLANES_CACHE_TTL)
+        return 200, body
+    except Exception as e:
+        return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
+
+
+def handle_v2_forecast(params):
+    """Per-location 3-day forecast. Same response shape as /api/forecast."""
+
+    if not OWM_KEY:
+        return 500, json.dumps({"error": "no openweather_key configured"}).encode()
+
+    lat, lon, _bbox, loc_or_err = resolve_location(params)
+    if lat is None:
+        return 400, loc_or_err
+
+    cache_key = f"v2:forecast:{loc_or_err}"
+    cached = cache_get(cache_key, max_age_sec=3600)
+    if cached:
+        return 200, cached
+
+    # Delegate to the v1 forecast handler by passing lat/lon overrides — it
+    # already accepts those and keys its own cache on (lat,lon). We then
+    # mirror the result into the v2 cache so v2 callers don't have to wait
+    # on a v1 cache miss next time.
+    status, body = handle_forecast({"lat": [str(lat)], "lon": [str(lon)]})
+    if status == 200:
+        cache_set(cache_key, body, age_override=3600)
+    return status, body
+
+
+# ---------------------------------------------------------------------------
+# v2 Sky — naked-eye planet visibility for the upcoming evening, with cloud
+# verdict from the location's forecast. Powered by JPL DE421 via skyfield.
+# Skyfield is lazy-loaded so a missing install only affects /api/v2/sky;
+# all other endpoints stay up.
+# ---------------------------------------------------------------------------
+
+_sky_loaded   = False
+_sky_load_err = ""
+_sky_ts       = None
+_sky_eph      = None
+_sky_lock     = Lock()
+
+# Per-planet meta: human name, 4-char abbr, skyfield ephemeris key, typical
+# magnitude (mid-cycle), brightness label. Mag is informational only — used
+# to colour the "Bright/Dim" word the device shows beneath the planet glyph.
+_PLANET_META = (
+    ("Mercury", "Merc",  "mercury",            0.0),
+    ("Venus",   "Venus", "venus",             -4.0),
+    ("Mars",    "Mars",  "mars",               0.0),
+    ("Jupiter", "Jup",   "jupiter barycenter", -2.2),
+    ("Saturn",  "Sat",   "saturn barycenter",  0.5),
+)
+
+
+def _ensure_skyfield():
+    """Lazy-load skyfield + de421.bsp once per process. Idempotent; returns
+    True on success. On failure the error string is stored in _sky_load_err
+    so the handler can include it in the 500 response (helpful for debugging
+    a freshly-installed proxy)."""
+    global _sky_loaded, _sky_load_err, _sky_ts, _sky_eph
+    if _sky_loaded:
+        return True
+    with _sky_lock:
+        if _sky_loaded:
+            return True
+        try:
+            from skyfield.api import Loader
+            loader = Loader(str(Path(__file__).parent / "skyfield_data"))
+            _sky_ts  = loader.timescale()
+            _sky_eph = loader("de421.bsp")
+            _sky_loaded = True
+            return True
+        except Exception as e:
+            _sky_load_err = str(e)
+            _log_proxy_event(f"skyfield load failed: {e}")
+            return False
+
+
+_COMPASS_8 = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def _compass(az_deg):
+    """8-point compass label for an azimuth in degrees (0=N, 90=E, …)."""
+    return _COMPASS_8[int((az_deg + 22.5) % 360 // 45)]
+
+
+def _cloud_verdict(cond_id):
+    """OWM condition ID -> short viewing-condition label."""
+    if cond_id == 800:               return "Clear"
+    if 801 <= cond_id <= 802:        return "Hazy"
+    if 803 <= cond_id <= 804:        return "Cloudy"
+    return "Overcast"                # rain/snow/storm/fog/etc — no chance
+
+
+def _brightness_label(mag):
+    """Naked-eye brightness bucket. Roughly matches everyday descriptors."""
+    if mag < -2: return "Brilliant"
+    if mag <  0: return "Bright"
+    if mag <  2: return "Visible"
+    return "Faint"
+
+
+def _local_tz_offset():
+    """Same convention as handle_time: seconds to add to UTC for local."""
+    is_dst = time.localtime().tm_isdst > 0
+    return -time.altzone if is_dst else -time.timezone
+
+
+def _evening_window_utc(tz_offset):
+    """UTC (start, end) for tonight's viewing window. Evening starts 19:00
+    local on the "current evening's" date and runs 7 hours to 02:00 local.
+    Before 06:00 local we treat tonight as the evening that just began
+    yesterday (so 03:00 callers still get tonight's data, not tomorrow's)."""
+    import datetime
+    now_utc = time.time()
+    local_dt = datetime.datetime.utcfromtimestamp(now_utc + tz_offset)
+    tonight_date = local_dt.date() if local_dt.hour >= 6 \
+                   else local_dt.date() - datetime.timedelta(days=1)
+    # Local 19:00 expressed as UTC: build datetime as if in UTC, then subtract offset
+    start_local_dt = datetime.datetime.combine(tonight_date, datetime.time(19, 0))
+    start_utc = int(start_local_dt.replace(tzinfo=datetime.timezone.utc).timestamp()) - tz_offset
+    return tonight_date.isoformat(), start_utc, start_utc + 7 * 3600
+
+
+def _hhmm_local(unix_t, tz_offset):
+    """Unix seconds (UTC) -> 'HH:MM' string in the proxy's local TZ."""
+    import datetime
+    local_dt = datetime.datetime.utcfromtimestamp(unix_t + tz_offset)
+    return local_dt.strftime("%H:%M")
+
+
+def _tonight_clouds(lat, lon):
+    """Pull tonight's cond_id from the existing forecast pipeline (cached
+    there as well, so this adds no upstream traffic on a warm cache)."""
+    status, body = handle_forecast({"lat": [str(lat)], "lon": [str(lon)]})
+    if status != 200:
+        return 800, "Clear"          # fail open — better to show planets than nothing
+    try:
+        fc = json.loads(body)
+        days = fc.get("days") or []
+        if not days:
+            return 800, "Clear"
+        today = days[0]
+        return int(today.get("cond_id", 800)), today.get("cond", "Clear")
+    except Exception:
+        return 800, "Clear"
+
+
+def handle_v2_sky(params):
+    """Tonight's naked-eye planet visibility for a named location, bundled
+    with a cloud verdict. Same response is good for the whole evening (6h
+    cache) — planet altaz changes slowly and we never need sub-minute
+    precision for 'is Jupiter up tonight'."""
+
+    lat, lon, _bbox, loc_or_err = resolve_location(params)
+    if lat is None:
+        return 400, loc_or_err
+
+    cache_key = f"v2:sky:{loc_or_err}"
+    cached = cache_get(cache_key, max_age_sec=15 * 60)   # 15 min — sun/moon move
+    if cached:
+        return 200, cached
+
+    if not _ensure_skyfield():
+        return 500, json.dumps({
+            "error": "skyfield unavailable",
+            "detail": _sky_load_err,
+        }).encode()
+
+    from skyfield.api import wgs84
+    tz_offset = _local_tz_offset()
+    tonight_iso, start_utc, end_utc = _evening_window_utc(tz_offset)
+
+    observer = _sky_eph["earth"] + wgs84.latlon(lat, lon)
+    sun_target = _sky_eph["sun"]
+
+    # 30-min sampling — ~15 samples covers the 7h window, more than enough
+    # to localize peak altitude. Sun altitude evaluated once per step.
+    times_unix = []
+    sun_alts   = []
+    t = start_utc
+    while t <= end_utc:
+        times_unix.append(t)
+        gm = time.gmtime(t)
+        skyt = _sky_ts.utc(gm.tm_year, gm.tm_mon, gm.tm_mday, gm.tm_hour, gm.tm_min)
+        sun_alt, _, _ = observer.at(skyt).observe(sun_target).apparent().altaz()
+        sun_alts.append(sun_alt.degrees)
+        t += 1800
+
+    planets_out = []
+    for name, abbr, eph_key, typ_mag in _PLANET_META:
+        target = _sky_eph[eph_key]
+        best_alt = -90.0
+        best_az  = 0.0
+        best_t   = None
+        rise_t = set_t = None
+        prev_alt = None
+        for i, t in enumerate(times_unix):
+            # Only count samples in usable twilight or darker
+            if sun_alts[i] > -6:
+                prev_alt = None
+                continue
+            gm = time.gmtime(t)
+            skyt = _sky_ts.utc(gm.tm_year, gm.tm_mon, gm.tm_mday, gm.tm_hour, gm.tm_min)
+            alt, az, _ = observer.at(skyt).observe(target).apparent().altaz()
+            a = alt.degrees
+            if prev_alt is not None:
+                if prev_alt < 0 <= a:
+                    rise_t = t
+                if prev_alt >= 0 > a:
+                    set_t = t
+            if a > best_alt:
+                best_alt, best_az, best_t = a, az.degrees, t
+            prev_alt = a
+
+        if best_alt >= 10:           # "easily visible" threshold
+            planets_out.append({
+                "name":      name,
+                "abbr":      abbr,
+                "best_alt":  int(round(best_alt)),
+                "best_az":   int(round(best_az)) % 360,
+                "best_dir":  _compass(best_az),
+                "best_time": _hhmm_local(best_t, tz_offset) if best_t else "",
+                "rise":      _hhmm_local(rise_t, tz_offset) if rise_t else "",
+                "set":       _hhmm_local(set_t,  tz_offset) if set_t  else "",
+                "mag":       typ_mag,
+                "bright":    _brightness_label(typ_mag),
+            })
+
+    cond_id, cond_str = _tonight_clouds(lat, lon)
+
+    # Current sun + moon altaz so the device can show them on the chart and
+    # decide whether to render a star field (sun below civil twilight).
+    now_t = _sky_ts.now()
+    sun_alt, sun_az, _ = observer.at(now_t).observe(_sky_eph["sun"]).apparent().altaz()
+    moon_alt, moon_az, _ = observer.at(now_t).observe(_sky_eph["moon"]).apparent().altaz()
+
+    # Moon illumination — angle between sun and moon as seen from earth.
+    # cos(elongation) → illum = (1 - cos(e)) / 2.  Skyfield's almanac has
+    # fraction_illuminated but we compute it here so we don't add a dep.
+    sun_vec  = observer.at(now_t).observe(_sky_eph["sun"]).apparent()
+    moon_vec = observer.at(now_t).observe(_sky_eph["moon"]).apparent()
+    elong = sun_vec.separation_from(moon_vec).radians
+    moon_illum = (1 - math.cos(elong)) / 2
+
+    # Synodic phase (0=new, 0.25=1Q waxing, 0.5=full, 0.75=3Q waning) via
+    # the almanac. Lets the device pick crescent direction without having
+    # to do its own ecliptic-longitude math.
+    from skyfield import almanac
+    moon_phase = (almanac.moon_phase(_sky_eph, now_t).degrees / 360.0) % 1.0
+
+    body = json.dumps({
+        "tonight":     tonight_iso,
+        "cond":        cond_str,
+        "cond_id":     cond_id,
+        "cloud_score": _cloud_verdict(cond_id),
+        "sun": {
+            "alt": int(round(sun_alt.degrees)),
+            "az":  int(round(sun_az.degrees)) % 360,
+        },
+        "moon": {
+            "alt":    int(round(moon_alt.degrees)),
+            "az":     int(round(moon_az.degrees)) % 360,
+            "illum":  round(float(moon_illum), 2),
+            "phase":  round(float(moon_phase), 3),
+            "waxing": bool(moon_phase < 0.5),   # numpy → python bool
+        },
+        "planets":     planets_out,
+    }).encode()
+    cache_set(cache_key, body, age_override=15 * 60)
+    return 200, body
+
+
+# ---------------------------------------------------------------------------
 # AIS Ship Tracking — WebSocket listener + HTTP endpoint
 # ---------------------------------------------------------------------------
 
@@ -665,14 +1076,27 @@ SHIP_CENTER_LAT = LATITUDE   # center of ship search radius (same as home locati
 SHIP_CENTER_LON = LONGITUDE
 SHIP_MAX_MILES = 10    # only show ships within this radius
 
+# Decades 4-9 each map to a single category, so bucketing by tens digit works.
 AIS_TYPE_NAMES = {
-    3: "Fishing", 4: "HighSpeed", 5: "Special",
+    4: "HighSpeed", 5: "Special",
     6: "Passenger", 7: "Cargo", 8: "Tanker", 9: "Other",
+}
+
+# Decade 3 (30-39) is NOT one category — each code is a distinct vessel kind.
+# Bucketing it by tens digit mislabels sailing/pleasure/etc. craft as "Fishing".
+AIS_TYPE_NAMES_30S = {
+    30: "Fishing", 31: "Towing", 32: "Towing", 33: "Dredging",
+    34: "Diving", 35: "Military", 36: "Sailing", 37: "Pleasure",
+    # 38, 39 are reserved — fall through to "Vessel".
 }
 
 def get_ship_type(ais_type):
     """Map AIS type integer (0-99) to category name."""
-    decade = ais_type // 10 if ais_type else 0
+    if not ais_type:
+        return "Vessel"
+    if ais_type in AIS_TYPE_NAMES_30S:
+        return AIS_TYPE_NAMES_30S[ais_type]
+    decade = ais_type // 10
     return AIS_TYPE_NAMES.get(decade, "Vessel")
 
 def _distance_miles(lat1, lon1, lat2, lon2):
@@ -985,6 +1409,9 @@ ROUTES = {
     "/api/route":       handle_route,
     "/api/aircraft":    handle_aircraft,
     "/api/forecast":    handle_forecast,
+    "/api/v2/planes":   handle_v2_planes,
+    "/api/v2/forecast": handle_v2_forecast,
+    "/api/v2/sky":      handle_v2_sky,
     "/api/ships":       handle_ships,
     "/api/ships/debug": handle_ships_debug,
     "/api/sightings":   handle_sightings,
