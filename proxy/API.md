@@ -88,7 +88,7 @@ The endpoint always returns valid JSON with status 200 even on upstream failure,
 
 ## `GET /api/route`
 
-Looks up a flight's route (origin → destination airports) and aircraft type. Tries three upstreams in order: FlightAware AeroAPI (real-time, paid), OpenSky route DB, then adsbdb. Aircraft type/registration come from hexdb.io (or FlightAware if it had them).
+Looks up a flight's route (origin → destination airports) and aircraft type. Tries three upstreams in order, cheapest first: OpenSky route DB (free), adsbdb (free), then FlightAware AeroAPI (real-time, paid) as a last resort — consulted only when neither free source has an answer, and skipped entirely for bare N-number GA registrations, which it essentially never resolves. Aircraft type/registration come from hexdb.io (or FlightAware if it had them).
 
 **Query parameters:**
 
@@ -97,12 +97,12 @@ Looks up a flight's route (origin → destination airports) and aircraft type. T
 | `callsign` | yes | Flight callsign, e.g. `AAL1563` |
 | `icao24` | no | Aircraft hex code — enables type/registration lookup |
 
-**Cache TTL:** 1 hour per `callsign[+icao24]` pair. Aircraft metadata cached 24 hours per ICAO24.
+**Cache TTL:** resolved routes are cached 1 hour per `callsign[+icao24]` pair; misses ("route not found") are cached 6 hours. Caching the miss matters most — the device re-polls every ~60 s, and an uncached miss meant a fresh billable FlightAware call on every poll for as long as the plane loitered in the bbox. Aircraft metadata cached 24 hours per ICAO24.
 
 **Upstreams (in order):**
-- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (only if `flightaware_key` is configured)
 - `https://opensky-network.org/api/routes?callsign=...`
 - `https://api.adsbdb.com/v0/callsign/...`
+- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (only if `flightaware_key` is configured and the callsign is not a bare N-number)
 - `https://hexdb.io/api/v1/aircraft/{icao24}` (type + registration)
 
 **Success response (200):**
@@ -544,7 +544,7 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
 | `noaa_station` | `/api/tides` | Default NOAA CO-OPS station when the device omits `?station=`. Must be a harmonic/reference station (not a subordinate/offset-only one). No API key needed. |
 | `opensky_client_id` / `opensky_client_secret` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky OAuth2 client credentials (generate at opensky-network.org → Account → API Client). The proxy exchanges them for short-lived bearer tokens automatically. |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
-| `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). If missing, falls back to OpenSky / adsbdb. |
+| `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Used only as a last resort after the free OpenSky / adsbdb lookups; if missing, those are the only route sources. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).

@@ -367,28 +367,81 @@ def handle_planes(params):
         return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
 
 
+ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
+ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
+
+# A bare N-number is a tail registration, not a flight ident. FlightAware's
+# /flights/{ident} essentially never resolves these to a scheduled route, and
+# GA aircraft loiter in the bbox for hours, so querying them is pure spend.
+def _is_ga_registration(callsign):
+    return callsign[:1] == "N" and callsign[1:2].isdigit()
+
+
 def handle_route(params):
     """Proxy route + aircraft type lookup. Falls through:
-        FlightAware (real-time, paid)  ->  OpenSky routes  ->  adsbdb
-    FlightAware data reflects what the aircraft is *actually* doing right now,
-    whereas the OpenSky/adsbdb route DBs return scheduled-callsign data which
-    can be stale or wrong (e.g. callsign reused later in the day for a
-    different leg). Cached for 1 hour per callsign+icao24 pair."""
+        OpenSky routes  ->  adsbdb  ->  FlightAware (real-time, paid)
+
+    The free scheduled-route DBs are tried first; FlightAware is the paid
+    last resort, consulted only when neither has an answer. Its data is the
+    most accurate — it reflects what the aircraft is *actually* doing right
+    now, whereas the DBs return scheduled-callsign data that can be stale or
+    wrong (e.g. callsign reused later in the day for a different leg) — but
+    at roughly a cent a query it isn't worth spending when a free source
+    already answered.
+
+    Both outcomes are cached per callsign+icao24 pair: hits for 1h, misses
+    for 6h. Caching the misses matters more than caching the hits — the
+    device re-polls every ~60s, and an uncached miss meant a fresh billable
+    FlightAware call on every single poll for as long as the plane stayed in
+    the bbox."""
 
     callsign = params.get("callsign", [""])[0].strip()
     icao24 = params.get("icao24", [""])[0].strip()
     if not callsign:
         return 400, json.dumps({"error": "missing callsign"}).encode()
 
+    not_found = json.dumps({"error": "route not found", "callsign": callsign}).encode()
+
     cache_key = f"route:{callsign}:{icao24}" if icao24 else f"route:{callsign}"
-    cached = cache_get(cache_key, max_age_sec=3600)
+    cached = cache_get(cache_key, max_age_sec=ROUTE_CACHE_TTL_HIT)
     if cached:
-        return 200, cached
+        # Misses are cached too, so a hit isn't automatically a 200.
+        try:
+            if json.loads(cached).get("route"):
+                return 200, cached
+        except Exception:
+            pass
+        return 404, not_found
 
     result = {"callsign": callsign, "route": [], "typecode": "", "registration": ""}
 
-    # 1. FlightAware AeroAPI — real-time flight data. Best accuracy.
-    if FLIGHTAWARE_KEY:
+    # 1. OpenSky route DB (scheduled, free)
+    url = f"https://opensky-network.org/api/routes?callsign={callsign}"
+    status, data = fetch(url, headers=opensky_headers())
+    if status == 200 and data:
+        try:
+            route_data = json.loads(data)
+            result["route"] = route_data.get("route", [])
+        except Exception:
+            pass
+
+    # 2. adsbdb (scheduled, free, alt source)
+    if not result["route"]:
+        ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
+        ads_status, ads_data = fetch(ads_url)
+        if ads_status == 200 and ads_data:
+            try:
+                ads = json.loads(ads_data)
+                fr = ads.get("response", {}).get("flightroute", {})
+                origin_icao = fr.get("origin", {}).get("icao_code", "")
+                dest_icao = fr.get("destination", {}).get("icao_code", "")
+                if origin_icao and dest_icao:
+                    result["route"] = [origin_icao, dest_icao]
+            except Exception:
+                pass
+
+    # 3. FlightAware AeroAPI — paid, best accuracy. Last resort only.
+    if not result["route"] and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
         fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
         if fa_status == 200 and fa_data:
@@ -419,32 +472,6 @@ def handle_route(params):
             except Exception as e:
                 print(f"FlightAware parse err for {callsign}: {e}")
 
-    # 2. OpenSky route DB (scheduled)
-    if not result["route"]:
-        url = f"https://opensky-network.org/api/routes?callsign={callsign}"
-        status, data = fetch(url, headers=opensky_headers())
-        if status == 200 and data:
-            try:
-                route_data = json.loads(data)
-                result["route"] = route_data.get("route", [])
-            except Exception:
-                pass
-
-    # 3. adsbdb (scheduled, alt source)
-    if not result["route"]:
-        ads_url = f"https://api.adsbdb.com/v0/callsign/{callsign}"
-        ads_status, ads_data = fetch(ads_url)
-        if ads_status == 200 and ads_data:
-            try:
-                ads = json.loads(ads_data)
-                fr = ads.get("response", {}).get("flightroute", {})
-                origin_icao = fr.get("origin", {}).get("icao_code", "")
-                dest_icao = fr.get("destination", {}).get("icao_code", "")
-                if origin_icao and dest_icao:
-                    result["route"] = [origin_icao, dest_icao]
-            except Exception:
-                pass
-
     # Fetch aircraft type from hexdb.io (free, no auth, reliable)
     if icao24:
         ac_cache_key = f"aircraft:{icao24}"
@@ -472,7 +499,10 @@ def handle_route(params):
     if result["route"]:
         cache_set(cache_key, body)
         return 200, body
-    return 404, json.dumps({"error": "route not found", "callsign": callsign}).encode()
+    # Cache the miss as well, on a longer TTL, so a plane with no resolvable
+    # route doesn't re-run this whole chain once a minute while it loiters.
+    cache_set(cache_key, body, age_override=ROUTE_CACHE_TTL_MISS)
+    return 404, not_found
 
 
 def handle_aircraft(params):
