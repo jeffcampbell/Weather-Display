@@ -102,8 +102,10 @@ Looks up a flight's route (origin → destination airports) and aircraft type. T
 **Upstreams (in order):**
 - `https://opensky-network.org/api/routes?callsign=...`
 - `https://api.adsbdb.com/v0/callsign/...`
-- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (only if `flightaware_key` is configured and the callsign is not a bare N-number)
+- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (only if `flightaware_key` is configured, the callsign is not a bare N-number, **and the monthly FlightAware quota is not exhausted**)
 - `https://hexdb.io/api/v1/aircraft/{icao24}` (type + registration)
+
+**Monthly spend cap:** FlightAware is the only paid upstream, so billable `/flights` calls are capped per calendar month (UTC) by `flightaware_monthly_limit` (default 450). The count is persisted to `flightaware_usage.json` next to `server.py`, so a proxy restart can't reset it mid-month; only genuinely billable calls count (a non-2xx response is refunded), and it rolls over automatically on the 1st. Once the cap is hit, this endpoint stops consulting FlightAware and serves whatever the free sources found — routes still resolve for most airline callsigns, you just lose the real-time paid fallback until the next month. Current usage is reported by [`GET /api/health`](#get-apihealth) (`flightaware_used` / `flightaware_limit`), which also raises a `flightaware_quota_exhausted` issue when the cap is reached.
 
 **Success response (200):**
 
@@ -521,6 +523,9 @@ Liveness check.
   "issues": ["opensky_rate_limited"],
   "cache_entries": 12,
   "ships_tracked": 3,
+  "flightaware_month": "2026-08",
+  "flightaware_used": 37,
+  "flightaware_limit": 450,
   "uptime_seconds": 8412
 }
 ```
@@ -531,9 +536,12 @@ Liveness check.
 | `issues` | array | Tags for currently-degraded upstreams. Empty array = healthy. |
 | `cache_entries` | int | Active entries in the in-memory cache |
 | `ships_tracked` | int | Total ships in the AIS cache (before filtering) |
+| `flightaware_month` | string | Current billing period (`YYYY-MM`, UTC) the quota is counting against |
+| `flightaware_used` | int | Billable FlightAware `/flights` calls made this month |
+| `flightaware_limit` | int | Configured monthly cap (`flightaware_monthly_limit`) |
 | `uptime_seconds` | int | Seconds since the proxy process started |
 
-Known `issues` values: `opensky_rate_limited`. (List grows as more upstream checks are added.)
+Known `issues` values: `opensky_rate_limited`, `flightaware_quota_exhausted`. (List grows as more upstream checks are added.)
 
 ---
 

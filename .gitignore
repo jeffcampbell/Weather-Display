@@ -4,9 +4,10 @@ device/secrets.py
 device/settings.toml
 proxy/config.json
 
-# Runtime logs
+# Runtime logs / state
 proxy/device.log
 proxy/sightings.db
+proxy/flightaware_usage.json
 
 # Local tide-fallback runtime artifacts (see proxy/API.md → GET /api/tides)
 proxy/tide_venv/

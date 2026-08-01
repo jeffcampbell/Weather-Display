@@ -400,6 +400,89 @@ def handle_planes(params):
 ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
 ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
 
+# --- FlightAware AeroAPI monthly spend cap ---------------------------------
+# AeroAPI bills per successful /flights/{ident} query (~1¢ each). Free sources
+# are tried first and GA tails are skipped, but a runaway — a bug, or just a
+# busy month of unresolvable airline callsigns loitering in the bbox — could
+# still rack up charges. This is a hard monthly ceiling on *billable* calls,
+# persisted to disk (flightaware_usage.json) so a proxy restart can't silently
+# reset it mid-month, and rolled over automatically at the start of each UTC
+# month. Once the cap is hit, handle_route stops consulting FlightAware and
+# serves whatever the free sources found. Default keeps spend under the ~$5/mo
+# free tier at ~1¢/query; override with "flightaware_monthly_limit" in config.
+FLIGHTAWARE_MONTHLY_LIMIT = int(_config.get("flightaware_monthly_limit", 450))
+_FA_USAGE_PATH = Path(__file__).parent / "flightaware_usage.json"
+_fa_usage_lock = Lock()
+_fa_exhausted_logged_period = None
+
+
+def _fa_period():
+    return time.strftime("%Y-%m", time.gmtime())
+
+
+def _fa_usage_read():
+    """This month's usage dict {period, count}, rolling over at the start of a
+    new UTC month. Caller must hold _fa_usage_lock."""
+    try:
+        d = json.loads(_FA_USAGE_PATH.read_text())
+    except Exception:
+        d = {}
+    if d.get("period") != _fa_period():
+        d = {"period": _fa_period(), "count": 0}
+    return d
+
+
+def _fa_usage_write(d):
+    try:
+        _FA_USAGE_PATH.write_text(json.dumps(d))
+    except Exception as e:
+        print(f"FlightAware usage write failed: {e}")
+
+
+def flightaware_usage_status():
+    """(used, limit) for the current month — surfaced on /api/health."""
+    with _fa_usage_lock:
+        return _fa_usage_read().get("count", 0), FLIGHTAWARE_MONTHLY_LIMIT
+
+
+def _flightaware_reserve():
+    """Atomically reserve one billable FlightAware call against the monthly
+    cap. Returns True (and increments) if under the limit, else False. Reserving
+    *before* the call makes the ceiling hard even under concurrent requests."""
+    with _fa_usage_lock:
+        d = _fa_usage_read()
+        if d.get("count", 0) >= FLIGHTAWARE_MONTHLY_LIMIT:
+            return False
+        d["count"] = d.get("count", 0) + 1
+        _fa_usage_write(d)
+        return True
+
+
+def _flightaware_refund():
+    """Return a reserved slot to the pool when the request didn't actually bill
+    (non-2xx response, or a network error before reaching FlightAware)."""
+    with _fa_usage_lock:
+        d = _fa_usage_read()
+        if d.get("count", 0) > 0:
+            d["count"] -= 1
+            _fa_usage_write(d)
+
+
+def _flightaware_note_exhausted():
+    """Log the cap being hit, at most once per month, so the log isn't spammed
+    on every ~60s poll for the rest of the billing period."""
+    global _fa_exhausted_logged_period
+    period = _fa_period()
+    with _fa_usage_lock:
+        if _fa_exhausted_logged_period == period:
+            return
+        _fa_exhausted_logged_period = period
+    _log_proxy_event(
+        f"FlightAware monthly cap of {FLIGHTAWARE_MONTHLY_LIMIT} reached for "
+        f"{period} — serving routes from free sources only until next month"
+    )
+
+
 # A bare N-number is a tail registration, not a flight ident. FlightAware's
 # /flights/{ident} essentially never resolves these to a scheduled route, and
 # GA aircraft loiter in the bbox for hours, so querying them is pure spend.
@@ -470,37 +553,43 @@ def handle_route(params):
             except Exception:
                 pass
 
-    # 3. FlightAware AeroAPI — paid, best accuracy. Last resort only.
+    # 3. FlightAware AeroAPI — paid, best accuracy. Last resort only, and only
+    #    while under the monthly spend cap (FLIGHTAWARE_MONTHLY_LIMIT).
     if not result["route"] and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
-        fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
-        fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
-        if fa_status == 200 and fa_data:
-            try:
-                fa = json.loads(fa_data)
-                # Pick the in-progress flight, else the most recent one.
-                flights = fa.get("flights", []) or []
-                pick = None
-                for f in flights:
-                    if f.get("status", "").lower().startswith("en route") or f.get("actual_off"):
-                        if not f.get("actual_on"):
-                            pick = f
-                            break
-                if pick is None and flights:
-                    pick = flights[0]
-                if pick:
-                    o_icao = (pick.get("origin") or {}).get("code_icao", "")
-                    d_icao = (pick.get("destination") or {}).get("code_icao", "")
-                    if o_icao and d_icao:
-                        result["route"] = [o_icao, d_icao]
-                    # FlightAware also gives aircraft type — use it if present
-                    ac_type = pick.get("aircraft_type", "")
-                    if ac_type and not result["typecode"]:
-                        result["typecode"] = ac_type
-                    reg = pick.get("registration", "")
-                    if reg and not result["registration"]:
-                        result["registration"] = reg
-            except Exception as e:
-                print(f"FlightAware parse err for {callsign}: {e}")
+        if not _flightaware_reserve():
+            _flightaware_note_exhausted()   # cap hit — skip the billable call
+        else:
+            fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
+            fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
+            if fa_status != 200:
+                _flightaware_refund()   # non-2xx doesn't bill — reclaim the slot
+            if fa_status == 200 and fa_data:
+                try:
+                    fa = json.loads(fa_data)
+                    # Pick the in-progress flight, else the most recent one.
+                    flights = fa.get("flights", []) or []
+                    pick = None
+                    for f in flights:
+                        if f.get("status", "").lower().startswith("en route") or f.get("actual_off"):
+                            if not f.get("actual_on"):
+                                pick = f
+                                break
+                    if pick is None and flights:
+                        pick = flights[0]
+                    if pick:
+                        o_icao = (pick.get("origin") or {}).get("code_icao", "")
+                        d_icao = (pick.get("destination") or {}).get("code_icao", "")
+                        if o_icao and d_icao:
+                            result["route"] = [o_icao, d_icao]
+                        # FlightAware also gives aircraft type — use it if present
+                        ac_type = pick.get("aircraft_type", "")
+                        if ac_type and not result["typecode"]:
+                            result["typecode"] = ac_type
+                        reg = pick.get("registration", "")
+                        if reg and not result["registration"]:
+                            result["registration"] = reg
+                except Exception as e:
+                    print(f"FlightAware parse err for {callsign}: {e}")
 
     # Fetch aircraft type from hexdb.io (free, no auth, reliable)
     if icao24:
@@ -1451,11 +1540,17 @@ def handle_health(params):
     issues = []
     if _opensky_429_streak:
         issues.append("opensky_rate_limited")
+    fa_used, fa_limit = flightaware_usage_status()
+    if fa_limit and fa_used >= fa_limit:
+        issues.append("flightaware_quota_exhausted")
     return 200, json.dumps({
         "status": "ok",
         "issues": issues,
         "cache_entries": len(_cache),
         "ships_tracked": len(_ships),
+        "flightaware_month": _fa_period(),
+        "flightaware_used": fa_used,
+        "flightaware_limit": fa_limit,
         "uptime_seconds": int(time.time() - _started_at),
     }).encode()
 
