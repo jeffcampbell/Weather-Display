@@ -49,10 +49,48 @@ PLANE_MAX_SECS = 600          # max continuous time on plane screen
 PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
 PLANE_QUIET_START_HR = 1      # local hour to stop fetching planes (saves API)
 PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
-PLANES_ENABLED = True
-# Ship tracking only makes sense for coastal displays. The inland sky-mode
-# variant skips both the AIS fetch and the ship-screen rotation entirely.
-SHIPS_ENABLED = (secrets.get("basin_mode", "tides") != "sky")
+# ---------------------------------------------------------------------------
+# Feature + display configuration (per-device, from secrets.py)
+#
+# Feature flags turn each capability on/off independently. Defaults preserve
+# the previous behavior (which was derived from `basin_mode`) so existing
+# secrets.py files keep working unchanged.
+#
+#   enable_weather    weather text (temp / condition / wind) + 3-day forecast
+#   enable_tide       tide basin water column + tide time  (coastal displays)
+#   enable_astronomy  moon/planet sky card + sky map/zoom   (inland displays)
+#   enable_planes     overhead aircraft screen
+#   enable_boats      nearby AIS vessel screen              (coastal displays)
+#
+# Tide and astronomy share the left basin / sky card, so on a single panel
+# they are alternatives — if both are enabled, astronomy takes the basin.
+# ---------------------------------------------------------------------------
+_LEGACY_BASIN = secrets.get("basin_mode", "tides")   # back-compat default source
+
+def _flag(name, default):
+    return bool(secrets.get(name, default))
+
+ENABLE_WEATHER   = _flag("enable_weather", True)
+ENABLE_ASTRONOMY = _flag("enable_astronomy", _LEGACY_BASIN == "sky")
+ENABLE_TIDE      = _flag("enable_tide", _LEGACY_BASIN != "sky")
+ENABLE_PLANES    = _flag("enable_planes", True)
+ENABLE_BOATS     = _flag("enable_boats", _LEGACY_BASIN != "sky")
+
+# --- Display panel size ---
+# "128x64" (default, verified) renders the 64x32 layout at scale=2 plus
+# native-width astronomy. "64x32" targets a native 64x32 panel. NOTE: full
+# 64x32 layout support is still in progress; 128x64 is the tested config.
+DISPLAY = secrets.get("display", "128x64")
+if DISPLAY == "64x32":
+    MATRIX_WIDTH, MATRIX_HEIGHT, DISPLAY_SCALE = 64, 32, 1
+else:
+    MATRIX_WIDTH, MATRIX_HEIGHT, DISPLAY_SCALE = 128, 64, 2
+
+# Internal knobs the rest of the file already understands, derived from the
+# flags above. Astronomy wins the shared basin/sky area when both are on.
+BASIN_MODE = "sky" if ENABLE_ASTRONOMY else "tides"
+PLANES_ENABLED = ENABLE_PLANES
+SHIPS_ENABLED = ENABLE_BOATS
 SHIPS_TEST = False
 SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
@@ -90,10 +128,8 @@ DEVICE_SECRET = secrets.get("device_secret", "")
 # the proxy's config.json `locations` block. When empty, the device uses the
 # original /api/planes endpoint (proxy's home location).
 LOCATION_NAME = secrets.get("location", "")
-# Left-column basin content. "tides" = original water + weather sky + ship.
-# "sky"   = moon phase (room here for ISS / planets later — see roadmap).
-# Set "sky" for inland displays where tide data is meaningless.
-BASIN_MODE = secrets.get("basin_mode", "tides")
+# BASIN_MODE, PLANES_ENABLED, and SHIPS_ENABLED are derived from the feature
+# flags in the configuration block near the top of this file.
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths
@@ -154,8 +190,8 @@ mp = MatrixPortal(
     status_neopixel=board.NEOPIXEL,
     bit_depth=2,
     debug=False,
-    width=128,
-    height=64,
+    width=MATRIX_WIDTH,
+    height=MATRIX_HEIGHT,
 )
 
 # Clear MatrixPortal's default group so we manage our own layout
@@ -1422,7 +1458,7 @@ def fetch_route(callsign, icao24=""):
 # planet card overlays the basin area at native resolution so glyphs and
 # labels get the full 128x64 pixel density.
 weather_group = displayio.Group()                 # native-resolution outer
-weather_group_scaled = displayio.Group(scale=2)   # all existing scale-2 widgets
+weather_group_scaled = displayio.Group(scale=DISPLAY_SCALE)   # all existing scale-2 widgets
 weather_group.append(weather_group_scaled)
 
 # LEFT COLUMN: tide water fill (full column, animated)
@@ -1514,7 +1550,7 @@ if BASIN_MODE == "sky":
     vsep_tg.hidden = True
 
 # --- Plane screen group ---
-plane_group = displayio.Group(scale=2)
+plane_group = displayio.Group(scale=DISPLAY_SCALE)
 
 # Background first (includes logo box)
 plane_group.append(pl_bg_tg)
@@ -1547,7 +1583,7 @@ plane_group.append(reg_label)
 # show_ship() switches to "plane" screen and repurposes the labels
 
 # --- Loading screen group ---
-loading_group = displayio.Group(scale=2)
+loading_group = displayio.Group(scale=DISPLAY_SCALE)
 loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=12)
 loading_group.append(loading_label)
 
@@ -2559,10 +2595,11 @@ while True:
     else:
         # --- Weather + Tides/Sky refresh ---
         if now - last_weather_fetch >= WEATHER_INTERVAL:
-            fetch_weather()
-            if BASIN_MODE == "sky":
+            if ENABLE_WEATHER:
+                fetch_weather()
+            if BASIN_MODE == "sky":       # sky == astronomy enabled
                 fetch_sky()
-            else:
+            elif ENABLE_TIDE:
                 fetch_tides()
             flush_device_log()
             last_weather_fetch = now
