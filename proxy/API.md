@@ -88,7 +88,7 @@ The endpoint always returns valid JSON with status 200 even on upstream failure,
 
 ## `GET /api/route`
 
-Looks up a flight's route (origin → destination airports) and aircraft type. Tries three upstreams in order, cheapest first: OpenSky route DB (free), adsbdb (free), then FlightAware AeroAPI (real-time, paid) as a last resort — consulted only when neither free source has an answer, and skipped entirely for bare N-number GA registrations, which it essentially never resolves. Aircraft type/registration come from hexdb.io (or FlightAware if it had them).
+Looks up a flight's route (origin → destination airports) and aircraft type. Tries three upstreams, cheapest first: OpenSky route DB (free), adsbdb (free), then FlightAware AeroAPI (real-time, paid). The free DBs return a callsign's *scheduled* route, which goes stale when a callsign is reused for a different leg, so by default FlightAware is consulted to *override* a free answer — not merely as a last resort — giving the aircraft's actual current route (see `flightaware_override_free_routes`). FlightAware is still skipped entirely for bare N-number GA registrations (which it essentially never resolves) and once the monthly quota is exhausted. Aircraft type/registration come from hexdb.io (or FlightAware if it had them).
 
 **Query parameters:**
 
@@ -102,7 +102,7 @@ Looks up a flight's route (origin → destination airports) and aircraft type. T
 **Upstreams (in order):**
 - `https://opensky-network.org/api/routes?callsign=...`
 - `https://api.adsbdb.com/v0/callsign/...`
-- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (only if `flightaware_key` is configured, the callsign is not a bare N-number, **and the monthly FlightAware quota is not exhausted**)
+- `https://aeroapi.flightaware.com/aeroapi/flights/{callsign}` (consulted to override the free route when `flightaware_override_free_routes` is set — the default — or otherwise only when the free sources found nothing; requires `flightaware_key`, skipped for bare N-numbers, **and only while the monthly FlightAware quota is not exhausted**)
 - `https://hexdb.io/api/v1/aircraft/{icao24}` (type + registration)
 
 **Monthly spend cap:** FlightAware is the only paid upstream, so billable `/flights` calls are capped per calendar month (UTC) by `flightaware_monthly_limit` (default 450). The count is persisted to `flightaware_usage.json` next to `server.py`, so a proxy restart can't reset it mid-month; only genuinely billable calls count (a non-2xx response is refunded), and it rolls over automatically on the 1st. Once the cap is hit, this endpoint stops consulting FlightAware and serves whatever the free sources found — routes still resolve for most airline callsigns, you just lose the real-time paid fallback until the next month. Current usage is reported by [`GET /api/health`](#get-apihealth) (`flightaware_used` / `flightaware_limit`), which also raises a `flightaware_quota_exhausted` issue when the cap is reached.
@@ -594,7 +594,8 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
 | `noaa_station` | `/api/tides` | Default NOAA CO-OPS station when the device omits `?station=`. Must be a harmonic/reference station (not a subordinate/offset-only one). No API key needed. |
 | `opensky_client_id` / `opensky_client_secret` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky OAuth2 client credentials (generate at opensky-network.org → Account → API Client). The proxy exchanges them for short-lived bearer tokens automatically. |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
-| `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Used only as a last resort after the free OpenSky / adsbdb lookups; if missing, those are the only route sources. |
+| `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Overrides the free OpenSky / adsbdb route by default (see `flightaware_override_free_routes`); if missing, those are the only route sources. |
+| `flightaware_override_free_routes` | `/api/route` | When `true` (default), FlightAware overrides a route the free DBs already resolved, fixing stale "right tail, wrong route" answers from reused callsigns. `false` reverts to consulting FlightAware only when the free sources found nothing. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).

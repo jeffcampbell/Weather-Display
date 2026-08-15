@@ -411,6 +411,18 @@ ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
 # serves whatever the free sources found. Default keeps spend under the ~$5/mo
 # free tier at ~1¢/query; override with "flightaware_monthly_limit" in config.
 FLIGHTAWARE_MONTHLY_LIMIT = int(_config.get("flightaware_monthly_limit", 450))
+
+# When True, FlightAware is consulted to *override* a route the free sources
+# already resolved — not just as a last resort when they came up empty. This
+# fixes the "right tail, wrong route" case: the free DBs return a callsign's
+# *scheduled* route, which goes stale when a callsign/airframe is reused for a
+# different leg, and a wrong-but-present free answer used to permanently block
+# the accurate real-time source. Spend stays bounded by the small bbox query
+# volume, the monthly cap, the GA-registration skip, and the per-(callsign,
+# icao24) route cache — each airframe costs at most one FA call per cache
+# window regardless of how often the device re-polls. Set false in config to
+# fall back to the old free-first-wins behavior.
+FLIGHTAWARE_OVERRIDE_FREE = bool(_config.get("flightaware_override_free_routes", True))
 _FA_USAGE_PATH = Path(__file__).parent / "flightaware_usage.json"
 _fa_usage_lock = Lock()
 _fa_exhausted_logged_period = None
@@ -494,13 +506,15 @@ def handle_route(params):
     """Proxy route + aircraft type lookup. Falls through:
         OpenSky routes  ->  adsbdb  ->  FlightAware (real-time, paid)
 
-    The free scheduled-route DBs are tried first; FlightAware is the paid
-    last resort, consulted only when neither has an answer. Its data is the
-    most accurate — it reflects what the aircraft is *actually* doing right
-    now, whereas the DBs return scheduled-callsign data that can be stale or
-    wrong (e.g. callsign reused later in the day for a different leg) — but
-    at roughly a cent a query it isn't worth spending when a free source
-    already answered.
+    The free scheduled-route DBs are tried first. FlightAware is the paid,
+    authoritative source: its data reflects what the aircraft is *actually*
+    doing right now, whereas the DBs return scheduled-callsign data that can
+    be stale or wrong (e.g. callsign reused later in the day for a different
+    leg). Because a wrong-but-present free answer would otherwise be trusted
+    forever, FlightAware is consulted to *override* the free route, not just
+    when the free sources came up empty — see FLIGHTAWARE_OVERRIDE_FREE. At
+    roughly a cent a query this is kept bounded by the monthly spend cap, the
+    GA-registration skip, and the per-callsign+icao24 cache below.
 
     Both outcomes are cached per callsign+icao24 pair: hits for 1h, misses
     for 6h. Caching the misses matters more than caching the hits — the
@@ -553,9 +567,15 @@ def handle_route(params):
             except Exception:
                 pass
 
-    # 3. FlightAware AeroAPI — paid, best accuracy. Last resort only, and only
-    #    while under the monthly spend cap (FLIGHTAWARE_MONTHLY_LIMIT).
-    if not result["route"] and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
+    # 3. FlightAware AeroAPI — paid, best accuracy, real-time. Consulted to
+    #    *override* the free scheduled-route answer (which can be stale when a
+    #    callsign is reused for a different leg), not merely as a last resort.
+    #    Bounded by: FLIGHTAWARE_OVERRIDE_FREE, the monthly spend cap, the
+    #    GA-registration skip, and the per-(callsign,icao24) route cache. With
+    #    the override off, falls back to the old "only when free found nothing"
+    #    behavior.
+    fa_should_consult = FLIGHTAWARE_OVERRIDE_FREE or not result["route"]
+    if fa_should_consult and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         if not _flightaware_reserve():
             _flightaware_note_exhausted()   # cap hit — skip the billable call
         else:

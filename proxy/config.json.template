@@ -25,6 +25,9 @@
   "_flightaware_monthly_limit_comment": "Hard ceiling on billable FlightAware AeroAPI /flights lookups per calendar month (UTC). Persisted to flightaware_usage.json so a restart can't reset it mid-month; once hit, /api/route serves from the free sources only. Default 450 keeps spend under the ~$5/mo free tier at ~1c/query.",
   "flightaware_monthly_limit": 450,
 
+  "_flightaware_override_free_routes_comment": "When true (default), FlightAware overrides a route the free DBs already resolved, fixing stale 'right tail, wrong route' answers from reused callsigns. Costs one FA lookup per airframe per cache window (bounded by the monthly limit above). Set false to only consult FlightAware when the free sources found nothing.",
+  "flightaware_override_free_routes": true,
+
   "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
   "device_secret": ""
 }
