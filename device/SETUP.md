@@ -2,9 +2,9 @@
 
 ## Hardware
 
-- [Adafruit MatrixPortal S3](https://www.adafruit.com/product/5778) or [MatrixPortal M4](https://www.adafruit.com/product/4745)
-- [64×32 RGB LED Matrix Panel](https://www.adafruit.com/product/2278) (3 mm or 4 mm pitch)
-- USB-C power supply, 5 V, at least 2 A
+- [Adafruit MatrixPortal S3](https://www.adafruit.com/product/5778) (recommended — its PSRAM gives more headroom for the larger framebuffer) or [MatrixPortal M4](https://www.adafruit.com/product/4745)
+- HUB75 RGB LED Matrix Panel — either 128×64 (1/32 scan) or 64×32 (1/16 scan), 3 mm or 4 mm pitch. Set `display` in `secrets.py` to match.
+- 5 V power supply, **4 A minimum** (5 A safer). Feed it into the MatrixPortal's green screw-terminal block — a laptop's USB-C port (≤1.5 A) is **not enough** and will cause flickering and brownouts. A 2.4 A supply is borderline; OK for sparse-text scenes at reduced brightness but may flicker on bright/animated screens.
 
 ## 1. Install CircuitPython
 
@@ -60,9 +60,24 @@ Copy `device/secrets.py.template` to `device/secrets.py` and fill in your values
 | `tz_offset_hours` | Static UTC offset used at boot. The device auto-re-syncs to the OWM-reported (DST-aware) offset on every weather fetch, so this just needs to be approximately right. |
 | `proxy_host` | `http://YOUR_PI_IP:6590` — see proxy setup in root README |
 
-## 6. Deploy code.py
+## 6. Deploy the code
 
-Copy `device/code.py` to `CIRCUITPY/code.py`. CircuitPython restarts automatically.
+The device code is a small **launcher** plus one program per panel size. Copy
+**all three** to `CIRCUITPY/` (root):
+
+| File | Purpose |
+|------|---------|
+| `code.py` | Launcher — reads `display` from `secrets.py` and starts the matching layout |
+| `layout_64x32.py` | Native 64×32 layout |
+| `layout_128x64.py` | Native 128×64 layout (scale=2 + wide astronomy/forecast) |
+
+CircuitPython restarts automatically. The launcher runs `layout_64x32.py` by
+default; set `"display": "128x64"` in `secrets.py` for the larger panel. Both
+layout files must be present even though only one runs.
+
+> **Upgrading from v1.x:** deployment changed from a single `code.py` to these
+> three files. Copying only `code.py` will fail with an import error — deploy
+> all three.
 
 ## 7. (Optional, S3 only) Enable the web workflow
 
@@ -89,18 +104,20 @@ To get USB drive access back, edit `boot.py` (via the web editor) to comment out
 
 ## Configuration
 
-Key settings at the top of `code.py`:
+**Per-device settings live in `secrets.py`** (see `secrets.py.template`):
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `WEATHER_INTERVAL` | `600` | Seconds between weather/tide refreshes |
-| `OPENSKY_INTERVAL` | `60` | Seconds between aircraft checks |
-| `PLANE_CYCLE_SECS` | `5` | Seconds per plane when multiple are overhead |
-| `PLANE_MAX_SECS` | `600` | Max time on plane screen before forcing a weather break |
-| `SHIP_INTERVAL` | `60` | Seconds between ship list refreshes |
-| `PLANES_ENABLED` | `True` | Disable to turn off plane tracking entirely |
-| `SHIPS_ENABLED` | `True` | Disable to turn off ship tracking entirely |
-| `DEMO_MODE` | `False` | Cycle test fixtures without network (development only) |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `display` | `"64x32"` | Panel size — `"64x32"` or `"128x64"`. Selects the layout module. |
+| `enable_weather` | `True` | Temperature / condition / wind |
+| `enable_tide` | `True` | Tide basin + tide times (coastal displays) |
+| `enable_planes` | `True` | Overhead aircraft screen |
+| `enable_boats` | `True` | Nearby AIS vessels (coastal displays) |
+| `enable_astronomy` | `False` | **128×64 only:** sky map / planets / 3-day forecast |
+
+Timing/behavior constants (`WEATHER_INTERVAL`, `OPENSKY_INTERVAL`,
+`PLANE_CYCLE_SECS`, `SHIP_INTERVAL`, `DEMO_MODE`, …) live at the top of the
+active layout module (`layout_64x32.py` / `layout_128x64.py`).
 
 The plane bounding-box size lives on the proxy (`bbox` in `config.json`), not the device.
 
