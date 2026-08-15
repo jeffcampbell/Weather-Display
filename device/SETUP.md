@@ -2,9 +2,9 @@
 
 ## Hardware
 
-- [Adafruit MatrixPortal S3](https://www.adafruit.com/product/5778) or [MatrixPortal M4](https://www.adafruit.com/product/4745)
-- [64×32 RGB LED Matrix Panel](https://www.adafruit.com/product/2278) (3 mm or 4 mm pitch)
-- USB-C power supply, 5 V, at least 2 A
+- [Adafruit MatrixPortal S3](https://www.adafruit.com/product/5778) (recommended — its PSRAM gives more headroom for the larger framebuffer) or [MatrixPortal M4](https://www.adafruit.com/product/4745)
+- 128×64 HUB75 RGB LED Matrix Panel (1/32 scan, 3 mm or 4 mm pitch)
+- 5 V power supply, **4 A minimum** (5 A safer). Feed it into the MatrixPortal's green screw-terminal block — a laptop's USB-C port (≤1.5 A) is **not enough** and will cause flickering and brownouts. A 2.4 A supply is borderline; OK for sparse-text scenes at reduced brightness but may flicker on bright/animated screens.
 
 ## 1. Install CircuitPython
 

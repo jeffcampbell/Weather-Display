@@ -1,7 +1,9 @@
 # Matrix Portal — Tides, Weather, Aircraft, and Ship Tracker
-# Hardware: Adafruit MatrixPortal (M4 or S3) + 64x32 RGB LED Matrix
+# Hardware: Adafruit MatrixPortal S3 + 128x64 RGB LED Matrix
+# (M4 also works but S3 is recommended for the 128x64 panel — more RAM/PSRAM.)
 # See device/SETUP.md for the full library list and setup walkthrough.
 
+import random
 import time
 import gc
 import json
@@ -9,7 +11,6 @@ import math
 import board
 import microcontroller
 import digitalio
-import analogio
 import terminalio
 import displayio
 from adafruit_matrixportal.matrixportal import MatrixPortal
@@ -39,6 +40,7 @@ OWM_KEY = secrets["openweather_key"]
 TZ_OFFSET_HOURS = int(secrets.get("tz_offset_hours", -5))
 
 WEATHER_INTERVAL = 600
+FORECAST_INTERVAL = 3600    # 3-day forecast — proxy already caches for 1h
 OPENSKY_INTERVAL = 60
 HEALTH_INTERVAL = 300       # poll proxy /api/health every 5 minutes
 WATCHDOG_TIMEOUT = 90       # hard-reset if the main loop hasn't fed for this long
@@ -48,12 +50,34 @@ PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
 PLANE_QUIET_START_HR = 1      # local hour to stop fetching planes (saves API)
 PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
 PLANES_ENABLED = True
-SHIPS_ENABLED = True    # Set True to enable ship tracking
+# Ship tracking only makes sense for coastal displays. The inland sky-mode
+# variant skips both the AIS fetch and the ship-screen rotation entirely.
+SHIPS_ENABLED = (secrets.get("basin_mode", "tides") != "sky")
 SHIPS_TEST = False
 SHIP_INTERVAL = 60      # poll for ships every 60 sec
 SHIP_WEATHER_SECS = 30  # show weather for 30s in cycle
 DEMO_MODE = False       # Set True to auto-cycle test fixtures (no network needed)
 DEMO_INTERVAL = 30      # seconds per view in demo mode
+
+# Display runs at bit_depth=2 to keep per-row PWM bursts short enough that
+# the panel power rail doesn't sag mid-scan (the symptom: flicker on bright
+# rows). At bit_depth=2 each channel has 4 PWM levels (0x00 / 0x40 / 0x80 /
+# 0xC0), giving a 64-color palette total. _dim() snaps any 0xRRGGBB color
+# to that palette so the values in code match what the panel actually shows.
+# A handful of source literals that would round down to 0 are rescued
+# manually (water-deep, dim-star, vsep) to preserve visual intent.
+#
+# PANEL_BGR: this specific panel is wired BGR — sending red shows as blue,
+# sending blue shows as red. _dim() swaps R<->B post-quantization so source
+# code uses normal 0xRRGGBB values. If you ever swap in an RGB-wired panel,
+# set PANEL_BGR = False.
+PANEL_BGR = True
+
+def _dim(c):
+    c = c & 0xC0C0C0
+    if PANEL_BGR:
+        c = ((c & 0xFF) << 16) | (c & 0x00FF00) | ((c >> 16) & 0xFF)
+    return c
 
 # HTTP proxy on Raspberry Pi — bypasses ESP32 TLS limitation for OpenSky
 PROXY_HOST = secrets.get("proxy_host", "")       # e.g. "http://YOUR_PI_IP:6590"
@@ -61,6 +85,15 @@ PROXY_HOST = secrets.get("proxy_host", "")       # e.g. "http://YOUR_PI_IP:6590"
 # the proxy's device_secret. Empty here = device sends no header (proxy
 # only enforces if its config also has device_secret set).
 DEVICE_SECRET = secrets.get("device_secret", "")
+# Named location for the proxy's v2 API. When set, planes are fetched from
+# /api/v2/planes?loc=<name> using the location's lat/lon/bbox configured in
+# the proxy's config.json `locations` block. When empty, the device uses the
+# original /api/planes endpoint (proxy's home location).
+LOCATION_NAME = secrets.get("location", "")
+# Left-column basin content. "tides" = original water + weather sky + ship.
+# "sky"   = moon phase (room here for ISS / planets later — see roadmap).
+# Set "sky" for inland displays where tide data is meaningless.
+BASIN_MODE = secrets.get("basin_mode", "tides")
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths
@@ -104,34 +137,26 @@ btn_down.switch_to_input(pull=digitalio.Pull.UP)
 # being shown. Defined here so the button-poll block at the bottom of the
 # file can reach it; show_weather_tides is defined before that block runs.
 def force_weather_screen():
-    global planes, showing_planes
+    global planes, showing_planes, _forecast_showing, _forecast_pending
     planes = []
     showing_planes = False
+    _forecast_showing = False
+    _forecast_pending = False
     show_weather_tides()
 
 # ---------------------------------------------------------------------------
-# Display setup — 64x32, using displayio directly for icons + text
+# Display setup — 128x64 panel, rendered at scale=2 from a 64x32 coordinate
+# space. The root groups below all use scale=2, so every x/y coordinate in
+# this file is in the original 64x32 layout and gets pixel-doubled by
+# displayio. This avoids rewriting hundreds of hardcoded coordinates.
 # ---------------------------------------------------------------------------
-# status_neopixel intentionally omitted to keep the onboard NeoPixel dark.
-# The small red D13 LED is forced off below for the same reason.
-mp = MatrixPortal(bit_depth=4, debug=False)
-
-try:
-    _d13 = digitalio.DigitalInOut(board.LED)
-    _d13.switch_to_output(value=False)
-except (AttributeError, ValueError) as _e:
-    print("D13 LED not available:", _e)
-
-# Try to grab the onboard ALS-PT19 ambient light sensor. If anything about
-# this fails (pin missing on this firmware, already in use, etc.) we just
-# leave light_sensor=None and the rest of the file falls back to whatever
-# brightness logic doesn't depend on it.
-try:
-    light_sensor = analogio.AnalogIn(board.LIGHT)
-    print("ALS init OK, raw=", light_sensor.value)
-except Exception as _e:
-    print("ALS init failed:", _e)
-    light_sensor = None
+mp = MatrixPortal(
+    status_neopixel=board.NEOPIXEL,
+    bit_depth=2,
+    debug=False,
+    width=128,
+    height=64,
+)
 
 # Clear MatrixPortal's default group so we manage our own layout
 root = mp.display.root_group
@@ -228,18 +253,20 @@ _STAR_POSITIONS = ((2, 1), (7, 4), (14, 2), (4, 7), (11, 5), (17, 3), (8, 8), (1
 # Palette: 0=black sky, 1=water deep, 2=water mid, 3=water surface,
 #          4=ship hull (gray), 5=ship superstructure (amber), 6=dim star,
 #          7=sun/lightning yellow, 8=cloud/snow gray, 9=rain blue
-basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 10)
-basin_pal = displayio.Palette(10)
+basin_bmp = displayio.Bitmap(BASIN_W, BASIN_H, 12)
+basin_pal = displayio.Palette(12)
 basin_pal[0] = 0x000000
-basin_pal[1] = 0x001237   # water deep (navy)
+basin_pal[1] = 0x000040   # water deep (navy) — rescued from 0x001237 (would round to 0)
 basin_pal[2] = 0x003264   # water mid (ocean blue)
 basin_pal[3] = 0x125A96   # water surface/crest (bright blue)
-basin_pal[4] = 0xBBBBBB   # ship hull (light gray)
-basin_pal[5] = 0xFF8822   # ship superstructure (amber)
-basin_pal[6] = 0x232335   # dim star (night sky)
-basin_pal[7] = 0xFFCC00   # sun / lightning yellow
+basin_pal[4] = 0xBBBBBB   # ship hull (light gray) / Saturn ring / Mercury body
+basin_pal[5] = 0xFF8822   # ship superstructure (amber) / Jupiter body
+basin_pal[6] = 0x404040   # dim star (night sky) — rescued from 0x232335 (would round to 0)
+basin_pal[7] = 0xFFCC00   # sun / lightning yellow / Saturn body
 basin_pal[8] = 0xBBBBCC   # cloud / snow gray
 basin_pal[9] = 0x2255AA   # rain blue
+basin_pal[10] = 0xCC4422  # Mars rust (sky-mode only) — iron-oxide, not fire-engine red
+basin_pal[11] = 0xFFEECC  # Venus cream (sky-mode only)
 
 basin_tg = displayio.TileGrid(basin_bmp, pixel_shader=basin_pal, x=0, y=0)
 
@@ -250,36 +277,33 @@ _sep_pixel_y = 16       # current y of the tide direction indicator pixel
 
 BRIGHTNESS_MAX = 1.0
 BRIGHTNESS_MIN = 0.08   # dimmest without going off
-# ALS-PT19 raw readings (0..65535). Anything <= DARK clamps to MIN; >= BRIGHT
-# clamps to MAX. Tune to taste after watching real readings.
-LIGHT_RAW_DARK = 500
-LIGHT_RAW_BRIGHT = 25000
-LIGHT_EMA_ALPHA = 0.1   # smoothing factor: lower = steadier, slower to react
-
-_light_ema = None       # smoothed sensor value, lazy-init on first reading
+BRIGHTNESS_RAMP = 60    # minutes to ramp up/down
 
 def update_brightness():
-    """Adjust display brightness from a smoothed ambient-light reading.
-    Wrapped in try/except so a flaky sensor read never crashes the main
-    loop — on failure we leave the previous brightness in place."""
-    global _light_ema
-    if light_sensor is None:
-        return
-    try:
-        raw = light_sensor.value
-        if _light_ema is None:
-            _light_ema = raw
+    """Adjust display brightness based on sun position."""
+    t = time.localtime()
+    now_mins = t.tm_hour * 60 + t.tm_min
+
+    if _sunrise_mins <= now_mins <= _sunset_mins:
+        # Daytime — check if we're in the ramp-up or ramp-down window
+        mins_after_sunrise = now_mins - _sunrise_mins
+        mins_before_sunset = _sunset_mins - now_mins
+
+        if mins_after_sunrise < BRIGHTNESS_RAMP:
+            # Ramping up after sunrise
+            frac = mins_after_sunrise / BRIGHTNESS_RAMP
+            b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
+        elif mins_before_sunset < BRIGHTNESS_RAMP:
+            # Ramping down before sunset
+            frac = mins_before_sunset / BRIGHTNESS_RAMP
+            b = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
         else:
-            _light_ema = (1 - LIGHT_EMA_ALPHA) * _light_ema + LIGHT_EMA_ALPHA * raw
-        span = LIGHT_RAW_BRIGHT - LIGHT_RAW_DARK
-        frac = (_light_ema - LIGHT_RAW_DARK) / span if span > 0 else 1.0
-        if frac < 0:
-            frac = 0
-        elif frac > 1:
-            frac = 1
-        display.brightness = BRIGHTNESS_MIN + (BRIGHTNESS_MAX - BRIGHTNESS_MIN) * frac
-    except Exception as _e:
-        print("update_brightness err:", _e)
+            b = BRIGHTNESS_MAX
+    else:
+        # Nighttime
+        b = BRIGHTNESS_MIN
+
+    display.brightness = max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, b))
 
 # ---------------------------------------------------------------------------
 # Weather sky art helpers — draw into basin_bmp sky area (y < water_top)
@@ -413,6 +437,651 @@ _last_water_top = -1
 _last_weather_cond_drawn = None
 _last_has_ship_drawn = None
 _last_night_drawn = None
+
+
+# ---------------------------------------------------------------------------
+# Sky map (basin_mode="sky") — full-panel-width horizon view of tonight's
+# visible planets. The top ~52 rows are sky (altitude 90° at top, horizon
+# at the bottom of the area); planets plotted as colored 2x2 dots at their
+# (azimuth, altitude) positions. Cardinal direction labels are intentionally
+# left off for cleanliness; weather/time strip lives below the chart.
+# ---------------------------------------------------------------------------
+_HORIZON_Y     = 43      # row of the horizon line in sky_card_bmp coords
+_HORIZON_COLOR = 6       # palette slot 6: dim gray
+_SUN_COLOR     = 7       # palette slot 7: yellow
+_MOON_BRIGHT   = 4       # palette slot 4: light gray (full-ish moon)
+_MOON_MED      = 8       # palette slot 8: cool gray (half-ish)
+_MOON_DIM      = 6       # palette slot 6: dim gray (thin crescent)
+_STAR_DIM      = 6       # palette slot 6: dim gray
+_STAR_BRIGHT   = 8       # palette slot 8: cool gray
+_NIGHT_SUN_ALT = -6      # sun must be below this (deg) to render stars
+
+# Per-planet dot colors (basin_pal indices)
+_PLANET_COLOR = {
+    "Mercury": 4,    # light gray
+    "Venus":   11,   # cream
+    "Mars":    10,   # red
+    "Jupiter": 5,    # amber
+    "Saturn":  7,    # yellow
+}
+
+# Hex versions of planet colors for label tinting in the list view.
+_PLANET_COLOR_HEX = {
+    "Mercury": 0xBBBBBB,
+    "Venus":   0xFFEECC,
+    "Mars":    0xCC4422,
+    "Jupiter": 0xFF8822,
+    "Saturn":  0xFFCC00,
+}
+
+# Cycle: 30s zoomed-out map → 30s zoom on each visible planet (one at a
+# time), then back to map. Independent 4.5-min timer interrupts for the
+# list (text info) view, which itself runs 30s before normal cycle resumes.
+_VIEW_DWELL_SECS  = 30
+_LIST_DWELL_SECS  = 30
+_LIST_INTERVAL    = 4 * 60 + 30     # 270s — every 4.5 min the list shows
+_ZOOM_AZ_SPAN     = 60              # degrees of azimuth in zoom window
+_ZOOM_ALT_SPAN    = 30              # degrees of altitude in zoom window
+_sky_view_mode      = "map"
+_sky_view_last_flip = 0
+_zoom_idx           = 0             # which planet the zoom view focuses on
+_last_list_time     = 0             # monotonic time the list was last shown
+
+
+def _put(bmp, x, y, color_idx):
+    """Bounds-checked single pixel write."""
+    if 0 <= x < SKY_CARD_W and 0 <= y < SKY_CARD_H:
+        bmp[x, y] = color_idx
+
+
+def _az_to_x(az):
+    """Map azimuth (degrees) to sky_card x. 360° spans 128 px (~2.8°/px).
+    North wraps at x=0/128, E=32, S=64, W=96."""
+    return int(az * SKY_CARD_W / 360) % SKY_CARD_W
+
+
+def _alt_to_y(alt):
+    """Map altitude (degrees) to sky_card y. 90° = top, 0° = horizon row."""
+    y = _HORIZON_Y - int(alt * _HORIZON_Y / 90)
+    if y < 0:
+        return 0
+    if y > _HORIZON_Y - 1:
+        return _HORIZON_Y - 1
+    return y
+
+
+def _dot_2x2(x, y, color):
+    """Small block — top-left at (x, y)."""
+    for dx in (0, 1):
+        for dy in (0, 1):
+            _put(sky_card_bmp, x + dx, y + dy, color)
+
+
+def _dot_plus(cx, cy, color):
+    """5-pixel plus shape centered on (cx, cy) — bigger than 2x2 without
+    being a fat square."""
+    _put(sky_card_bmp, cx,     cy,     color)
+    _put(sky_card_bmp, cx - 1, cy,     color)
+    _put(sky_card_bmp, cx + 1, cy,     color)
+    _put(sky_card_bmp, cx,     cy - 1, color)
+    _put(sky_card_bmp, cx,     cy + 1, color)
+
+
+def _dot_disk(cx, cy, r, color):
+    """Round-ish filled disk of radius r centered on (cx, cy). Uses the
+    same tip/equator trim as the planet glyphs so small disks read clean."""
+    for dy in range(-r, r + 1):
+        ry2 = r * r - dy * dy
+        if ry2 < 1:
+            continue
+        rx = int(math.sqrt(ry2))
+        if rx == r:
+            rx -= 1
+        for dx in range(-rx, rx + 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, color)
+
+
+def _draw_glow_2x2(cx, cy, core_color, halo_color):
+    """2x2 bright core with a 1-pixel halo ring around it (12 halo pixels
+    forming a 4x4 outline, corners NOT included for a softer-edged look).
+    Core occupies (cx..cx+1, cy..cy+1)."""
+    # Halo top/bottom rows (3 pixels each, skipping outer corners)
+    for dx in (0, 1):
+        _put(sky_card_bmp, cx + dx, cy - 1, halo_color)
+        _put(sky_card_bmp, cx + dx, cy + 2, halo_color)
+    # Halo side columns
+    for dy in (0, 1):
+        _put(sky_card_bmp, cx - 1, cy + dy, halo_color)
+        _put(sky_card_bmp, cx + 2, cy + dy, halo_color)
+    _dot_2x2(cx, cy, core_color)
+
+
+def _draw_glow_3x3(cx, cy, core_color, halo_color):
+    """3x3 bright core centered on (cx, cy) with a soft 1-pixel halo ring.
+    5x5 footprint with corners trimmed for a rounded glow look."""
+    for dx in (-1, 0, 1):
+        _put(sky_card_bmp, cx + dx, cy - 2, halo_color)
+        _put(sky_card_bmp, cx + dx, cy + 2, halo_color)
+    for dy in (-1, 0, 1):
+        _put(sky_card_bmp, cx - 2, cy + dy, halo_color)
+        _put(sky_card_bmp, cx + 2, cy + dy, halo_color)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, core_color)
+
+
+def _draw_glow_5x5(cx, cy, core_color, halo_color):
+    """Big glowy planet glyph for the zoom view: rounded 5x5 core in
+    core_color, 7x7-footprint halo ring in halo_color."""
+    # Halo top + bottom rows (5 px each, no outer corners)
+    for dx in range(-2, 3):
+        _put(sky_card_bmp, cx + dx, cy - 3, halo_color)
+        _put(sky_card_bmp, cx + dx, cy + 3, halo_color)
+    # Halo side columns (5 px each)
+    for dy in range(-2, 3):
+        _put(sky_card_bmp, cx - 3, cy + dy, halo_color)
+        _put(sky_card_bmp, cx + 3, cy + dy, halo_color)
+    # 5x5 core with the 4 outer corners cut for a rounder look
+    for dx in range(-2, 3):
+        for dy in range(-2, 3):
+            if dx * dx + dy * dy > 5:
+                continue
+            _put(sky_card_bmp, cx + dx, cy + dy, core_color)
+
+
+def _draw_saturn_glyph(cx, cy, body_color, ring_color):
+    """Iconic mini-Saturn: 3x2 body with 1-pixel ring extensions on each
+    side at the equator row. Reads as 'planet with rings' even at this
+    pixel scale."""
+    # Body 3x2 (offset so (cx, cy) is the center of the upper row)
+    for dx in (-1, 0, 1):
+        _put(sky_card_bmp, cx + dx, cy,     body_color)
+        _put(sky_card_bmp, cx + dx, cy + 1, body_color)
+    # Ring extensions — 1 pixel on each side at the equator row (cy)
+    _put(sky_card_bmp, cx - 2, cy, ring_color)
+    _put(sky_card_bmp, cx + 2, cy, ring_color)
+
+
+# ---------------------------------------------------------------------------
+# Iconic per-planet glyphs for the ZOOM view. Each is hand-designed at the
+# 30-second zoom scale to feel like a portrait of that planet rather than
+# yet another colored dot. Map view keeps the smaller generic glow shapes.
+# ---------------------------------------------------------------------------
+
+def _draw_jupiter_zoom(cx, cy):
+    """7-row banded gas-giant. Amber body, two dark bands, equator slightly
+    wider for a faintly oblate look. Centered on (cx, cy)."""
+    A = _PLANET_COLOR["Jupiter"]   # amber
+    B = 6                          # dim gray bands
+    # (dy, half_width, color)
+    rows = (
+        (-3, 2, A),
+        (-2, 3, A),
+        (-1, 3, B),   # north equatorial band
+        ( 0, 4, A),   # equator (widest)
+        ( 1, 3, B),   # south equatorial band
+        ( 2, 3, A),
+        ( 3, 2, A),
+    )
+    for dy, w, color in rows:
+        for dx in range(-w, w + 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, color)
+
+
+def _draw_saturn_zoom(cx, cy):
+    """5-row Saturn with a thick ring crossing through the body. Ring is 2 px
+    tall on the extensions (one above + one below the equator) so the ring
+    shape dominates at glance instead of reading as a single thin line."""
+    Y = _PLANET_COLOR["Saturn"]    # yellow
+    R = 4                          # light gray ring
+    # Body 5x5, rounded
+    body_rows = ((-2, 1), (-1, 2), (0, 2), (1, 2), (2, 1))
+    for dy, w in body_rows:
+        for dx in range(-w, w + 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, Y)
+    # Ring extensions on both sides — 2px tall (equator + row above) so the
+    # ring is unmistakable. Outer tip stays single-pixel for a tapered look.
+    for dx in (-3, 3):
+        _put(sky_card_bmp, cx + dx, cy - 1, R)
+        _put(sky_card_bmp, cx + dx, cy,     R)
+    for dx in (-4, 4):
+        _put(sky_card_bmp, cx + dx, cy, R)
+    # Ring crosses through body at equator — single dim pixel at center
+    # to suggest the ring passing in front
+    _put(sky_card_bmp, cx, cy, R)
+
+
+def _draw_mars_zoom(cx, cy):
+    """5x5 red Mars with cool-gray polar caps top and bottom — the most
+    immediately recognizable Mars feature even at this pixel scale."""
+    R = _PLANET_COLOR["Mars"]      # red
+    W = 8                          # cool gray polar cap
+    # Body 5x5 rounded
+    body_rows = ((-1, 2), (0, 2), (1, 2))
+    for dy, w in body_rows:
+        for dx in range(-w, w + 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, R)
+    # Top + bottom edge slightly narrower with white center for polar caps
+    for dx in (-1, 0, 1):
+        _put(sky_card_bmp, cx + dx, cy - 2, R)
+        _put(sky_card_bmp, cx + dx, cy + 2, R)
+    _put(sky_card_bmp, cx, cy - 2, W)   # north polar cap (replaces center red)
+    _put(sky_card_bmp, cx, cy + 2, W)   # south polar cap
+
+
+def _draw_venus_zoom(cx, cy):
+    """Big bright Venus — 5x5 cream core with halo ring, plus 4 single-pixel
+    rays in cardinal directions for the iconic 'brightest object' look."""
+    _draw_glow_5x5(cx, cy, _PLANET_COLOR["Venus"], 8)
+    # 4 ray extensions one pixel past the halo
+    for dx, dy in ((-5, 0), (5, 0), (0, -5), (0, 5)):
+        _put(sky_card_bmp, cx + dx, cy + dy, 8)
+
+
+def _draw_mercury_zoom(cx, cy):
+    """Small 3x3 Mercury with a 2-pixel sun-tint gradient on its sun-facing
+    edge — hints at Mercury's perpetual nearness to the sun. Two pixels read
+    as deliberate tinting; one alone can look like a stray glitch."""
+    G = _PLANET_COLOR["Mercury"]   # light gray
+    Y = 7                          # yellow sun-tint
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            _put(sky_card_bmp, cx + dx, cy + dy, G)
+    _put(sky_card_bmp, cx + 2, cy,     Y)   # equator (brightest sun-facing point)
+    _put(sky_card_bmp, cx + 1, cy - 1, Y)   # upper-right edge (gradient)
+
+
+_PLANET_ZOOM_GLYPH = {
+    "Mercury": _draw_mercury_zoom,
+    "Venus":   _draw_venus_zoom,
+    "Mars":    _draw_mars_zoom,
+    "Jupiter": _draw_jupiter_zoom,
+    "Saturn":  _draw_saturn_zoom,
+}
+
+
+def _draw_moon_zoom(cx, cy, phase):
+    """Big phase-correct moon disk, radius 12 (25px diameter).
+
+    phase: 0..1 synodic position (0=new, 0.25=1st quarter waxing,
+    0.5=full, 0.75=last quarter waning, →1=new again).
+
+    Renders the lit hemisphere in light gray (palette 4), and outlines the
+    dark hemisphere's perimeter in dim gray (palette 6) so the disk is
+    always visible even at new moon."""
+    r = 12
+    LIT  = 4
+    RIM  = 6
+    cos_pa = math.cos(math.pi * (1 - 2 * phase))   # 1 at full, -1 at new
+    waxing = phase <= 0.5
+    for dy in range(-r, r + 1):
+        ry2 = r * r - dy * dy
+        if ry2 < 1:
+            continue
+        rx = int(math.sqrt(ry2))
+        if rx == r:
+            rx -= 1
+        for dx in range(-rx, rx + 1):
+            if waxing:
+                lit = dx > -cos_pa * rx - 0.5
+            else:
+                lit = dx <  cos_pa * rx + 0.5
+            if lit:
+                _put(sky_card_bmp, cx + dx, cy + dy, LIT)
+            elif dx == -rx or dx == rx:
+                # Rim outline of un-lit side so the disk shape is always
+                # readable, even when illum is very low.
+                _put(sky_card_bmp, cx + dx, cy + dy, RIM)
+
+
+def _clear_sky_card():
+    for y in range(SKY_CARD_H):
+        for x in range(SKY_CARD_W):
+            sky_card_bmp[x, y] = 0
+
+
+# Pseudo-random star scatter. Generated once at first night render with a
+# fixed seed so the pattern is stable across reboots — feels like the same
+# sky, not a different random one each time.
+_STARS = None
+
+def _generate_stars(count=40):
+    random.seed(42)
+    out = []
+    for _ in range(count):
+        x = random.randint(0, SKY_CARD_W - 1)
+        y = random.randint(1, _HORIZON_Y - 2)   # above horizon, not on top edge
+        bright = (random.randint(0, 4) == 0)    # ~1 in 5 brighter
+        out.append((x, y, bright))
+    return out
+
+
+def _is_night():
+    sun = _sky_data.get("sun") or {}
+    return sun.get("alt", 90) < _NIGHT_SUN_ALT
+
+
+def render_sky_map():
+    """Draw the horizon sky map at full panel width. Layers (bottom to top):
+       1. Stars (only when the sun is below civil twilight)
+       2. Horizon line
+       3. Sun (if above horizon)
+       4. Moon (size + brightness scaled by illumination)
+       5. Planets (size by magnitude)"""
+    global _STARS
+    _clear_sky_card()
+
+    # 1) Stars — pseudo-random scatter, only visible at night
+    if _is_night():
+        if _STARS is None:
+            _STARS = _generate_stars()
+        for sx, sy, bright in _STARS:
+            sky_card_bmp[sx, sy] = _STAR_BRIGHT if bright else _STAR_DIM
+
+    # 2) Horizon line — dim, doesn't compete with the dots
+    for x in range(SKY_CARD_W):
+        sky_card_bmp[x, _HORIZON_Y] = _HORIZON_COLOR
+
+    # 3) Sun — big yellow disk with amber halo + 4 cardinal rays when above
+    # horizon. Bigger than the planets so it visually dominates the map.
+    sun = _sky_data.get("sun") or {}
+    if sun.get("alt", -90) > 0:
+        sx = _az_to_x(sun["az"])
+        sy = _alt_to_y(sun["alt"])
+        _draw_glow_5x5(sx, sy, _SUN_COLOR, 5)  # 5x5 core + 7x7 halo
+        # 4 short rays extending out 1 px past the halo
+        _put(sky_card_bmp, sx - 5, sy, _SUN_COLOR)
+        _put(sky_card_bmp, sx + 5, sy, _SUN_COLOR)
+        _put(sky_card_bmp, sx, sy - 5, _SUN_COLOR)
+        _put(sky_card_bmp, sx, sy + 5, _SUN_COLOR)
+
+    # 4) Moon — bigger glowy for full-ish, smaller dim for crescent
+    moon = _sky_data.get("moon") or {}
+    m_alt = moon.get("alt", -90)
+    if m_alt > 0:
+        mx = _az_to_x(moon["az"])
+        my = _alt_to_y(m_alt)
+        illum = moon.get("illum", 0)
+        if illum > 0.7:
+            _draw_glow_3x3(mx, my, _MOON_BRIGHT, _MOON_DIM)
+        elif illum > 0.3:
+            _draw_glow_2x2(mx, my, _MOON_MED, _MOON_DIM)
+        elif illum > 0.05:
+            _dot_2x2(mx, my, _MOON_DIM)
+
+    # 5) Planets — iconic glyphs with halos. Brighter planets get bigger
+    #    cores and softer halos so they read as "this one really pops"
+    #    even at the cost of pin-point positional accuracy.
+    planets = _sky_data.get("planets") or []
+    for p in planets:
+        px = _az_to_x(p.get("best_az", 0))
+        py = _alt_to_y(p.get("best_alt", 0))
+        name = p.get("name", "")
+        color = _PLANET_COLOR.get(name, 4)
+        mag = p.get("mag", 0)
+        if name == "Saturn":
+            _draw_saturn_glyph(px, py, color, _STAR_DIM)
+        elif mag < -3:        # Venus (mag ~-4)
+            _draw_glow_3x3(px, py, color, _STAR_DIM)
+        elif mag < -1:        # Jupiter (mag ~-2)
+            _draw_glow_2x2(px, py, color, _STAR_DIM)
+        elif name == "Mars":
+            _draw_glow_2x2(px, py, color, _STAR_DIM)
+        else:                 # Mercury — small + simple
+            _dot_2x2(px, py, color)
+
+
+# Sky-map state. We only redraw when the planet list changes.
+_sky_data = {"planets": [], "cloud_score": "Clear", "cond": "Clear"}
+_sky_last_drawn = ""    # marker string: "<count>:<names>"
+# Unused legacy globals retained so update_basin_planets has stable signature
+_sky_idx = 0
+_sky_last_cycle = 0
+
+
+def fetch_sky():
+    """Pull tonight's planet visibility from the proxy. Refreshed once per
+    weather cycle (~5 min on the device, 6h cache on the proxy)."""
+    global _sky_data
+    if not (LOCATION_NAME and PROXY_HOST):
+        return
+    try:
+        url = "{}/api/v2/sky?loc={}".format(PROXY_HOST, LOCATION_NAME)
+        data = fetch_json(url)
+        _sky_data = data
+        device_log("Sky:{} cloud={}".format(
+            len(data.get("planets", [])),
+            data.get("cloud_score", "?"),
+        ))
+    except Exception as e:
+        device_log("Sky err:{}".format(e))
+
+
+def _zoom_targets():
+    """Names of objects we can zoom on, in cycle order: each visible
+    planet plus "Moon" if it's above the horizon."""
+    planets = _sky_data.get("planets") or []
+    names = [p.get("name", "") for p in planets]
+    moon = _sky_data.get("moon") or {}
+    if moon.get("alt", -90) > 0:
+        names.append("Moon")
+    return names
+
+
+def render_zoom_view():
+    """Dispatcher for the zoom slot. Targets cycle through visible planets
+    and (if up) the moon. Planet zooms show a 60°×30° patch of sky around
+    the focus; the moon zoom dedicates the whole card to a big phase-
+    correct moon disk."""
+    targets = _zoom_targets()
+    if not targets:
+        _clear_sky_card()
+        return
+    idx = _zoom_idx if 0 <= _zoom_idx < len(targets) else 0
+    name = targets[idx]
+    if name == "Moon":
+        _render_moon_zoom()
+    else:
+        _render_planet_zoom_at(name)
+
+
+def _render_moon_zoom():
+    """Full-card moon portrait — big phase-correct disk centered."""
+    _clear_sky_card()
+    moon = _sky_data.get("moon") or {}
+    phase = moon.get("phase", 0)
+    illum = moon.get("illum", 0)
+    cx = SKY_CARD_W // 2          # 64
+    cy = SKY_CARD_H // 2 - 1      # 21
+    _draw_moon_zoom(cx, cy, phase)
+    if sky_zoom_label is not None:
+        sky_zoom_label.text = "ZOOM: Moon {}%".format(int(round(illum * 100)))
+        sky_zoom_label.color = _dim(0xDDCCAA)   # warm cream
+
+
+def _render_planet_zoom_at(focus_name):
+    """Planet-focused zoom: 60°×30° window around the planet's position."""
+    _clear_sky_card()
+    planets = _sky_data.get("planets") or []
+    focus = None
+    for p in planets:
+        if p.get("name", "") == focus_name:
+            focus = p
+            break
+    if focus is None:
+        return
+    cen_az  = focus.get("best_az", 0)
+    cen_alt = focus.get("best_alt", 30)
+
+    half_az  = _ZOOM_AZ_SPAN  / 2
+    half_alt = _ZOOM_ALT_SPAN / 2
+
+    def to_screen(az, alt):
+        # Signed delta az in [-180, 180] handles wraparound at 0/360
+        d_az = (az - cen_az + 540) % 360 - 180
+        if abs(d_az) > half_az or abs(alt - cen_alt) > half_alt:
+            return None
+        x = int(SKY_CARD_W * (d_az + half_az) / _ZOOM_AZ_SPAN)
+        # Higher altitude → smaller y (top of screen)
+        y = int(SKY_CARD_H * (half_alt - (alt - cen_alt)) / _ZOOM_ALT_SPAN)
+        return x, y
+
+    # Crosshair at the view center — subtle, dim
+    ccx, ccy = SKY_CARD_W // 2, SKY_CARD_H // 2
+    for d in (-3, 3):
+        _put(sky_card_bmp, ccx + d, ccy, 6)
+        _put(sky_card_bmp, ccx, ccy + d, 6)
+
+    # Sun if in window (rare at night, but include for completeness)
+    sun = _sky_data.get("sun") or {}
+    if sun.get("alt", -90) > 0:
+        pos = to_screen(sun["az"], sun["alt"])
+        if pos:
+            _draw_glow_5x5(pos[0], pos[1], _SUN_COLOR, 5)
+
+    # Moon if in window
+    moon = _sky_data.get("moon") or {}
+    if moon.get("alt", -90) > 0:
+        pos = to_screen(moon["az"], moon["alt"])
+        if pos:
+            illum = moon.get("illum", 0)
+            if illum > 0.5:
+                _draw_glow_5x5(pos[0], pos[1], _MOON_BRIGHT, _MOON_DIM)
+            elif illum > 0.2:
+                _draw_glow_3x3(pos[0], pos[1], _MOON_MED, _MOON_DIM)
+            elif illum > 0.05:
+                _dot_2x2(pos[0], pos[1], _MOON_DIM)
+
+    # Planets — iconic per-planet glyphs (see _draw_*_zoom above). Each
+    # has hand-designed features: Jupiter's bands, Saturn's rings,
+    # Mars's polar caps, Venus's rays, Mercury's sun-tint.
+    for p in planets:
+        pos = to_screen(p.get("best_az", 0), p.get("best_alt", 0))
+        if not pos:
+            continue
+        name = p.get("name", "")
+        glyph = _PLANET_ZOOM_GLYPH.get(name)
+        if glyph:
+            glyph(pos[0], pos[1])
+        else:
+            _dot_2x2(pos[0], pos[1], _PLANET_COLOR.get(name, 4))
+
+    # Update zoom label
+    if sky_zoom_label is not None:
+        sky_zoom_label.text = "ZOOM: " + focus.get("name", "")
+        sky_zoom_label.color = _dim(
+            _PLANET_COLOR_HEX.get(focus.get("name", ""), 0xCCCCCC)
+        )
+
+
+def _render_list_view():
+    """Populate the 3 list-view rows with planet info. Empty slots get
+    blank text so the rows just disappear."""
+    planets = _sky_data.get("planets") or []
+    for i in range(3):
+        if i < len(planets):
+            p = planets[i]
+            name = p.get("name", "")
+            sky_list_name_labels[i].text = name
+            sky_list_name_labels[i].color = _dim(
+                _PLANET_COLOR_HEX.get(name, 0xCCCCCC)
+            )
+            sset = p.get("set", "")
+            rise = p.get("rise", "")
+            tail = sset or rise or ""
+            sky_list_info_labels[i].text = "{} {}\xb0 {}-{}".format(
+                p.get("best_dir", ""),
+                p.get("best_alt", 0),
+                p.get("best_time", ""),
+                tail,
+            )
+        else:
+            sky_list_name_labels[i].text = ""
+            sky_list_info_labels[i].text = ""
+
+
+def _set_view_mode(mode):
+    """Toggle the right combination of widgets for the active view.
+    map  -> sky_card_tg only
+    zoom -> sky_card_tg + zoom title label
+    list -> 3 name + 3 info labels (sky_card_tg hidden)"""
+    is_list = (mode == "list")
+    is_zoom = (mode == "zoom")
+    sky_card_tg.hidden = is_list
+    for lbl in sky_list_name_labels:
+        lbl.hidden = not is_list
+    for lbl in sky_list_info_labels:
+        lbl.hidden = not is_list
+    if sky_zoom_label is not None:
+        sky_zoom_label.hidden = not is_zoom
+
+
+def update_basin_planets():
+    """Per-tick sky-area update.
+
+    Normal cycle (each step _VIEW_DWELL_SECS):
+        map → zoom on each planet in turn → map → repeat
+
+    Independent every-_LIST_INTERVAL timer interrupts the cycle to show
+    the list view for _LIST_DWELL_SECS, then normal cycle resumes from map.
+    """
+    global _sky_last_drawn, _sky_view_mode, _sky_view_last_flip
+    global _zoom_idx, _last_list_time, _forecast_pending
+
+    now = time.monotonic()
+    planets = _sky_data.get("planets") or []
+
+    zoom_targets = _zoom_targets()
+    dwell = _LIST_DWELL_SECS if _sky_view_mode == "list" else _VIEW_DWELL_SECS
+    if planets and now - _sky_view_last_flip >= dwell:
+        # Decide what to switch to.
+        if _sky_view_mode == "list":
+            # End of list flash: back to map, restart cycle from beginning.
+            # Also signal the main loop to show the forecast card next, so
+            # the user gets a "planet summary → weather summary" beat. We
+            # raise the flag regardless of whether forecast_days is populated
+            # so the user sees the card transition even when the fetch is
+            # late or failed — show_forecast() handles the empty case.
+            _sky_view_mode = "map"
+            _zoom_idx = 0
+            _forecast_pending = True
+        elif now - _last_list_time >= _LIST_INTERVAL:
+            # Time for the periodic list flash. Pre-empts whatever was next.
+            _sky_view_mode = "list"
+            _last_list_time = now
+        elif _sky_view_mode == "map":
+            # Map → zoom on first target (planet or moon).
+            _sky_view_mode = "zoom"
+            _zoom_idx = 0
+        else:                                # _sky_view_mode == "zoom"
+            _zoom_idx += 1
+            if _zoom_idx >= len(zoom_targets):
+                _sky_view_mode = "map"
+                _zoom_idx = 0
+        _sky_view_last_flip = now
+        _set_view_mode(_sky_view_mode)
+        _sky_last_drawn = ""
+
+    sun = _sky_data.get("sun") or {}
+    moon = _sky_data.get("moon") or {}
+    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}".format(
+        _sky_view_mode, _zoom_idx,
+        len(planets),
+        ",".join(p.get("name", "") for p in planets),
+        sun.get("az", -1), sun.get("alt", -91),
+        moon.get("az", -1), moon.get("alt", -91),
+        moon.get("phase", 0),
+    )
+    if marker == _sky_last_drawn:
+        return
+
+    if _sky_view_mode == "map":
+        render_sky_map()
+    elif _sky_view_mode == "zoom":
+        render_zoom_view()
+    else:
+        _render_list_view()
+    _sky_last_drawn = marker
 
 
 def update_basin_water(level, tick):
@@ -593,11 +1262,11 @@ pl_bg_tg = displayio.TileGrid(pl_bg_bmp, pixel_shader=pl_bg_pal, x=0, y=0)
 
 def update_plane_bg(airline_color):
     """Update plane background with airline branding."""
-    r = ((airline_color >> 16) & 0xFF)
-    g = ((airline_color >> 8) & 0xFF)
-    b = (airline_color & 0xFF)
-    pl_bg_pal[1] = airline_color
-    pl_bg_pal[2] = ((r >> 2) << 16) | ((g >> 2) << 8) | (b >> 2)
+    pl_bg_pal[1] = _dim(airline_color)
+    # Border used to be a >>2 darkening of airline_color, which collapses to
+    # 0x000000 under bit_depth=2 quantization. Fixed dim gray reads as a
+    # subtle outline on every airline color instead.
+    pl_bg_pal[2] = 0x404040
 
 
 def update_ship_ocean(tick):
@@ -640,7 +1309,7 @@ _FLIGHT_CACHE_MAX = 50
 _consecutive_fetch_errs = 0
 _FETCH_ERR_RESET_THRESHOLD = 12  # auto-reboot after this many fetch/render errors in a row
 
-def fetch_json(url, timeout=10):
+def fetch_json(url):
     """Fetch a URL and return parsed JSON. Always closes the socket — without
     try/finally, a MemoryError mid-parse leaks the socket and the next fetch
     fails with 'existing socket already connected' until reboot.
@@ -648,18 +1317,12 @@ def fetch_json(url, timeout=10):
     Also tracks a consecutive-error counter; if a fetch raises (caller's
     except block calls fetch_failed), repeated failures trigger a hard
     reboot — adafruit_requests can get into an unrecoverable SSL/socket
-    state that only a CPU reset clears.
-
-    `timeout` bounds how long a single fetch can block. Some hosts (e.g.
-    NOAA's AWS-API-Gateway-fronted tide API) have occasionally hung well
-    past the library's own default, taking the whole device down with
-    them once WATCHDOG_TIMEOUT elapsed — callers hitting a flaky host
-    should pass a shorter timeout so they fail fast instead."""
+    state that only a CPU reset clears."""
     global _consecutive_fetch_errs
     headers = None
     if DEVICE_SECRET and PROXY_HOST and url.startswith(PROXY_HOST):
         headers = {"X-Device-Secret": DEVICE_SECRET}
-    resp = mp.network.fetch(url, headers=headers, timeout=timeout)
+    resp = mp.network.fetch(url, headers=headers) if headers else mp.network.fetch(url)
     try:
         data = resp.json()
         _consecutive_fetch_errs = 0  # success resets the counter
@@ -753,25 +1416,32 @@ def fetch_route(callsign, icao24=""):
     return info
 
 # --- Weather screen group ---
-weather_group = displayio.Group()
+# Two-layer composition. The outer group renders at panel-native scale=1;
+# its scale=2 child carries everything that was originally laid out on the
+# 64x32 logical grid (tide basin, weather labels, clock, etc.). The sky-mode
+# planet card overlays the basin area at native resolution so glyphs and
+# labels get the full 128x64 pixel density.
+weather_group = displayio.Group()                 # native-resolution outer
+weather_group_scaled = displayio.Group(scale=2)   # all existing scale-2 widgets
+weather_group.append(weather_group_scaled)
 
 # LEFT COLUMN: tide water fill (full column, animated)
-weather_group.append(basin_tg)
+weather_group_scaled.append(basin_tg)
 
-# Tide time at top of column — tiny font
+# Tide time at bottom of column — tiny font
 tide_time_label = Label(FONT_SMALL, text="", color=0x00CCDD, x=1, y=29)
-weather_group.append(tide_time_label)
+weather_group_scaled.append(tide_time_label)
 
 # Vertical separator line at x=14
 vsep_bmp = displayio.Bitmap(1, 32, 2)
 vsep_pal = displayio.Palette(2)
 vsep_pal[0] = 0x000000
 vsep_pal.make_transparent(0)
-vsep_pal[1] = 0x222233
+vsep_pal[1] = 0x404040   # vertical separator — rescued from 0x222233 (would round to 0)
 for r in range(32):
     vsep_bmp[0, r] = 1
 vsep_tg = displayio.TileGrid(vsep_bmp, pixel_shader=vsep_pal, x=20, y=0)
-weather_group.append(vsep_tg)
+weather_group_scaled.append(vsep_tg)
 
 # Tide direction indicator — white pixel sliding up (rising) or down (ebbing)
 # along the separator line
@@ -782,29 +1452,69 @@ sep_pixel_pal.make_transparent(0)
 sep_pixel_pal[1] = 0xFFFFFF
 sep_pixel_bmp[0, 0] = 1
 sep_pixel_tg = displayio.TileGrid(sep_pixel_bmp, pixel_shader=sep_pixel_pal, x=20, y=16)
-weather_group.append(sep_pixel_tg)
+weather_group_scaled.append(sep_pixel_tg)
 
 # RIGHT SIDE — 4 rows
 
-# Row 1 (y=4): Clock — mid font, white, prominent
-clock_label = Label(FONT_MID, text="", color=0xFFFFFF, x=22, y=4)
+# Native-resolution weather labels. In tide mode they live in the right
+# column (x=44+); in sky mode they live in a horizontal two-row strip at
+# the bottom — row 1 = clock + temp, row 2 = condition + wind.
+if BASIN_MODE == "sky":
+    clock_label = Label(FONT_MID,   text="", color=0xFFFFFF, x=2,  y=51)
+    temp_label  = Label(FONT_MID,   text="", color=0xFFDD00, x=80, y=51)
+    cond_label  = Label(FONT_MID,   text="", color=0xAAAACC, x=2,  y=60)
+    wind_label  = Label(FONT_SMALL, text="", color=0x88BBCC, x=80, y=60)
+else:
+    clock_label = Label(FONT_MID,   text="", color=0xFFFFFF, x=44, y=8,  scale=2)
+    temp_label  = Label(FONT_MID,   text="", color=0xFFDD00, x=44, y=26, scale=2)
+    cond_label  = Label(FONT_MID,   text="", color=0xAAAACC, x=44, y=44)
+    wind_label  = Label(FONT_SMALL, text="", color=0x88BBCC, x=44, y=55)
 weather_group.append(clock_label)
-
-# Row 2 (y=12): Weather icon + temperature — mid font, bright yellow
-
-temp_label = Label(FONT_MID, text="", color=0xFFDD00, x=32, y=12)
 weather_group.append(temp_label)
-
-# Row 3 (y=20): Condition — small font, gray
-cond_label = Label(FONT_SMALL, text="", color=0x888899, x=22, y=20)
 weather_group.append(cond_label)
-
-# Row 4 (y=28): Wind — small font, light blue
-wind_label = Label(FONT_SMALL, text="", color=0x6699AA, x=22, y=28)
 weather_group.append(wind_label)
 
+# --- Sky card (basin_mode='sky' only) ---
+# Full panel width × top 44 rows. Horizon at y=43; the bottom two rows
+# (y=44..63) hold the two-row native weather strip. Hidden in tide mode.
+SKY_CARD_W, SKY_CARD_H = 128, 44
+sky_card_bmp = displayio.Bitmap(SKY_CARD_W, SKY_CARD_H, 12)
+sky_card_tg = displayio.TileGrid(sky_card_bmp, pixel_shader=basin_pal, x=0, y=0)
+sky_card_tg.hidden = (BASIN_MODE != "sky")
+weather_group.append(sky_card_tg)
+
+# List-view labels — 3 rows, each with a name (planet-colored) + info
+# (direction, altitude, best/set times). Hidden by default; shown only
+# while _sky_view_mode == "list".
+sky_list_name_labels = []
+sky_list_info_labels = []
+sky_zoom_label = None
+if BASIN_MODE == "sky":
+    for ly in (12, 24, 36):
+        name_lbl = Label(FONT_SMALL, text="", color=0xCCCCCC, x=2,  y=ly)
+        info_lbl = Label(FONT_SMALL, text="", color=0x88BBCC, x=36, y=ly)
+        name_lbl.hidden = True
+        info_lbl.hidden = True
+        weather_group.append(name_lbl)
+        weather_group.append(info_lbl)
+        sky_list_name_labels.append(name_lbl)
+        sky_list_info_labels.append(info_lbl)
+    # Tiny title shown in zoom mode: "ZOOM: <Planet>".
+    sky_zoom_label = Label(FONT_SMALL, text="", color=0xCCCCCC, x=2, y=4)
+    sky_zoom_label.hidden = True
+    weather_group.append(sky_zoom_label)
+
+# In sky mode, hide the scale=2 basin + tide label + vertical separator
+# since the sky card overlays them and the separator no longer marks a
+# meaningful boundary between planet glyph and weather text.
+if BASIN_MODE == "sky":
+    basin_tg.hidden = True
+    tide_time_label.hidden = True
+    sep_pixel_tg.hidden = True
+    vsep_tg.hidden = True
+
 # --- Plane screen group ---
-plane_group = displayio.Group()
+plane_group = displayio.Group(scale=2)
 
 # Background first (includes logo box)
 plane_group.append(pl_bg_tg)
@@ -837,23 +1547,172 @@ plane_group.append(reg_label)
 # show_ship() switches to "plane" screen and repurposes the labels
 
 # --- Loading screen group ---
-# Shows "LOADING..." plus the device's IP address so the web workflow
-# (https://code.circuitpython.org/) is reachable without hunting for it.
-# IP lookup is best-effort: any failure (no native wifi module, radio not
-# yet associated) just leaves the line blank — never fatal at module load.
-loading_group = displayio.Group()
-loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=8)
+loading_group = displayio.Group(scale=2)
+loading_label = Label(FONT, text="LOADING...", color=0xFFFF00, x=4, y=12)
 loading_group.append(loading_label)
 
-try:
-    import wifi as _wifi
-    _ip_addr = _wifi.radio.ipv4_address
-    _ip_text = str(_ip_addr) if _ip_addr else ""
-except Exception as _e:
-    print("IP label skipped:", _e)
-    _ip_text = ""
-ip_label = Label(FONT_SMALL, text=_ip_text, color=0x00AAFF, x=6, y=22)
-loading_group.append(ip_label)
+# --- 3-day forecast screen group (sky mode only) ---
+# Native 128×64 so the 4×6 small font lays out at 1:1 pixel density. Three
+# columns × 5 text rows + 1 weather glyph each. Reuses basin_pal (sun yellow,
+# cloud gray, rain blue, dim gray) so no second palette is needed.
+FORECAST_W, FORECAST_H = 128, 64
+_FCOL_CENTERS = (21, 64, 106)   # x-center of each column
+_FCOL_LEFTS   = (1, 44, 87)     # x-left for left-anchored text
+_FROW_Y       = (1, 26, 35, 44, 53)   # day, cond, hi, wind-speed, wind-dir
+_FGLYPH_CY    = 16              # vertical center of glyph zone (y=8..24)
+# Day-of-week labels for the third forecast column. tm_wday is 0=Mon..6=Sun.
+_DOW_SHORT = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+
+forecast_group = displayio.Group()
+forecast_bmp = displayio.Bitmap(FORECAST_W, FORECAST_H, 12)
+forecast_tg = displayio.TileGrid(forecast_bmp, pixel_shader=basin_pal, x=0, y=0)
+forecast_group.append(forecast_tg)
+
+# 3 columns × 5 labels (day / cond / hi / wind-speed / wind-dir). Day label
+# is centered above the glyph; the rest are left-aligned at the column's
+# left margin so wider strings like "Light rain" don't recenter mid-update.
+_forecast_labels = []
+for _col in range(3):
+    _col_labels = []
+    # Day label (centered, brighter)
+    _day_lbl = Label(FONT_SMALL, text="", color=0xFFFFFF)
+    _day_lbl.anchor_point = (0.5, 0)
+    _day_lbl.anchored_position = (_FCOL_CENTERS[_col], _FROW_Y[0])
+    forecast_group.append(_day_lbl)
+    _col_labels.append(_day_lbl)
+    # Condition / hi / wind labels (left-anchored)
+    for _i, _color in enumerate((0xAAAACC, 0xFFDD00, 0x88BBCC, 0x88BBCC)):
+        _lbl = Label(FONT_SMALL, text="", color=_color,
+                     x=_FCOL_LEFTS[_col], y=_FROW_Y[_i + 1])
+        forecast_group.append(_lbl)
+        _col_labels.append(_lbl)
+    _forecast_labels.append(_col_labels)
+
+
+def _fp(x, y, c):
+    """Bounds-checked single pixel write into forecast_bmp."""
+    if 0 <= x < FORECAST_W and 0 <= y < FORECAST_H:
+        forecast_bmp[x, y] = c
+
+
+def _fc_cloud_shape(cx, cy, color=8):
+    """Cloud silhouette centered at (cx, cy). ~13 wide × 5 tall: bumpy top,
+    rounded body. Used as the base for rain/snow/storm/drizzle glyphs too."""
+    C = color
+    for dx in (-3, -2, 2, 3, 4):
+        _fp(cx + dx, cy - 2, C)
+    for dx in (-5, -4, -3, -2, -1, 1, 2, 3, 4, 5):
+        _fp(cx + dx, cy - 1, C)
+    for dx in range(-6, 7):
+        _fp(cx + dx, cy,     C)
+        _fp(cx + dx, cy + 1, C)
+    for dx in range(-5, 6):
+        _fp(cx + dx, cy + 2, C)
+
+
+def _fc_sun(cx, cy):
+    """Round 5×5 disk + 4 cardinal 2-px rays + 4 diagonal 1-px rays."""
+    Y = 7
+    for dy in (-2, -1, 0, 1, 2):
+        for dx in (-2, -1, 0, 1, 2):
+            if abs(dx) == 2 and abs(dy) == 2:
+                continue
+            _fp(cx + dx, cy + dy, Y)
+    for d in (4, 5):
+        _fp(cx + d, cy, Y); _fp(cx - d, cy, Y)
+        _fp(cx, cy + d, Y); _fp(cx, cy - d, Y)
+    _fp(cx + 3, cy + 3, Y); _fp(cx - 3, cy + 3, Y)
+    _fp(cx + 3, cy - 3, Y); _fp(cx - 3, cy - 3, Y)
+
+
+def _fc_partly_cloudy(cx, cy):
+    """Small sun upper-left + cloud overlapping lower-right."""
+    Y = 7
+    sx, sy = cx - 4, cy - 4
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            _fp(sx + dx, sy + dy, Y)
+    _fp(sx - 2, sy, Y); _fp(sx + 2, sy, Y)
+    _fp(sx, sy - 2, Y); _fp(sx, sy + 2, Y)
+    _fc_cloud_shape(cx + 1, cy + 2)
+
+
+def _fc_rain(cx, cy):
+    """Cloud + 3 diagonal rain streaks below."""
+    _fc_cloud_shape(cx, cy - 2)
+    B = 9
+    for sx in (-4, 0, 4):
+        _fp(cx + sx,     cy + 4, B)
+        _fp(cx + sx - 1, cy + 5, B)
+
+
+def _fc_drizzle(cx, cy):
+    """Cloud + 3 single dots below (lighter than rain)."""
+    _fc_cloud_shape(cx, cy - 2)
+    B = 9
+    for sx in (-4, 0, 4):
+        _fp(cx + sx, cy + 4, B)
+
+
+def _fc_thunderstorm(cx, cy):
+    """Cloud + yellow zigzag bolt centered below."""
+    _fc_cloud_shape(cx, cy - 2)
+    L = 7
+    _fp(cx + 1, cy + 3, L)
+    _fp(cx,     cy + 4, L); _fp(cx + 1, cy + 4, L)
+    _fp(cx - 1, cy + 5, L); _fp(cx,     cy + 5, L)
+    _fp(cx - 2, cy + 6, L); _fp(cx - 1, cy + 6, L)
+
+
+def _fc_snow(cx, cy):
+    """Cloud + 3 plus-pattern flakes below."""
+    _fc_cloud_shape(cx, cy - 2)
+    W = 4
+    for sx in (-4, 0, 4):
+        _fp(cx + sx,     cy + 4, W)
+        _fp(cx + sx - 1, cy + 5, W); _fp(cx + sx, cy + 5, W); _fp(cx + sx + 1, cy + 5, W)
+        _fp(cx + sx,     cy + 6, W)
+
+
+def _fc_fog(cx, cy):
+    """4 horizontal gray bars suggesting layered fog."""
+    G = 6
+    G2 = 8
+    bars = ((cy - 5, G2, 11), (cy - 2, G, 14), (cy + 1, G2, 12), (cy + 4, G, 13))
+    for by, color, w in bars:
+        for dx in range(-(w // 2), w - w // 2):
+            _fp(cx + dx, by, color)
+
+
+def _draw_forecast_glyph(cx, cy, cond_id):
+    """Dispatch glyph by OpenWeatherMap condition code group."""
+    if cond_id is None:
+        cond_id = 800
+    if 200 <= cond_id < 300:
+        _fc_thunderstorm(cx, cy)
+    elif 300 <= cond_id < 400:
+        _fc_drizzle(cx, cy)
+    elif 500 <= cond_id < 600:
+        _fc_rain(cx, cy)
+    elif 600 <= cond_id < 700:
+        _fc_snow(cx, cy)
+    elif 700 <= cond_id < 800:
+        _fc_fog(cx, cy)
+    elif cond_id == 800:
+        _fc_sun(cx, cy)
+    elif cond_id == 801:
+        _fc_partly_cloudy(cx, cy)
+    else:
+        _fc_cloud_shape(cx, cy)
+
+
+def _forecast_day_label(idx):
+    """Index 0 = TODAY, 1 = TMRW, 2 = weekday name."""
+    if idx == 0:
+        return "TODAY"
+    if idx == 1:
+        return "TMRW"
+    return _DOW_SHORT[(time.localtime().tm_wday + idx) % 7]
 
 # --- Health indicator: 1 px red dot at (63, 31) ---
 # Visible when /api/health reports a non-empty `issues` list (or when the
@@ -872,11 +1731,32 @@ for _grp in (weather_group, plane_group, loading_group):
     _tg.hidden = True
     _grp.append(_tg)
     _health_pixels.append(_tg)
+# forecast_group is native 128×64 (not scale=2), so position the health pixel
+# at the native bottom-right corner directly.
+_fcst_health_tg = displayio.TileGrid(_health_bmp, pixel_shader=_health_pal, x=127, y=63)
+_fcst_health_tg.hidden = True
+forecast_group.append(_fcst_health_tg)
+_health_pixels.append(_fcst_health_tg)
 
 def set_health_indicator(visible):
     """Show or hide the bottom-right red pixel across all screens."""
     for _tg in _health_pixels:
         _tg.hidden = not visible
+
+# --- Apply PANEL_BRIGHTNESS to every static palette and label color ---
+# HUB75 has no hardware dimming, so we scale RGB values in place.
+# Dynamic writes (update_plane_bg, show_ship, show_plane, etc.) call
+# _dim() inline; the scan below catches everything statically defined above.
+for _pal in (basin_pal, pl_bg_pal, vsep_pal, sep_pixel_pal, _health_pal):
+    for _i in range(len(_pal)):
+        _pal[_i] = _dim(_pal[_i])
+for _lbl in (tide_time_label, clock_label, temp_label, cond_label, wind_label,
+             logo_label, route_label, airline_label, actype_label,
+             alt_label, reg_label, loading_label):
+    _lbl.color = _dim(_lbl.color)
+for _col_labels in _forecast_labels:
+    for _lbl in _col_labels:
+        _lbl.color = _dim(_lbl.color)
 
 # Start with loading screen
 display.root_group = loading_group
@@ -934,7 +1814,7 @@ _sunrise_mins = 5 * 60 + 30
 _sunset_mins = 19 * 60 + 30
 ships = []
 ship_idx = 0
-last_ship_fetch = -SHIP_INTERVAL + 20  # stagger: ships fire ~20s after boot
+last_ship_fetch = -SHIP_INTERVAL
 _ship_cycle_start = 0
 _showing_ship = False
 _ship_hull_params = None   # (y_start, ship_h, bow_len, ship_w, cx) for ship ocean animation
@@ -956,11 +1836,20 @@ showing_planes = False
 plane_screen_started_at = 0   # ts when plane screen first appeared (for max-duration safeguard)
 plane_cooldown_until = 0      # don't re-show plane screen before this ts
 plane_idx = 0
-# Stagger first-tick load: weather+tides at t=0, planes at t=10s,
-# ships at t=20s (set above), health at t=30s.
-last_weather_fetch = -WEATHER_INTERVAL          # t=0
-last_sky_fetch = -OPENSKY_INTERVAL + 10         # t=10
-last_health_fetch = -HEALTH_INTERVAL + 30       # t=30
+last_weather_fetch = -WEATHER_INTERVAL
+last_forecast_fetch = -FORECAST_INTERVAL
+last_sky_fetch = -OPENSKY_INTERVAL
+last_health_fetch = -HEALTH_INTERVAL
+# 3-day forecast state. Populated by fetch_forecast() from /api/forecast.
+# Each entry: {"hi", "lo", "cond", "cond_id", "date", "wind", "wind_deg"}.
+forecast_days = []
+# Sky-mode-only: signals the main loop to flip to the forecast card once
+# the planet list view dwell ends. Cleared when forecast card is shown or
+# pre-empted by planes/ships.
+_forecast_pending = False
+_forecast_showing = False
+_forecast_started_at = 0
+FORECAST_DWELL_SECS = 30      # how long the forecast card stays on screen
 last_plane_cycle = 0
 current_screen = "loading"
 
@@ -997,6 +1886,8 @@ def switch_screen(name):
         display.root_group = weather_group
     elif name == "plane":
         display.root_group = plane_group
+    elif name == "forecast":
+        display.root_group = forecast_group
     elif name == "loading":
         display.root_group = loading_group
 
@@ -1068,62 +1959,71 @@ def fetch_weather():
     gc.collect()
 
 
-def fetch_tides():
-    """Fetch tide predictions and store them as (abs_secs, type, hour,
-    minute_str). The proxy returns a rolling ~30-day window (see
-    TIDE_FETCH_DAYS in proxy/server.py) so the next upcoming tide is
-    always in the list and the basin-level interpolation works across
-    midnight — the device doesn't need to know or care about the window
-    size, it just consumes whatever predictions come back.
+def fetch_forecast():
+    """Pull today/tomorrow/day-after high/low/cond/wind from the proxy.
+    The proxy already caches OpenWeatherMap's 5-day endpoint for 1h, so the
+    device just mirrors that cadence."""
+    global forecast_days
+    gc.collect()
+    try:
+        if LOCATION_NAME:
+            url = "{}/api/v2/forecast?loc={}".format(PROXY_HOST, LOCATION_NAME)
+        else:
+            url = "{}/api/forecast".format(PROXY_HOST)
+        data = fetch_json(url)
+        forecast_days = data.get("days") or []
+        device_log("Fcst:{}d".format(len(forecast_days)))
+    except Exception as e:
+        device_log("Fcst err:{}".format(e))
+        fetch_failed()
+    gc.collect()
 
-    Routed through the Pi proxy's /api/tides rather than hitting NOAA
-    directly — NOAA's AWS-fronted API was intermittently hanging the
-    ESP32-S3's TLS stack long enough to trip the watchdog and reboot the
-    whole device. The proxy does the NOAA call itself (with its own
-    timeout) and always returns valid JSON, serving a cached response if
-    NOAA is down, so this call behaves like the other proxy-routed
-    fetches (planes/ships) instead of like a flaky direct external call."""
+
+def fetch_tides():
+    """Fetch today + tomorrow's tide predictions from NOAA in one request and
+    store them as (abs_secs, type, hour, minute_str). Using a 2-day window
+    means the next upcoming tide is always in the list (no fall-through to a
+    second request) and the basin-level interpolation works across midnight.
+
+    NOTE: NOAA's `date` param only accepts `today`, `latest`, `recent`. To get
+    a specific day or range you must use `begin_date`/`end_date` — passing
+    `date=tomorrow` silently returns today's data."""
     global tide_str, tide_type_val, _tide_predictions
     gc.collect()
     try:
-        # timeout=15: comfortably longer than the proxy's own 10s upstream
-        # NOAA timeout (proxy/server.py TIDE fetch()), so a device-side
-        # timeout can't race and fire right as the proxy was about to
-        # return its safe fallback response.
-        url = "{}/api/tides?station={}".format(PROXY_HOST, NOAA_STATION)
-        preds = fetch_json(url, timeout=15).get("predictions", [])
+        now = time.localtime()
+        today_str = "{:04d}{:02d}{:02d}".format(now.tm_year, now.tm_mon, now.tm_mday)
+        tmr = time.localtime(time.mktime(now) + 86400)
+        tmr_str = "{:04d}{:02d}{:02d}".format(tmr.tm_year, tmr.tm_mon, tmr.tm_mday)
+        url = (
+            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+            "?begin_date={}&end_date={}&station={}&product=predictions&datum=MLLW"
+            "&time_zone=lst_ldt&interval=hilo&units=english&format=json"
+        ).format(today_str, tmr_str, NOAA_STATION)
+        preds = fetch_json(url).get("predictions", [])
+        now_secs = time.mktime(now)
 
-        # Only replace _tide_predictions when the fetch actually returned
-        # data. An empty response (e.g. the proxy's safe fallback while
-        # NOAA is down) is a clean, non-exceptional result — but wiping
-        # _tide_predictions/tide_str to N/A on every one of those would
-        # blank a perfectly good display. Keep showing the last known-good
-        # tide until a fetch actually brings back fresh predictions.
+        _tide_predictions = []
+        for p in preds:
+            ts = p["t"]                        # e.g. "2026-05-09 18:12"
+            d_part, t_part = ts.split(" ")
+            y, mo, d = [int(x) for x in d_part.split("-")]
+            h_str, m_str = t_part.split(":")
+            h, m = int(h_str), int(m_str)
+            secs = time.mktime((y, mo, d, h, m, 0, 0, 0, 0))
+            _tide_predictions.append((secs, p.get("type", ""), h, m_str))
+
         next_p = None
-        if preds:
-            new_predictions = []
-            for p in preds:
-                ts = p["t"]                        # e.g. "2026-05-09 18:12"
-                d_part, t_part = ts.split(" ")
-                y, mo, d = [int(x) for x in d_part.split("-")]
-                h_str, m_str = t_part.split(":")
-                h, m = int(h_str), int(m_str)
-                secs = time.mktime((y, mo, d, h, m, 0, 0, 0, 0))
-                new_predictions.append((secs, p.get("type", ""), h, m_str))
-
-            now_secs = time.mktime(time.localtime())
-            for p in new_predictions:
-                if p[0] >= now_secs:
-                    next_p = p
-                    break
-            _tide_predictions = new_predictions
-
+        for p in _tide_predictions:
+            if p[0] >= now_secs:
+                next_p = p
+                break
         if next_p:
             tide_type_val = next_p[1]
             h12 = next_p[2] % 12 or 12
             tide_str = "{}:{}".format(h12, next_p[3])
             device_log("Tide:{} {}".format(tide_type_val, tide_str))
-        elif not tide_str:
+        else:
             tide_str = "N/A"
             tide_type_val = ""
         # Calculate basin level — the per-tick block redraws it each frame
@@ -1142,7 +2042,10 @@ def fetch_planes():
     global planes
     gc.collect()
     try:
-        url = "{}/api/planes".format(PROXY_HOST)
+        if LOCATION_NAME:
+            url = "{}/api/v2/planes?loc={}".format(PROXY_HOST, LOCATION_NAME)
+        else:
+            url = "{}/api/planes".format(PROXY_HOST)
         data = fetch_json(url)
         # Proxy returns positional arrays: [call, icao24, alt, spd, hdg, vrate]
         # Avoids ~180 bytes/plane of string-key interning vs named-key dicts.
@@ -1199,14 +2102,45 @@ def fetch_health():
 # ---------------------------------------------------------------------------
 
 # Centering helpers for the right panel (x=17 to x=63, 47px wide)
-_RIGHT_START = 21
-_RIGHT_W = 43
+# Right-column panel coordinates (sky-mode native layout). The planet card
+# ends at native x=39 so we leave a 4 px gap before weather text starts.
+_RIGHT_START = 44
+_RIGHT_W = 128 - _RIGHT_START   # = 84 px
 
-def _center_mid(label, text):
-    """Center a mid-font label (5px/char) in the right panel."""
+# Per-label effective glyph width. Each entry is (font_w * label_scale) so
+# the centering helpers don't have to introspect the Label object.
+_CHAR_W_CLOCK = 10   # FONT_MID (5) × scale=2
+_CHAR_W_TEMP  = 10
+_CHAR_W_COND  = 5    # FONT_MID native
+_CHAR_W_WIND  = 4    # FONT_SMALL native
+
+
+def _center_right(label, text, char_w):
+    """Center a label in the right column at native pixel scale."""
     label.text = text
-    tw = len(text) * 5
-    label.x = _RIGHT_START + (_RIGHT_W - tw) // 2
+    label.x = _RIGHT_START + (_RIGHT_W - len(text) * char_w) // 2
+
+
+# Legacy names — preserved so older call sites keep working. The two ship
+# helpers still operate on the 64×32 scale=2 plane group (unchanged).
+def _center_mid(label, text):
+    if BASIN_MODE == "sky":
+        # Bottom-strip labels live at fixed x positions; just update text.
+        label.text = text
+        return
+    if label is clock_label or label is temp_label:
+        _center_right(label, text, _CHAR_W_CLOCK)
+    else:
+        _center_right(label, text, _CHAR_W_COND)
+
+def _center_small(label, text):
+    if BASIN_MODE == "sky":
+        label.text = text
+        return
+    if label is cond_label:
+        _center_right(label, text, _CHAR_W_COND)
+    else:
+        _center_right(label, text, _CHAR_W_WIND)
 
 def _center_ship(label, text):
     label.text = text
@@ -1215,12 +2149,6 @@ def _center_ship(label, text):
 def _center_ship_mid(label, text):
     label.text = text
     label.x = 16 + (48 - len(text) * 5) // 2
-
-def _center_small(label, text):
-    """Center a small-font label (4px/char) in the right panel."""
-    label.text = text
-    tw = len(text) * 4
-    label.x = _RIGHT_START + (_RIGHT_W - tw) // 2
 
 # ---------------------------------------------------------------------------
 # Ship type colors and display
@@ -1289,11 +2217,11 @@ def show_ship(ship):
         cx = 7
         super_rows = max(2, ship_h * 3 // 10)
 
-        pl_bg_pal[1] = 0x001237   # ocean deep
-        pl_bg_pal[2] = 0xBBBBCC   # hull (light blue-gray)
-        pl_bg_pal[3] = 0x003264   # ocean mid
-        pl_bg_pal[4] = 0x125A96   # ocean surface
-        pl_bg_pal[5] = color       # superstructure (ship type color)
+        pl_bg_pal[1] = _dim(0x001237)   # ocean deep
+        pl_bg_pal[2] = _dim(0xBBBBCC)   # hull (light blue-gray)
+        pl_bg_pal[3] = _dim(0x003264)   # ocean mid
+        pl_bg_pal[4] = _dim(0x125A96)   # ocean surface
+        pl_bg_pal[5] = _dim(color)      # superstructure (ship type color)
 
         # Fill ocean background, then draw hull — update_ship_ocean animates it
         for y in range(32):
@@ -1336,7 +2264,7 @@ def show_ship(ship):
         else:
             airline_label.text = name[:9]
             airline_label.x = 16
-        airline_label.color = 0xFFFFFF
+        airline_label.color = _dim(0xFFFFFF)
         airline_label.y = 5
 
         # Row 2: type name and/or length in feet. AIS reports length in
@@ -1359,14 +2287,14 @@ def show_ship(ship):
         else:
             _ship_alt_enabled = False
             _center_ship_mid(reg_label, type_name[:9])
-        reg_label.color = color
+        reg_label.color = _dim(color)
         reg_label.y = 13
 
         if dest:
             _center_ship_mid(alt_label, dest[:9])
         else:
             alt_label.text = ""
-        alt_label.color = 0x8899AA
+        alt_label.color = _dim(0x8899AA)
         alt_label.y = 21
 
         dist = ship.get("distance_mi", 0)
@@ -1375,10 +2303,57 @@ def show_ship(ship):
         info = "{}mi {}".format(dist, compass) if dist else compass
         actype_label.font = FONT_SMALL
         _center_ship(actype_label, info)
-        actype_label.color = 0x6699AA
+        actype_label.color = _dim(0x6699AA)
         actype_label.y = 29
     except MemoryError as _e:
         print("show_ship MemoryError:", _e)
+        gc.collect()
+
+
+def show_forecast():
+    """Render the 3-day forecast card. Vertical columns: day name, weather
+    glyph, condition text, high temp, wind speed, wind direction."""
+    try:
+        switch_screen("forecast")
+        device_log("Fcst show:{}d".format(len(forecast_days)))
+        # Wipe glyph zone + redraw separator lines. Text labels self-update.
+        for y in range(FORECAST_H):
+            for x in range(FORECAST_W):
+                forecast_bmp[x, y] = 0
+        for sy in range(FORECAST_H):
+            forecast_bmp[42, sy] = 6
+            forecast_bmp[85, sy] = 6
+
+        # Empty-data fallback: clear all labels and surface a single
+        # "NO FORECAST DATA" line centered on the panel. This still confirms
+        # the rotation slot is firing — without it, an empty forecast_days
+        # would render as a near-black card and feel like a no-op.
+        if not forecast_days:
+            for col_labels in _forecast_labels:
+                for lbl in col_labels:
+                    lbl.text = ""
+            _forecast_labels[1][0].text = "NO DATA"
+            return
+
+        for col in range(3):
+            day_lbl, cond_lbl, hi_lbl, wind_s_lbl, wind_d_lbl = _forecast_labels[col]
+            if col < len(forecast_days):
+                d = forecast_days[col]
+                cond_id = d.get("cond_id", 800)
+                day_lbl.text = _forecast_day_label(col)
+                cond_lbl.text = get_condition_text(cond_id, d.get("cond", "Clear"))[:10]
+                hi_lbl.text = "{}{}F".format(d.get("hi", "?"), chr(176))
+                wind_s_lbl.text = "{}mph".format(d.get("wind", 0))
+                wind_d_lbl.text = heading_to_compass(d.get("wind_deg", 0))
+                _draw_forecast_glyph(_FCOL_CENTERS[col], _FGLYPH_CY, cond_id)
+            else:
+                day_lbl.text = ""
+                cond_lbl.text = ""
+                hi_lbl.text = ""
+                wind_s_lbl.text = ""
+                wind_d_lbl.text = ""
+    except MemoryError as _e:
+        print("show_forecast MemoryError:", _e)
         gc.collect()
 
 
@@ -1397,19 +2372,24 @@ def show_weather_tides():
         elif temp_val >= 50: tc = 0x88FFCC
         elif temp_val >= 30: tc = 0x44AAFF
         else:                tc = 0x2255CC
-        temp_label.color = tc
+        temp_label.color = _dim(tc)
         _center_small(cond_label, weather_cond[:10])
         _center_small(wind_label, wind_str)
-        # Tide time / HIGH / LOW at bottom of left column. Slack window
-        # is ±15 minutes, expressed in seconds since predictions are absolute.
-        now_secs = time.mktime(time.localtime())
-        slack_label = ""
-        for p in _tide_predictions:
-            if abs(p[0] - now_secs) <= 900:
-                slack_label = "HIGH" if p[1] == "H" else "LOW"
-                break
-        tide_time_label.text = slack_label if slack_label else tide_str
-        tide_time_label.color = 0xFFFFFF if (slack_label or _tide_level < 0.2) else 0x00CCDD
+        if BASIN_MODE == "sky":
+            # Planet-card labels are owned by update_basin_planets() — it
+            # writes them on every glyph swap. Nothing to do here.
+            pass
+        else:
+            # Tide time / HIGH / LOW at bottom of left column. Slack window
+            # is ±15 minutes, expressed in seconds since predictions are absolute.
+            now_secs = time.mktime(time.localtime())
+            slack_label = ""
+            for p in _tide_predictions:
+                if abs(p[0] - now_secs) <= 900:
+                    slack_label = "HIGH" if p[1] == "H" else "LOW"
+                    break
+            tide_time_label.text = slack_label if slack_label else tide_str
+            tide_time_label.color = _dim(0xFFFFFF if (slack_label or _tide_level < 0.2) else 0x00CCDD)
     except MemoryError as _e:
         print("show_weather_tides MemoryError:", _e)
         gc.collect()
@@ -1452,9 +2432,9 @@ def show_plane(plane):
         actype_label.font = FONT_SMALL
 
         airline_label.y = 13; airline_label.x = 16
-        alt_label.y     = 20; alt_label.x     = 16; alt_label.color = 0x44AA44
+        alt_label.y     = 20; alt_label.x     = 16; alt_label.color = _dim(0x44AA44)
         actype_label.y  = 27; actype_label.x  = 16
-        reg_label.y     = 27; reg_label.x     = 16; reg_label.color = 0x667788
+        reg_label.y     = 27; reg_label.x     = 16; reg_label.color = _dim(0x667788)
         logo_label.y    = 16; logo_label.x    = 2
 
         callsign = plane[0]
@@ -1464,7 +2444,7 @@ def show_plane(plane):
         logo_label.text = iata
         logo_label.x = 1 + (14 - len(iata) * 6) // 2
         bright = ((color >> 16) & 0xFF) * 0.299 + ((color >> 8) & 0xFF) * 0.587 + (color & 0xFF) * 0.114
-        logo_label.color = 0x111111 if bright > 140 else 0xFFFFFF
+        logo_label.color = _dim(0x111111 if bright > 140 else 0xFFFFFF)
 
         # Safety net: if the cache entry is gone (evicted by a sibling
         # fetch_route call during get_displayable_planes' iteration) or
@@ -1477,7 +2457,7 @@ def show_plane(plane):
         route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
 
         airline_label.text = name[:8]
-        airline_label.color = color
+        airline_label.color = _dim(color)
 
         alt_k = plane[2] // 1000
         alt_label.text = "{}k {}".format(alt_k, heading_to_compass(plane[4])) if alt_k > 0 else ""
@@ -1485,7 +2465,7 @@ def show_plane(plane):
         # Row 4: type (left) + registration (right-aligned)
         ac_type = route.get("type", "")
         actype_label.text = ac_type
-        actype_label.color = 0x55AADD
+        actype_label.color = _dim(0x55AADD)
         reg = route.get("reg", "") or ""
         reg_label.text = reg
         if reg:
@@ -1577,14 +2557,36 @@ while True:
             _demo_advance()
             _demo_last_switch = now
     else:
-        # --- Weather + Tides refresh ---
+        # --- Weather + Tides/Sky refresh ---
         if now - last_weather_fetch >= WEATHER_INTERVAL:
             fetch_weather()
-            fetch_tides()
+            if BASIN_MODE == "sky":
+                fetch_sky()
+            else:
+                fetch_tides()
             flush_device_log()
             last_weather_fetch = now
-            if not showing_planes:
+            if not showing_planes and not _forecast_showing:
                 show_weather_tides()
+
+        # --- 3-day forecast refresh (sky mode only — the only rotation slot
+        # that surfaces it). Independent cadence from current-weather since
+        # the daily outlook only changes a few times a day.
+        if BASIN_MODE == "sky" and now - last_forecast_fetch >= FORECAST_INTERVAL:
+            fetch_forecast()
+            last_forecast_fetch = now
+
+        # --- Forecast card show/hide. Sky list view raises _forecast_pending
+        # on exit; we honour it here unless a plane or ship is currently
+        # owning the screen. Dwell expires → return to weather/tides.
+        if _forecast_pending and not showing_planes and not _showing_ship:
+            _forecast_pending = False
+            _forecast_showing = True
+            _forecast_started_at = now
+            show_forecast()
+        if _forecast_showing and now - _forecast_started_at >= FORECAST_DWELL_SECS:
+            _forecast_showing = False
+            show_weather_tides()
 
         # --- Proxy health check (drives the bottom-right red pixel) ---
         if PROXY_HOST and now - last_health_fetch >= HEALTH_INTERVAL:
@@ -1620,6 +2622,7 @@ while True:
             # flag — otherwise the ship per-tick block keeps animating
             # update_ship_ocean over pl_bg_bmp, clobbering the plane logo.
             _showing_ship = False
+            _forecast_showing = False    # plane takes over the screen group
             plane_idx = 0
             last_plane_cycle = now
             plane_screen_started_at = now
@@ -1666,6 +2669,7 @@ while True:
                         cumulative += _d
                     if not _showing_ship:
                         _showing_ship = True
+                        _forecast_showing = False    # ship takes over the screen group
                         ship_idx = expected_idx
                         device_log("Ship:{} {}mi".format(ships[ship_idx].get("name","?")[:12], ships[ship_idx].get("distance_mi","?")))
                         show_ship(ships[ship_idx])
@@ -1689,7 +2693,7 @@ while True:
     # gc.collect() first to maximize the largest contiguous free block.
     # NOTE: do NOT call fetch_failed() here — render MemoryErrors are normal
     # and must not count toward the auto-reboot threshold.
-    if not showing_planes and not _showing_ship:
+    if not showing_planes and not _showing_ship and not _forecast_showing:
         try:
             gc.collect()
             t = time.localtime()
@@ -1697,26 +2701,30 @@ while True:
             ampm = "A" if t.tm_hour < 12 else "P"
             _center_mid(clock_label, "{}:{:02d} {}M".format(h12, t.tm_min, ampm))
             _basin_anim_tick += 1
-            update_basin_water(_tide_level, _basin_anim_tick)
-            _at_slack = tide_time_label.text in ("HIGH", "LOW")
-            if _at_slack:
-                _now_secs = time.mktime(t)
-                _still_slack = False
-                for _p in _tide_predictions:
-                    if abs(_p[0] - _now_secs) <= 900:
-                        _still_slack = True
-                        break
-                if not _still_slack:
-                    tide_time_label.text = tide_str
-                    tide_time_label.color = 0x00CCDD
-                    _at_slack = False
-            sep_pixel_tg.hidden = _at_slack
-            if not _at_slack:
-                if tide_type_val == "H":
-                    _sep_pixel_y = (_sep_pixel_y - 1) % 32
-                elif tide_type_val == "L":
-                    _sep_pixel_y = (_sep_pixel_y + 1) % 32
-                sep_pixel_tg.y = _sep_pixel_y
+            if BASIN_MODE == "sky":
+                update_basin_planets()
+                sep_pixel_tg.hidden = True
+            else:
+                update_basin_water(_tide_level, _basin_anim_tick)
+                _at_slack = tide_time_label.text in ("HIGH", "LOW")
+                if _at_slack:
+                    _now_secs = time.mktime(t)
+                    _still_slack = False
+                    for _p in _tide_predictions:
+                        if abs(_p[0] - _now_secs) <= 900:
+                            _still_slack = True
+                            break
+                    if not _still_slack:
+                        tide_time_label.text = tide_str
+                        tide_time_label.color = _dim(0x00CCDD)
+                        _at_slack = False
+                sep_pixel_tg.hidden = _at_slack
+                if not _at_slack:
+                    if tide_type_val == "H":
+                        _sep_pixel_y = (_sep_pixel_y - 1) % 32
+                    elif tide_type_val == "L":
+                        _sep_pixel_y = (_sep_pixel_y + 1) % 32
+                    sep_pixel_tg.y = _sep_pixel_y
             update_brightness()
         except MemoryError as _e:
             print("per-tick MemoryError:", _e)
