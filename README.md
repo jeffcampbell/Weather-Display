@@ -2,7 +2,7 @@
 
 ![Weather and tide screen](img/normal_weather.jpg)
 
-A live weather, tide, aircraft, and ship tracker that runs on an Adafruit MatrixPortal driving a 64×32 RGB LED matrix.
+A live weather, tide, aircraft, and ship tracker that runs on an Adafruit MatrixPortal driving a 64×32 or 128×64 RGB LED matrix (selectable via a `display` flag; the 128×64 layout adds a sky map, planet views, and a 3-day forecast).
 
 The display cycles between three screens depending on what's happening nearby:
 
@@ -128,7 +128,7 @@ See [device/SETUP.md](device/SETUP.md) for the full walkthrough. Quick version:
 4. Copy the data files from `device/` (`airlines.csv`, `airports.csv`, `conditions.csv`) to `CIRCUITPY/`.
 5. Copy `device/secrets.py.template` to `device/secrets.py`, fill in your Wi-Fi, OpenWeatherMap key, NOAA station, lat/lon, Pi proxy URL, and (if you set one on the proxy) `device_secret`. Then copy the file to `CIRCUITPY/secrets.py`.
 6. Copy `device/boot.py` to `CIRCUITPY/boot.py`. On the S3 this disables USB mass-storage in favor of the web workflow; on the M4 it's a no-op.
-7. Copy `device/code.py` to `CIRCUITPY/code.py`. CircuitPython auto-restarts.
+7. Copy `device/code.py`, `device/layout_64x32.py`, and `device/layout_128x64.py` to `CIRCUITPY/`. The launcher (`code.py`) starts the layout matching `display` in `secrets.py` (default `64x32`). CircuitPython auto-restarts.
 
 The display should show `LOADING...` for a few seconds, then the weather + tides screen.
 
@@ -138,7 +138,9 @@ The display should show `LOADING...` for a few seconds, then the weather + tides
 
 ```
 device/
-  code.py                 Main CircuitPython application
+  code.py                 Launcher — picks a layout from `display` in secrets.py
+  layout_64x32.py         Native 64×32 layout
+  layout_128x64.py        Native 128×64 layout (scale=2 + wide astronomy)
   boot.py                 Runs once at boot — disables USB on the S3
   secrets.py.template     Configuration template (copy to secrets.py)
   settings.toml.template  CircuitPython native settings (Wi-Fi + web workflow)
