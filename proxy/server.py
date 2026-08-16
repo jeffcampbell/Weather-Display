@@ -1742,8 +1742,13 @@ def _statuspage_indicator_level(indicator):
 
 def _status_statuspage(name, host):
     """Adapter for Atlassian Statuspage sites (GitHub, Cloudflare, Supabase,
-    HashiCorp, ...). status.json gives the overall indicator; only when it's
-    non-green do we spend a second request on summary.json for incident text."""
+    HashiCorp, ...). status.json gives the overall indicator, but that indicator
+    is rolled up from every component's state — for Cloudflare that includes the
+    handful of edge PoPs perpetually rerouting or in maintenance, which flips the
+    indicator to "minor" even though the human status page (which suppresses that
+    routine churn) reads "All Systems Operational". So we only trust a non-green
+    indicator when summary.json also lists an active incident; otherwise it's
+    background noise and we report normal, matching what a person sees."""
     st, body = fetch("https://{}/api/v2/status.json".format(host), timeout=8)
     if st != 200:
         raise RuntimeError("status.json HTTP {}".format(st))
@@ -1752,21 +1757,31 @@ def _status_statuspage(name, host):
     entry = {"name": name, "level": level}
     if level == 0:
         return entry
+    # Indicator is non-green. Confirm there's a real incident before escalating.
+    # summary.json's `incidents` array holds only unresolved (active) incidents.
     try:
         st2, body2 = fetch("https://{}/api/v2/summary.json".format(host), timeout=8)
-        if st2 == 200:
-            incidents = json.loads(body2).get("incidents") or []
-            if incidents:
-                inc = incidents[0]
-                entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
-                comps = inc.get("components") or []
-                if comps:
-                    entry["component"] = _status_trunc(
-                        comps[0].get("name"), _STATUS_COMPONENT_MAX)
+        if st2 != 200:
+            raise RuntimeError("summary.json HTTP {}".format(st2))
+        incidents = json.loads(body2).get("incidents") or []
     except Exception as e:
+        # Can't confirm; don't silently hide a possible real problem. Keep the
+        # indicator's level and fall back to the page description for a title.
         _log_proxy_event("status summary {} failed: {}".format(name, e))
-    # Fall back to the page's own description ("Partial System Outage" etc.)
-    # when the indicator is non-green but no active incident lists a title.
+        entry["title"] = _status_trunc(
+            status_obj.get("description"), _STATUS_TITLE_MAX)
+        return entry
+    if not incidents:
+        # Non-green indicator with no active incident == routine component noise
+        # (edge maintenance / partial reroutes). Report normal, like the page.
+        entry["level"] = 0
+        return entry
+    inc = incidents[0]
+    entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
+    comps = inc.get("components") or []
+    if comps:
+        entry["component"] = _status_trunc(
+            comps[0].get("name"), _STATUS_COMPONENT_MAX)
     if not entry.get("title"):
         entry["title"] = _status_trunc(
             status_obj.get("description"), _STATUS_TITLE_MAX)
