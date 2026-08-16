@@ -9,7 +9,8 @@
 #
 # Feature flags (enable_weather / enable_tide / enable_astronomy /
 # enable_planes / enable_boats) live inside both layouts and behave the same
-# either way — see either module's configuration block.
+# either way — see either module's configuration block. enable_astronomy and
+# enable_status are 128x64-only (the outage board and rich sky views).
 #
 # Importing a layout module runs it (its main loop never returns), so this
 # file does nothing else after the import.

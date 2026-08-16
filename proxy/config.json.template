@@ -29,5 +29,16 @@
   "flightaware_override_free_routes": true,
 
   "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
-  "device_secret": ""
+  "device_secret": "",
+
+  "_status_providers_comment": "Providers monitored by /api/status (the 128x64 outage board). type 'statuspage' is fully config-driven — add any Atlassian Statuspage site with just name+host, no code. type 'aws'/'gcp'/'azure' use built-in adapters (host ignored). Omit this key to use the built-in default set below.",
+  "status_providers": [
+    { "name": "GitHub",     "type": "statuspage", "host": "www.githubstatus.com" },
+    { "name": "Cloudflare", "type": "statuspage", "host": "www.cloudflarestatus.com" },
+    { "name": "Supabase",   "type": "statuspage", "host": "status.supabase.com" },
+    { "name": "HashiCorp",  "type": "statuspage", "host": "status.hashicorp.com" },
+    { "name": "AWS",        "type": "aws" },
+    { "name": "GCP",        "type": "gcp" },
+    { "name": "Azure",      "type": "azure" }
+  ]
 }

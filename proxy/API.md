@@ -22,6 +22,7 @@ When `device_secret` is set in the proxy's `config.json`, **every endpoint** req
 | `POST /api/devicelog` | Append device log entries |
 | `GET /api/health` | Liveness check |
 | `GET /api/time` | Current UTC + the proxy's local TZ offset (the device's clock source) |
+| `GET /api/status` | Normalized cloud/dev provider outage board (128x64 display) |
 
 ---
 
@@ -569,6 +570,42 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
 
 ---
 
+## `GET /api/status`
+
+Aggregates the public status feeds of major cloud/dev providers into one compact, pre-normalized payload for the 128x64 outage board. The proxy does all the HTTP and parsing (7+ heterogeneous feeds) so the memory-constrained device just reads levels. Providers, their adapters, and order come from the `status_providers` config block.
+
+**Response:**
+
+```json
+{
+  "providers": [
+    { "name": "GitHub", "level": 0 },
+    { "name": "Supabase", "level": 1, "title": "401 errors due to JWT rejections", "component": "API Gateway" },
+    { "name": "AWS", "level": 2, "title": "Increased error rates", "component": "EC2 · us-east-1" }
+  ],
+  "worst": 1,
+  "ts": 1786871646
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `providers` | array | One entry per configured provider, in config order (stable, so the device grid layout is stable) |
+| `providers[].name` | string | Display name (`GitHub`, `AWS`, …) |
+| `providers[].level` | int | Normalized status: `0` = normal, `1` = degraded, `2` = outage |
+| `providers[].title` | string | Short incident headline. **Present only when `level > 0`.** Truncated to ~48 chars. |
+| `providers[].component` | string | Affected service/component (and region where the feed gives one). **Optional**, only when the feed provides it. Truncated to ~24 chars. |
+| `worst` | int | The maximum `level` across all providers — lets the device decide at a glance whether any incident cards are needed |
+| `ts` | int | Unix seconds when this snapshot was built |
+
+**Level mapping:** Atlassian Statuspage `status.indicator` → `none` = 0, `minor` = 1, `major`/`critical` = 2. GCP: an open incident (no `end`) with a high severity or an `OUTAGE` impact = 2, else 1. AWS/Azure: any current/active event = 1, escalated to 2 on an outage/unavailable keyword.
+
+**Resilience:** each provider is fetched inside a `try`/`except`; a feed that errors or times out degrades to `level: 0` (and logs a `proxy:` line) rather than failing the whole board.
+
+**Cache TTL:** 180s (`STATUS_CACHE_SEC`). The device polls at this cadence; the cache keeps upstream load to at most one round of feed fetches per window regardless of how many displays poll.
+
+---
+
 ## Configuration (`config.json`)
 
 ```json
@@ -597,5 +634,6 @@ Returns current UTC seconds plus the proxy's local TZ offset (DST-aware). The Ma
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Overrides the free OpenSky / adsbdb route by default (see `flightaware_override_free_routes`); if missing, those are the only route sources. |
 | `flightaware_override_free_routes` | `/api/route` | When `true` (default), FlightAware overrides a route the free DBs already resolved, fixing stale "right tail, wrong route" answers from reused callsigns. `false` reverts to consulting FlightAware only when the free sources found nothing. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
+| `status_providers` | `/api/status` | Providers to monitor, in display order. Each has `name` and `type`. `type: "statuspage"` needs a `host` (any Atlassian Statuspage site — add one with no code). `type: "aws"`/`"gcp"`/`"azure"` use built-in adapters (no `host`). Omit the whole key to use the built-in default set (GitHub, Cloudflare, Supabase, HashiCorp, AWS, GCP, Azure). |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).

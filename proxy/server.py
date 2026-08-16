@@ -63,6 +63,21 @@ BBOX = float(_config.get("bbox", 0.1))
 # the LATITUDE/LONGITUDE/BBOX globals above — leaving v1 behavior untouched.
 LOCATIONS = _config.get("locations") or {}
 
+# Cloud/dev service providers to monitor for /api/status. Statuspage-based
+# providers are fully config-driven (name + host); AWS/GCP/Azure use built-in
+# adapters keyed by "type". Defaults cover the launch set so the endpoint works
+# even if config.json predates this feature. See handle_status.
+_DEFAULT_STATUS_PROVIDERS = [
+    {"name": "GitHub",     "type": "statuspage", "host": "www.githubstatus.com"},
+    {"name": "Cloudflare", "type": "statuspage", "host": "www.cloudflarestatus.com"},
+    {"name": "Supabase",   "type": "statuspage", "host": "status.supabase.com"},
+    {"name": "HashiCorp",  "type": "statuspage", "host": "status.hashicorp.com"},
+    {"name": "AWS",        "type": "aws"},
+    {"name": "GCP",        "type": "gcp"},
+    {"name": "Azure",      "type": "azure"},
+]
+STATUS_PROVIDERS = _config.get("status_providers") or _DEFAULT_STATUS_PROVIDERS
+
 
 def resolve_location(params):
     """Resolve ?loc=<name> against the LOCATIONS config block. Returns
@@ -1698,6 +1713,183 @@ def handle_sightings(params):
     return 200, json.dumps(result).encode()
 
 
+# ---------------------------------------------------------------------------
+# Service status board (/api/status)
+# ---------------------------------------------------------------------------
+# Aggregates the public status feeds of major cloud/dev providers into one
+# compact, normalized payload the 128x64 display polls. All the heavy HTTP +
+# parsing lives here so the memory-constrained device just reads pre-digested
+# levels. Normalized level scale everywhere: 0 = normal, 1 = degraded,
+# 2 = outage. See STATUS_PROVIDERS config near the top of the file.
+
+STATUS_CACHE_SEC = 180        # display polls this; keep upstream load light
+_STATUS_TITLE_MAX = 48
+_STATUS_COMPONENT_MAX = 24
+
+
+def _status_trunc(s, limit):
+    # Collapse whitespace and drop non-ASCII — the device's BDF fonts only have
+    # ASCII glyphs, so curly quotes / em-dashes / etc. would render as gaps.
+    s = " ".join(str(s or "").encode("ascii", "ignore").decode().split())
+    return s if len(s) <= limit else s[: limit - 2].rstrip() + ".."
+
+
+def _statuspage_indicator_level(indicator):
+    """Map an Atlassian Statuspage status.indicator to our 0/1/2 scale."""
+    return {"none": 0, "minor": 1, "major": 2, "critical": 2}.get(
+        (indicator or "").lower(), 0)
+
+
+def _status_statuspage(name, host):
+    """Adapter for Atlassian Statuspage sites (GitHub, Cloudflare, Supabase,
+    HashiCorp, ...). status.json gives the overall indicator; only when it's
+    non-green do we spend a second request on summary.json for incident text."""
+    st, body = fetch("https://{}/api/v2/status.json".format(host), timeout=8)
+    if st != 200:
+        raise RuntimeError("status.json HTTP {}".format(st))
+    status_obj = json.loads(body).get("status", {})
+    level = _statuspage_indicator_level(status_obj.get("indicator", "none"))
+    entry = {"name": name, "level": level}
+    if level == 0:
+        return entry
+    try:
+        st2, body2 = fetch("https://{}/api/v2/summary.json".format(host), timeout=8)
+        if st2 == 200:
+            incidents = json.loads(body2).get("incidents") or []
+            if incidents:
+                inc = incidents[0]
+                entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
+                comps = inc.get("components") or []
+                if comps:
+                    entry["component"] = _status_trunc(
+                        comps[0].get("name"), _STATUS_COMPONENT_MAX)
+    except Exception as e:
+        _log_proxy_event("status summary {} failed: {}".format(name, e))
+    # Fall back to the page's own description ("Partial System Outage" etc.)
+    # when the indicator is non-green but no active incident lists a title.
+    if not entry.get("title"):
+        entry["title"] = _status_trunc(
+            status_obj.get("description"), _STATUS_TITLE_MAX)
+    return entry
+
+
+def _status_gcp(name):
+    """Adapter for Google Cloud. incidents.json is an array; an incident with
+    no `end` timestamp is still open. severity high (or an OUTAGE impact) => 2."""
+    st, body = fetch("https://status.cloud.google.com/incidents.json", timeout=8)
+    if st != 200:
+        raise RuntimeError("incidents.json HTTP {}".format(st))
+    incidents = json.loads(body) or []
+    worst = None
+    for inc in incidents:
+        if inc.get("end"):
+            continue    # resolved
+        impact = (inc.get("status_impact") or "").upper()
+        sev = (inc.get("severity") or "").lower()
+        lvl = 2 if ("OUTAGE" in impact or sev == "high") else 1
+        if worst is None or lvl > worst.get("level", 0):
+            comps = inc.get("affected_products") or []
+            worst = {
+                "name": name,
+                "level": lvl,
+                "title": _status_trunc(inc.get("external_desc"), _STATUS_TITLE_MAX),
+            }
+            if comps:
+                worst["component"] = _status_trunc(
+                    comps[0].get("title"), _STATUS_COMPONENT_MAX)
+    return worst or {"name": name, "level": 0}
+
+
+def _status_aws(name):
+    """Adapter for the AWS Health Dashboard public feed. Its shape is not a
+    stable contract, so parse defensively: any current event => degraded, and
+    an 'outage'/'unavailable' keyword escalates to 2."""
+    st, body = fetch("https://health.aws.amazon.com/public/currentevents", timeout=8)
+    if st != 200:
+        raise RuntimeError("currentevents HTTP {}".format(st))
+    data = json.loads(body)
+    events = data if isinstance(data, list) else (data.get("events") or [])
+    if not events:
+        return {"name": name, "level": 0}
+    ev = events[0]
+    text = " ".join(str(ev.get(k, "")) for k in (
+        "event_title", "summary", "service_name", "status_text", "description"))
+    lvl = 2 if any(w in text.lower() for w in
+                   ("outage", "unavailable", "not available", "down")) else 1
+    entry = {"name": name, "level": lvl,
+             "title": _status_trunc(text, _STATUS_TITLE_MAX)}
+    svc = ev.get("service_name") or ev.get("service")
+    region = ev.get("region") or ev.get("region_name")
+    comp = " - ".join(x for x in (svc, region) if x)
+    if comp:
+        entry["component"] = _status_trunc(comp, _STATUS_COMPONENT_MAX)
+    return entry
+
+
+def _status_azure(name):
+    """Adapter for Azure. No clean JSON — parse the status RSS feed. Items whose
+    text says 'resolved' are skipped; any remaining active item => degraded."""
+    import xml.etree.ElementTree as ET
+    st, body = fetch("https://azure.status.microsoft/en-us/status/feed/", timeout=8)
+    if st != 200:
+        raise RuntimeError("azure feed HTTP {}".format(st))
+    root = ET.fromstring(body)
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        if "resolved" in (title + " " + desc).lower():
+            continue
+        lvl = 2 if any(w in (title + " " + desc).lower() for w in
+                       ("outage", "unavailable", "down")) else 1
+        return {"name": name, "level": lvl,
+                "title": _status_trunc(title, _STATUS_TITLE_MAX)}
+    return {"name": name, "level": 0}
+
+
+_STATUS_ADAPTERS = {
+    "statuspage": lambda p: _status_statuspage(p["name"], p["host"]),
+    "gcp":        lambda p: _status_gcp(p["name"]),
+    "aws":        lambda p: _status_aws(p["name"]),
+    "azure":      lambda p: _status_azure(p["name"]),
+}
+
+
+def handle_status(params):
+    """Aggregate provider status feeds into one compact payload for the display.
+    Providers at level 0 omit component/title. A feed that errors degrades to
+    level 0 (logged) rather than failing the whole board. Cached for
+    STATUS_CACHE_SEC so device polling never hammers the upstreams."""
+    cache_key = "status"
+    cached = cache_get(cache_key, max_age_sec=STATUS_CACHE_SEC)
+    if cached:
+        return 200, cached
+
+    providers = []
+    worst = 0
+    for p in STATUS_PROVIDERS:
+        name = p.get("name", "?")
+        adapter = _STATUS_ADAPTERS.get(p.get("type", "statuspage"))
+        if not adapter:
+            _log_proxy_event("status: unknown provider type for {}".format(name))
+            providers.append({"name": name, "level": 0})
+            continue
+        try:
+            entry = adapter(p)
+        except Exception as e:
+            _log_proxy_event("status {} failed: {}".format(name, e))
+            entry = {"name": name, "level": 0}
+        worst = max(worst, entry.get("level", 0))
+        providers.append(entry)
+
+    body = json.dumps({
+        "providers": providers,
+        "worst": worst,
+        "ts": int(time.time()),
+    }).encode()
+    cache_set(cache_key, body, age_override=STATUS_CACHE_SEC)
+    return 200, body
+
+
 ROUTES = {
     "/api/planes":      handle_planes,
     "/api/route":       handle_route,
@@ -1712,6 +1904,7 @@ ROUTES = {
     "/api/sightings":   handle_sightings,
     "/api/devicelog":   handle_devicelog_get,
     "/api/health":      handle_health,
+    "/api/status":      handle_status,
     "/api/time":        handle_time,
 }
 
