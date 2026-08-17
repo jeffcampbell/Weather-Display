@@ -14,6 +14,7 @@ Usage:
     PORT=8080 python3 server.py        # custom port
 """
 
+import calendar
 import json
 import math
 import os
@@ -1740,6 +1741,31 @@ def _statuspage_indicator_level(indicator):
         (indicator or "").lower(), 0)
 
 
+def _statuspage_component_level(status):
+    """Map an Atlassian Statuspage *component* status to our 0/1/2 scale.
+    This is the current, live state of one service — unlike the page indicator
+    or an incident's impact, which stay pinned at the peak until resolution."""
+    return {
+        "operational": 0,
+        "degraded_performance": 1,
+        "under_maintenance": 1,
+        "partial_outage": 1,
+        "major_outage": 2,
+    }.get((status or "").lower(), 0)
+
+
+def _statuspage_updated_epoch(iso):
+    """Parse a Statuspage ISO8601-UTC timestamp (e.g. 2026-08-17T20:45:28.860Z)
+    into a Unix epoch. Returns None if absent/unparseable."""
+    if not iso:
+        return None
+    s = str(iso).split(".")[0].rstrip("Z")
+    try:
+        return int(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return None
+
+
 def _status_statuspage(name, host):
     """Adapter for Atlassian Statuspage sites (GitHub, Cloudflare, Supabase,
     HashiCorp, ...). status.json gives the overall indicator, but that indicator
@@ -1753,9 +1779,9 @@ def _status_statuspage(name, host):
     if st != 200:
         raise RuntimeError("status.json HTTP {}".format(st))
     status_obj = json.loads(body).get("status", {})
-    level = _statuspage_indicator_level(status_obj.get("indicator", "none"))
-    entry = {"name": name, "level": level}
-    if level == 0:
+    ind_level = _statuspage_indicator_level(status_obj.get("indicator", "none"))
+    entry = {"name": name, "level": ind_level}
+    if ind_level == 0:
         return entry
     # Indicator is non-green. Confirm there's a real incident before escalating.
     # summary.json's `incidents` array holds only unresolved (active) incidents.
@@ -1777,11 +1803,32 @@ def _status_statuspage(name, host):
         entry["level"] = 0
         return entry
     inc = incidents[0]
-    entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
+    # Grade severity off the incident's CURRENT affected-component statuses, not
+    # the page indicator / incident impact — those stay pinned at the peak
+    # ("major"/"critical") until the incident is resolved, so they keep screaming
+    # OUTAGE for hours after the services actually recovered. The worst live
+    # component is what a person reading the page sees right now.
     comps = inc.get("components") or []
-    if comps:
+    worst_comp = None
+    level = 0
+    for c in comps:
+        cl = _statuspage_component_level(c.get("status"))
+        if worst_comp is None or cl > level:
+            level, worst_comp = cl, c
+    if not comps:
+        level = ind_level    # no per-component detail; trust the indicator
+    entry["level"] = level
+    updated = _statuspage_updated_epoch(inc.get("updated_at"))
+    if updated:
+        entry["updated"] = updated
+    if level == 0:
+        # Incident still open but every affected component is back to
+        # operational — GitHub just hasn't clicked "resolve". Report normal.
+        return entry
+    entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
+    if worst_comp is not None:
         entry["component"] = _status_trunc(
-            comps[0].get("name"), _STATUS_COMPONENT_MAX)
+            worst_comp.get("name"), _STATUS_COMPONENT_MAX)
     if not entry.get("title"):
         entry["title"] = _status_trunc(
             status_obj.get("description"), _STATUS_TITLE_MAX)

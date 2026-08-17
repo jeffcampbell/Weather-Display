@@ -1754,6 +1754,19 @@ def show_status_summary():
         gc.collect()
 
 
+def _fmt_status_updated(epoch):
+    """UTC epoch -> local 'h:mmp' clock string via the synced tz offset, for the
+    incident card's last-update time. Empty string when unknown/unparseable."""
+    if not epoch:
+        return ""
+    try:
+        t = time.localtime(int(epoch) + _tz_offset_secs)
+        return "{}:{:02d}{}".format(
+            t.tm_hour % 12 or 12, t.tm_min, "p" if t.tm_hour >= 12 else "a")
+    except (ValueError, OverflowError):
+        return ""
+
+
 def show_status_incident(p):
     """Render the detail card for one degraded/down provider."""
     try:
@@ -1761,7 +1774,9 @@ def show_status_incident(p):
         lvl = p.get("level", 0)
         col = _dim(0xFF0000 if lvl >= 2 else 0xFFAA00)
         _sti_provider.text = str(p.get("name", ""))[:20]
-        _sti_status.text = "OUTAGE" if lvl >= 2 else "DEGRADED"
+        _upd = _fmt_status_updated(p.get("updated"))
+        _sti_status.text = ("OUTAGE" if lvl >= 2 else "DEGRADED") + (
+            "  " + _upd if _upd else "")
         _sti_status.color = col
         _sti_comp.text = str(p.get("component", ""))[:30]
         _l1, _l2 = _status_wrap2(str(p.get("title", "")), 30)
