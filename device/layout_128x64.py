@@ -1755,12 +1755,20 @@ def show_status_summary():
 
 
 def _fmt_status_updated(epoch):
-    """UTC epoch -> local 'h:mmp' clock string via the synced tz offset, for the
-    incident card's last-update time. Empty string when unknown/unparseable."""
+    """UTC epoch -> last-update string for the incident card. A bare 'h:mmp'
+    clock is only meaningful within the last day; once the update is more than
+    24h old the wall-clock time is ambiguous (no date shown), so collapse it to
+    '>24H'. Empty string when unknown/unparseable."""
     if not epoch:
         return ""
     try:
-        t = time.localtime(int(epoch) + _tz_offset_secs)
+        epoch = int(epoch)
+        # RTC holds local time, so mktime(localtime()) is a local epoch; back out
+        # the tz offset to compare against the UTC epoch the proxy sent.
+        now_utc = time.mktime(time.localtime()) - _tz_offset_secs
+        if now_utc - epoch > 86400:
+            return ">24H"
+        t = time.localtime(epoch + _tz_offset_secs)
         return "{}:{:02d}{}".format(
             t.tm_hour % 12 or 12, t.tm_min, "p" if t.tm_hour >= 12 else "a")
     except (ValueError, OverflowError):
