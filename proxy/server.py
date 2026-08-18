@@ -1866,11 +1866,11 @@ def _status_gcp(name):
 # real event open (no end_time) yet stops updating it for months. So we can't
 # just take events[0]: we filter to genuinely-active events and grade by the
 # feed's numeric status (0 normal/resolved, 1 informational, 2 degradation,
-# 3 disruption). Degraded events go stale after a week and drop off; an outage
-# has no staleness cap — a real one is important enough to stay on screen even
-# if AWS is slow to close it (they almost never run that long anyway).
+# 3 disruption). Any event we haven't seen an update on in a week is treated as
+# stale and dropped — a real ongoing AWS event gets updated far more often than
+# that, so a week-quiet entry is an abandoned-open feed artifact, not a signal.
 _AWS_STATUS_LEVEL = {"2": 1, "3": 2}          # 0/1 => not shown
-_AWS_DEGRADED_STALE_SEC = 7 * 86400
+_AWS_STALE_SEC = 7 * 86400
 
 
 def _aws_event_updated(ev):
@@ -1895,8 +1895,8 @@ def _aws_event_updated(ev):
 def _status_aws(name):
     """Adapter for the AWS Health Dashboard public feed (UTF-16 JSON; json.loads
     handles the BOM). Report the worst genuinely-active event: skip anything
-    with an end_time (resolved); degraded events must be fresh (<7d), outages
-    show regardless of age. See the module comment above for the rationale."""
+    with an end_time (resolved) or not updated in the last 7 days (stale). See
+    the module comment above for the rationale."""
     st, body = fetch("https://health.aws.amazon.com/public/currentevents", timeout=8)
     if st != 200:
         raise RuntimeError("currentevents HTTP {}".format(st))
@@ -1911,12 +1911,11 @@ def _status_aws(name):
         if not lvl:
             continue      # normal / informational — don't light the board
         updated = _aws_event_updated(ev)
-        if lvl == 1 and (updated is None
-                         or now - updated > _AWS_DEGRADED_STALE_SEC):
-            continue      # degraded but stale (or undatable) — drop it
-        key = (lvl, updated or 0)
+        if updated is None or now - updated > _AWS_STALE_SEC:
+            continue      # stale (or undatable) — drop it
+        key = (lvl, updated)
         if worst is None or key > worst[0:2]:
-            worst = (lvl, updated or 0, ev)
+            worst = (lvl, updated, ev)
     if worst is None:
         return {"name": name, "level": 0}
     lvl, updated, ev = worst
