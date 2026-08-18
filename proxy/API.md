@@ -580,8 +580,8 @@ Aggregates the public status feeds of major cloud/dev providers into one compact
 {
   "providers": [
     { "name": "GitHub", "level": 0 },
-    { "name": "Supabase", "level": 1, "title": "401 errors due to JWT rejections", "component": "API Gateway" },
-    { "name": "AWS", "level": 2, "title": "Increased error rates", "component": "EC2 · us-east-1" }
+    { "name": "Supabase", "level": 1, "title": "401 errors due to JWT rejections", "component": "API Gateway", "updated": 1786694012 },
+    { "name": "AWS", "level": 2, "title": "Increased error rates", "component": "Multiple services - us-east-1", "updated": 1786871500 }
   ],
   "worst": 1,
   "ts": 1786871646
@@ -595,10 +595,16 @@ Aggregates the public status feeds of major cloud/dev providers into one compact
 | `providers[].level` | int | Normalized status: `0` = normal, `1` = degraded, `2` = outage |
 | `providers[].title` | string | Short incident headline. **Present only when `level > 0`.** Truncated to ~48 chars. |
 | `providers[].component` | string | Affected service/component (and region where the feed gives one). **Optional**, only when the feed provides it. Truncated to ~24 chars. |
+| `providers[].updated` | int | Unix seconds of the incident's last update, when the feed carries one (Statuspage and AWS). **Optional.** The device renders it as a clock time, collapsing to `>24H` once it's over a day old. |
 | `worst` | int | The maximum `level` across all providers — lets the device decide at a glance whether any incident cards are needed |
 | `ts` | int | Unix seconds when this snapshot was built |
 
-**Level mapping:** Atlassian Statuspage `status.indicator` → `none` = 0, `minor` = 1, `major`/`critical` = 2. GCP: an open incident (no `end`) with a high severity or an `OUTAGE` impact = 2, else 1. AWS/Azure: any current/active event = 1, escalated to 2 on an outage/unavailable keyword.
+**Level mapping.** Each adapter reports the *current* worst state, not an incident's peak — a feed that stays flagged after the impact has cleared should not keep the board lit.
+
+- **Atlassian Statuspage** (GitHub, Cloudflare, Supabase, HashiCorp, …): a green `status.indicator` is `0`. A non-green indicator is trusted only when `summary.json` also lists an active (unresolved) incident — otherwise it's routine component noise (e.g. Cloudflare's perpetual edge-PoP maintenance) and reports `0`. When there is an active incident, the level is the max of that incident's affected components' *current* statuses (`operational` = 0; `degraded_performance`/`under_maintenance`/`partial_outage` = 1; `major_outage` = 2), so it tracks recovery even before the provider marks the incident resolved. If `summary.json` can't be fetched, it falls back to the indicator (`minor` = 1, `major`/`critical` = 2).
+- **GCP** (`incidents.json`): an open incident (no `end`) with a high severity or an `OUTAGE` impact = 2, else 1.
+- **AWS** (`currentevents`, UTF-16 JSON): the worst *active* event, graded by the feed's numeric `status` (`2` = degraded/1, `3` = disruption/2; `0`/`1` normal/informational are ignored). Events with an `end_time` (resolved) or no activity in the last 7 days (abandoned-open feed artifacts) are dropped, regardless of severity.
+- **Azure** (status RSS): an active item = 1, escalated to 2 on an outage/unavailable/down keyword; items whose text says "resolved" are skipped.
 
 **Resilience:** each provider is fetched inside a `try`/`except`; a feed that errors or times out degrades to `level: 0` (and logs a `proxy:` line) rather than failing the whole board.
 
