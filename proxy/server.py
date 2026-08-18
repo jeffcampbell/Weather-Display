@@ -1862,27 +1862,71 @@ def _status_gcp(name):
     return worst or {"name": name, "level": 0}
 
 
+# AWS keeps recently-resolved events in currentevents, and sometimes leaves a
+# real event open (no end_time) yet stops updating it for months. So we can't
+# just take events[0]: we filter to genuinely-active events and grade by the
+# feed's numeric status (0 normal/resolved, 1 informational, 2 degradation,
+# 3 disruption). Degraded events go stale after a week and drop off; an outage
+# has no staleness cap — a real one is important enough to stay on screen even
+# if AWS is slow to close it (they almost never run that long anyway).
+_AWS_STATUS_LEVEL = {"2": 1, "3": 2}          # 0/1 => not shown
+_AWS_DEGRADED_STALE_SEC = 7 * 86400
+
+
+def _aws_event_updated(ev):
+    """Epoch of an AWS event's most recent activity: newest event_log timestamp,
+    falling back to the event's `date`. None if neither parses."""
+    best = None
+    for logentry in (ev.get("event_log") or []):
+        try:
+            ts = int(logentry.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or ts > best:
+            best = ts
+    if best is None:
+        try:
+            best = int(ev.get("date"))
+        except (TypeError, ValueError):
+            best = None
+    return best
+
+
 def _status_aws(name):
-    """Adapter for the AWS Health Dashboard public feed. Its shape is not a
-    stable contract, so parse defensively: any current event => degraded, and
-    an 'outage'/'unavailable' keyword escalates to 2."""
+    """Adapter for the AWS Health Dashboard public feed (UTF-16 JSON; json.loads
+    handles the BOM). Report the worst genuinely-active event: skip anything
+    with an end_time (resolved); degraded events must be fresh (<7d), outages
+    show regardless of age. See the module comment above for the rationale."""
     st, body = fetch("https://health.aws.amazon.com/public/currentevents", timeout=8)
     if st != 200:
         raise RuntimeError("currentevents HTTP {}".format(st))
     data = json.loads(body)
     events = data if isinstance(data, list) else (data.get("events") or [])
-    if not events:
+    now = int(time.time())
+    worst = None          # (level, updated_epoch, event)
+    for ev in events:
+        if ev.get("end_time"):
+            continue      # resolved
+        lvl = _AWS_STATUS_LEVEL.get(str(ev.get("status")).strip())
+        if not lvl:
+            continue      # normal / informational — don't light the board
+        updated = _aws_event_updated(ev)
+        if lvl == 1 and (updated is None
+                         or now - updated > _AWS_DEGRADED_STALE_SEC):
+            continue      # degraded but stale (or undatable) — drop it
+        key = (lvl, updated or 0)
+        if worst is None or key > worst[0:2]:
+            worst = (lvl, updated or 0, ev)
+    if worst is None:
         return {"name": name, "level": 0}
-    ev = events[0]
-    text = " ".join(str(ev.get(k, "")) for k in (
-        "event_title", "summary", "service_name", "status_text", "description"))
-    lvl = 2 if any(w in text.lower() for w in
-                   ("outage", "unavailable", "not available", "down")) else 1
+    lvl, updated, ev = worst
     entry = {"name": name, "level": lvl,
-             "title": _status_trunc(text, _STATUS_TITLE_MAX)}
-    svc = ev.get("service_name") or ev.get("service")
-    region = ev.get("region") or ev.get("region_name")
-    comp = " - ".join(x for x in (svc, region) if x)
+             "title": _status_trunc(ev.get("summary"), _STATUS_TITLE_MAX)}
+    if updated:
+        entry["updated"] = updated
+    comp = " - ".join(x for x in (
+        ev.get("service_name") or ev.get("service"),
+        ev.get("region_name") or ev.get("region")) if x)
     if comp:
         entry["component"] = _status_trunc(comp, _STATUS_COMPONENT_MAX)
     return entry
