@@ -112,6 +112,8 @@ Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit 
 
 ### Service-status board
 
+![Service-status board screen](img/status_view.jpg)
+
 With `enable_status` on, the 128×64 display rotates in a board showing the health of major cloud/dev providers — a grid of normal/degraded/outage markers plus a detail card (provider, severity, affected component, and the incident's last-update time) for anything that's down. All the feed-fetching and normalization happens on the proxy at `GET /api/status`, so the device just reads pre-digested levels. Providers are configured in `proxy/config.json` under `status_providers` (adding any Atlassian Statuspage host — GitHub, Cloudflare, Supabase, HashiCorp, … — takes one line, no code); AWS, GCP, and Azure have built-in adapters. See [proxy/API.md](proxy/API.md#get-apistatus) for the payload shape.
 
 ---
