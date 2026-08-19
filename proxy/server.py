@@ -1754,7 +1754,19 @@ def _status_trunc(s, limit):
     # Collapse whitespace and drop non-ASCII — the device's BDF fonts only have
     # ASCII glyphs, so curly quotes / em-dashes / etc. would render as gaps.
     s = " ".join(str(s or "").encode("ascii", "ignore").decode().split())
-    return s if len(s) <= limit else s[: limit - 2].rstrip() + ".."
+    if len(s) <= limit:
+        return s
+    # Truncate at a word boundary so the label doesn't end mid-word
+    # ("...a limited numb.."). Reserve 2 chars for the ".." marker. Fall back to
+    # a hard character cut when the first word alone overflows (no space to break
+    # on), or when honoring the word boundary would throw away most of the budget
+    # — a long word early in the string is better shown clipped than as almost
+    # nothing. ".." stays ASCII on purpose (BDF fonts have no ellipsis glyph).
+    head = s[: limit - 2]
+    cut = head.rfind(" ")
+    if cut >= (limit - 2) * 0.6:
+        head = head[:cut]
+    return head.rstrip(" ,.;:-") + ".."
 
 
 def _statuspage_indicator_level(indicator):
