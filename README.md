@@ -73,6 +73,49 @@ Full proxy API: [proxy/API.md](proxy/API.md).
 
 ---
 
+## Display sizes and feature flags
+
+### Two panel sizes
+
+The device ships two complete layouts and picks one at boot from the `display` key in `secrets.py`:
+
+| `display` | Layout | Notes |
+|-----------|--------|-------|
+| `"64x32"` (default) | [`device/layout_64x32.py`](device/layout_64x32.py) | Native 64×32 — weather/tides, aircraft, ships |
+| `"128x64"` | [`device/layout_128x64.py`](device/layout_128x64.py) | Full-panel superset — everything above at `scale=2`, plus a wide sky map, planet views, a 3-day forecast, and a service-status board |
+
+The launcher (`device/code.py`) imports the matching layout module and hands off; nothing else picks the size. Change `display`, save, and CircuitPython restarts into the other layout — no reflash needed.
+
+### Feature flags
+
+Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit a key to use its default. The four core flags work on both panels; two are 128×64-only and are simply ignored by the 64×32 layout.
+
+| Flag | Default | Panels | Enables |
+|------|---------|--------|---------|
+| `enable_weather` | on | both | Temperature, condition, wind, and the weather-art sky |
+| `enable_tide` | on | both | Tide basin + next high/low (coastal displays) |
+| `enable_planes` | on | both | Overhead-aircraft screen |
+| `enable_boats` | on | both | Nearby AIS vessels (coastal displays) |
+| `enable_astronomy` | off | **128×64 only** | Sky map, planet views, and the 3-day forecast |
+| `enable_status` | off | **128×64 only** | Cloud/dev-service outage board (see below) |
+
+```python
+# secrets.py — an inland 128×64 display with the outage board on:
+"display":          "128x64",
+"enable_tide":      False,   # no coast nearby
+"enable_boats":     False,
+"enable_astronomy": True,
+"enable_status":    True,
+```
+
+(`enable_astronomy` supersedes the older `basin_mode: "sky"` switch, which still works and just sets the astronomy/tide defaults.)
+
+### Service-status board
+
+With `enable_status` on, the 128×64 display rotates in a board showing the health of major cloud/dev providers — a grid of normal/degraded/outage markers plus a detail card (provider, severity, affected component, and the incident's last-update time) for anything that's down. All the feed-fetching and normalization happens on the proxy at `GET /api/status`, so the device just reads pre-digested levels. Providers are configured in `proxy/config.json` under `status_providers` (adding any Atlassian Statuspage host — GitHub, Cloudflare, Supabase, HashiCorp, … — takes one line, no code); AWS, GCP, and Azure have built-in adapters. See [proxy/API.md](proxy/API.md#get-apistatus) for the payload shape.
+
+---
+
 ## Quick Start
 
 ### 1. Get API keys

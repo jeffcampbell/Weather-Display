@@ -14,6 +14,7 @@ Usage:
     PORT=8080 python3 server.py        # custom port
 """
 
+import calendar
 import json
 import math
 import os
@@ -62,6 +63,21 @@ BBOX = float(_config.get("bbox", 0.1))
 # Named locations for the v2 API. v1 endpoints ignore this and continue using
 # the LATITUDE/LONGITUDE/BBOX globals above — leaving v1 behavior untouched.
 LOCATIONS = _config.get("locations") or {}
+
+# Cloud/dev service providers to monitor for /api/status. Statuspage-based
+# providers are fully config-driven (name + host); AWS/GCP/Azure use built-in
+# adapters keyed by "type". Defaults cover the launch set so the endpoint works
+# even if config.json predates this feature. See handle_status.
+_DEFAULT_STATUS_PROVIDERS = [
+    {"name": "GitHub",     "type": "statuspage", "host": "www.githubstatus.com"},
+    {"name": "Cloudflare", "type": "statuspage", "host": "www.cloudflarestatus.com"},
+    {"name": "Supabase",   "type": "statuspage", "host": "status.supabase.com"},
+    {"name": "HashiCorp",  "type": "statuspage", "host": "status.hashicorp.com"},
+    {"name": "AWS",        "type": "aws"},
+    {"name": "GCP",        "type": "gcp"},
+    {"name": "Azure",      "type": "azure"},
+]
+STATUS_PROVIDERS = _config.get("status_providers") or _DEFAULT_STATUS_PROVIDERS
 
 
 def resolve_location(params):
@@ -1698,6 +1714,287 @@ def handle_sightings(params):
     return 200, json.dumps(result).encode()
 
 
+# ---------------------------------------------------------------------------
+# Service status board (/api/status)
+# ---------------------------------------------------------------------------
+# Aggregates the public status feeds of major cloud/dev providers into one
+# compact, normalized payload the 128x64 display polls. All the heavy HTTP +
+# parsing lives here so the memory-constrained device just reads pre-digested
+# levels. Normalized level scale everywhere: 0 = normal, 1 = degraded,
+# 2 = outage. See STATUS_PROVIDERS config near the top of the file.
+
+STATUS_CACHE_SEC = 180        # display polls this; keep upstream load light
+_STATUS_TITLE_MAX = 48
+_STATUS_COMPONENT_MAX = 24
+
+
+def _status_trunc(s, limit):
+    # Collapse whitespace and drop non-ASCII — the device's BDF fonts only have
+    # ASCII glyphs, so curly quotes / em-dashes / etc. would render as gaps.
+    s = " ".join(str(s or "").encode("ascii", "ignore").decode().split())
+    return s if len(s) <= limit else s[: limit - 2].rstrip() + ".."
+
+
+def _statuspage_indicator_level(indicator):
+    """Map an Atlassian Statuspage status.indicator to our 0/1/2 scale."""
+    return {"none": 0, "minor": 1, "major": 2, "critical": 2}.get(
+        (indicator or "").lower(), 0)
+
+
+def _statuspage_component_level(status):
+    """Map an Atlassian Statuspage *component* status to our 0/1/2 scale.
+    This is the current, live state of one service — unlike the page indicator
+    or an incident's impact, which stay pinned at the peak until resolution."""
+    return {
+        "operational": 0,
+        "degraded_performance": 1,
+        "under_maintenance": 1,
+        "partial_outage": 1,
+        "major_outage": 2,
+    }.get((status or "").lower(), 0)
+
+
+def _statuspage_updated_epoch(iso):
+    """Parse a Statuspage ISO8601-UTC timestamp (e.g. 2026-08-17T20:45:28.860Z)
+    into a Unix epoch. Returns None if absent/unparseable."""
+    if not iso:
+        return None
+    s = str(iso).split(".")[0].rstrip("Z")
+    try:
+        return int(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return None
+
+
+def _status_statuspage(name, host):
+    """Adapter for Atlassian Statuspage sites (GitHub, Cloudflare, Supabase,
+    HashiCorp, ...). status.json gives the overall indicator, but that indicator
+    is rolled up from every component's state — for Cloudflare that includes the
+    handful of edge PoPs perpetually rerouting or in maintenance, which flips the
+    indicator to "minor" even though the human status page (which suppresses that
+    routine churn) reads "All Systems Operational". So we only trust a non-green
+    indicator when summary.json also lists an active incident; otherwise it's
+    background noise and we report normal, matching what a person sees."""
+    st, body = fetch("https://{}/api/v2/status.json".format(host), timeout=8)
+    if st != 200:
+        raise RuntimeError("status.json HTTP {}".format(st))
+    status_obj = json.loads(body).get("status", {})
+    ind_level = _statuspage_indicator_level(status_obj.get("indicator", "none"))
+    entry = {"name": name, "level": ind_level}
+    if ind_level == 0:
+        return entry
+    # Indicator is non-green. Confirm there's a real incident before escalating.
+    # summary.json's `incidents` array holds only unresolved (active) incidents.
+    try:
+        st2, body2 = fetch("https://{}/api/v2/summary.json".format(host), timeout=8)
+        if st2 != 200:
+            raise RuntimeError("summary.json HTTP {}".format(st2))
+        incidents = json.loads(body2).get("incidents") or []
+    except Exception as e:
+        # Can't confirm; don't silently hide a possible real problem. Keep the
+        # indicator's level and fall back to the page description for a title.
+        _log_proxy_event("status summary {} failed: {}".format(name, e))
+        entry["title"] = _status_trunc(
+            status_obj.get("description"), _STATUS_TITLE_MAX)
+        return entry
+    if not incidents:
+        # Non-green indicator with no active incident == routine component noise
+        # (edge maintenance / partial reroutes). Report normal, like the page.
+        entry["level"] = 0
+        return entry
+    inc = incidents[0]
+    # Grade severity off the incident's CURRENT affected-component statuses, not
+    # the page indicator / incident impact — those stay pinned at the peak
+    # ("major"/"critical") until the incident is resolved, so they keep screaming
+    # OUTAGE for hours after the services actually recovered. The worst live
+    # component is what a person reading the page sees right now.
+    comps = inc.get("components") or []
+    worst_comp = None
+    level = 0
+    for c in comps:
+        cl = _statuspage_component_level(c.get("status"))
+        if worst_comp is None or cl > level:
+            level, worst_comp = cl, c
+    if not comps:
+        level = ind_level    # no per-component detail; trust the indicator
+    entry["level"] = level
+    updated = _statuspage_updated_epoch(inc.get("updated_at"))
+    if updated:
+        entry["updated"] = updated
+    if level == 0:
+        # Incident still open but every affected component is back to
+        # operational — GitHub just hasn't clicked "resolve". Report normal.
+        return entry
+    entry["title"] = _status_trunc(inc.get("name"), _STATUS_TITLE_MAX)
+    if worst_comp is not None:
+        entry["component"] = _status_trunc(
+            worst_comp.get("name"), _STATUS_COMPONENT_MAX)
+    if not entry.get("title"):
+        entry["title"] = _status_trunc(
+            status_obj.get("description"), _STATUS_TITLE_MAX)
+    return entry
+
+
+def _status_gcp(name):
+    """Adapter for Google Cloud. incidents.json is an array; an incident with
+    no `end` timestamp is still open. severity high (or an OUTAGE impact) => 2."""
+    st, body = fetch("https://status.cloud.google.com/incidents.json", timeout=8)
+    if st != 200:
+        raise RuntimeError("incidents.json HTTP {}".format(st))
+    incidents = json.loads(body) or []
+    worst = None
+    for inc in incidents:
+        if inc.get("end"):
+            continue    # resolved
+        impact = (inc.get("status_impact") or "").upper()
+        sev = (inc.get("severity") or "").lower()
+        lvl = 2 if ("OUTAGE" in impact or sev == "high") else 1
+        if worst is None or lvl > worst.get("level", 0):
+            comps = inc.get("affected_products") or []
+            worst = {
+                "name": name,
+                "level": lvl,
+                "title": _status_trunc(inc.get("external_desc"), _STATUS_TITLE_MAX),
+            }
+            if comps:
+                worst["component"] = _status_trunc(
+                    comps[0].get("title"), _STATUS_COMPONENT_MAX)
+    return worst or {"name": name, "level": 0}
+
+
+# AWS keeps recently-resolved events in currentevents, and sometimes leaves a
+# real event open (no end_time) yet stops updating it for months. So we can't
+# just take events[0]: we filter to genuinely-active events and grade by the
+# feed's numeric status (0 normal/resolved, 1 informational, 2 degradation,
+# 3 disruption). Any event we haven't seen an update on in a week is treated as
+# stale and dropped — a real ongoing AWS event gets updated far more often than
+# that, so a week-quiet entry is an abandoned-open feed artifact, not a signal.
+_AWS_STATUS_LEVEL = {"2": 1, "3": 2}          # 0/1 => not shown
+_AWS_STALE_SEC = 7 * 86400
+
+
+def _aws_event_updated(ev):
+    """Epoch of an AWS event's most recent activity: newest event_log timestamp,
+    falling back to the event's `date`. None if neither parses."""
+    best = None
+    for logentry in (ev.get("event_log") or []):
+        try:
+            ts = int(logentry.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or ts > best:
+            best = ts
+    if best is None:
+        try:
+            best = int(ev.get("date"))
+        except (TypeError, ValueError):
+            best = None
+    return best
+
+
+def _status_aws(name):
+    """Adapter for the AWS Health Dashboard public feed (UTF-16 JSON; json.loads
+    handles the BOM). Report the worst genuinely-active event: skip anything
+    with an end_time (resolved) or not updated in the last 7 days (stale). See
+    the module comment above for the rationale."""
+    st, body = fetch("https://health.aws.amazon.com/public/currentevents", timeout=8)
+    if st != 200:
+        raise RuntimeError("currentevents HTTP {}".format(st))
+    data = json.loads(body)
+    events = data if isinstance(data, list) else (data.get("events") or [])
+    now = int(time.time())
+    worst = None          # (level, updated_epoch, event)
+    for ev in events:
+        if ev.get("end_time"):
+            continue      # resolved
+        lvl = _AWS_STATUS_LEVEL.get(str(ev.get("status")).strip())
+        if not lvl:
+            continue      # normal / informational — don't light the board
+        updated = _aws_event_updated(ev)
+        if updated is None or now - updated > _AWS_STALE_SEC:
+            continue      # stale (or undatable) — drop it
+        key = (lvl, updated)
+        if worst is None or key > worst[0:2]:
+            worst = (lvl, updated, ev)
+    if worst is None:
+        return {"name": name, "level": 0}
+    lvl, updated, ev = worst
+    entry = {"name": name, "level": lvl,
+             "title": _status_trunc(ev.get("summary"), _STATUS_TITLE_MAX)}
+    if updated:
+        entry["updated"] = updated
+    comp = " - ".join(x for x in (
+        ev.get("service_name") or ev.get("service"),
+        ev.get("region_name") or ev.get("region")) if x)
+    if comp:
+        entry["component"] = _status_trunc(comp, _STATUS_COMPONENT_MAX)
+    return entry
+
+
+def _status_azure(name):
+    """Adapter for Azure. No clean JSON — parse the status RSS feed. Items whose
+    text says 'resolved' are skipped; any remaining active item => degraded."""
+    import xml.etree.ElementTree as ET
+    st, body = fetch("https://azure.status.microsoft/en-us/status/feed/", timeout=8)
+    if st != 200:
+        raise RuntimeError("azure feed HTTP {}".format(st))
+    root = ET.fromstring(body)
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        if "resolved" in (title + " " + desc).lower():
+            continue
+        lvl = 2 if any(w in (title + " " + desc).lower() for w in
+                       ("outage", "unavailable", "down")) else 1
+        return {"name": name, "level": lvl,
+                "title": _status_trunc(title, _STATUS_TITLE_MAX)}
+    return {"name": name, "level": 0}
+
+
+_STATUS_ADAPTERS = {
+    "statuspage": lambda p: _status_statuspage(p["name"], p["host"]),
+    "gcp":        lambda p: _status_gcp(p["name"]),
+    "aws":        lambda p: _status_aws(p["name"]),
+    "azure":      lambda p: _status_azure(p["name"]),
+}
+
+
+def handle_status(params):
+    """Aggregate provider status feeds into one compact payload for the display.
+    Providers at level 0 omit component/title. A feed that errors degrades to
+    level 0 (logged) rather than failing the whole board. Cached for
+    STATUS_CACHE_SEC so device polling never hammers the upstreams."""
+    cache_key = "status"
+    cached = cache_get(cache_key, max_age_sec=STATUS_CACHE_SEC)
+    if cached:
+        return 200, cached
+
+    providers = []
+    worst = 0
+    for p in STATUS_PROVIDERS:
+        name = p.get("name", "?")
+        adapter = _STATUS_ADAPTERS.get(p.get("type", "statuspage"))
+        if not adapter:
+            _log_proxy_event("status: unknown provider type for {}".format(name))
+            providers.append({"name": name, "level": 0})
+            continue
+        try:
+            entry = adapter(p)
+        except Exception as e:
+            _log_proxy_event("status {} failed: {}".format(name, e))
+            entry = {"name": name, "level": 0}
+        worst = max(worst, entry.get("level", 0))
+        providers.append(entry)
+
+    body = json.dumps({
+        "providers": providers,
+        "worst": worst,
+        "ts": int(time.time()),
+    }).encode()
+    cache_set(cache_key, body, age_override=STATUS_CACHE_SEC)
+    return 200, body
+
+
 ROUTES = {
     "/api/planes":      handle_planes,
     "/api/route":       handle_route,
@@ -1712,6 +2009,7 @@ ROUTES = {
     "/api/sightings":   handle_sightings,
     "/api/devicelog":   handle_devicelog_get,
     "/api/health":      handle_health,
+    "/api/status":      handle_status,
     "/api/time":        handle_time,
 }
 

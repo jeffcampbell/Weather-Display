@@ -49,6 +49,9 @@ PLANE_MAX_SECS = 600          # max continuous time on plane screen
 PLANE_COOLDOWN_SECS = 60      # weather break after PLANE_MAX_SECS hits
 PLANE_QUIET_START_HR = 1      # local hour to stop fetching planes (saves API)
 PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
+STATUS_INTERVAL = 180         # poll proxy /api/status every 3 min (proxy caches 180s)
+STATUS_SHOW_EVERY = 45        # rest-screen seconds before the status board shows again
+STATUS_DWELL_SECS = 10        # how long the summary + each incident card stays up
 # ---------------------------------------------------------------------------
 # Feature + display configuration (per-device, from secrets.py)
 #
@@ -61,6 +64,7 @@ PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
 #   enable_astronomy  moon/planet sky card + sky map/zoom   (inland displays)
 #   enable_planes     overhead aircraft screen
 #   enable_boats      nearby AIS vessel screen              (coastal displays)
+#   enable_status     cloud/dev provider outage board       (128x64 only)
 #
 # Tide and astronomy share the left basin / sky card, so on a single panel
 # they are alternatives — if both are enabled, astronomy takes the basin.
@@ -75,6 +79,7 @@ ENABLE_ASTRONOMY = _flag("enable_astronomy", _LEGACY_BASIN == "sky")
 ENABLE_TIDE      = _flag("enable_tide", _LEGACY_BASIN != "sky")
 ENABLE_PLANES    = _flag("enable_planes", True)
 ENABLE_BOATS     = _flag("enable_boats", _LEGACY_BASIN != "sky")
+ENABLE_STATUS    = _flag("enable_status", False)   # 128x64-only outage board
 
 # --- Display panel size ---
 # "128x64" (default, verified) renders the 64x32 layout at scale=2 plus
@@ -1625,6 +1630,171 @@ for _col in range(3):
     _forecast_labels.append(_col_labels)
 
 
+# ---------------------------------------------------------------------------
+# Service status board (128x64 only) — summary grid + incident card
+# ---------------------------------------------------------------------------
+# Data comes pre-normalized from the proxy's /api/status (levels 0/1/2), so
+# these two screens are pure rendering. Built only when ENABLE_STATUS is set,
+# to avoid the label/bitmap memory cost on displays that don't use it.
+STATUS_MAX = 8                       # grid slots (2 cols x 4 rows)
+_STATUS_MARK_COL_X = (8, 70)         # marker left x per column
+_STATUS_LBL_COL_X  = (16, 78)        # provider label x per column
+_STATUS_ROW_Y      = (20, 31, 42, 53)
+
+# Shared 4-color marker palette: 0=off (transparent), 1=green, 2=amber, 3=red.
+_status_pal = displayio.Palette(4)
+_status_pal[0] = 0x000000
+_status_pal[1] = _dim(0x00CC00)
+_status_pal[2] = _dim(0xFFAA00)
+_status_pal[3] = _dim(0xFF0000)
+_status_pal.make_transparent(0)
+
+status_group = None
+status_incident_group = None
+_status_marker_bmps = []
+_status_markers = []
+_status_name_labels = []
+_status_footer = None
+_sti_provider = _sti_status = _sti_comp = _sti_title1 = _sti_title2 = None
+
+if ENABLE_STATUS:
+    status_group = displayio.Group()
+    _st_header = Label(FONT_SMALL, text="SERVICE STATUS", color=_dim(0xCCCCCC))
+    _st_header.anchor_point = (0.5, 0.5)
+    _st_header.anchored_position = (64, 7)
+    status_group.append(_st_header)
+    for _si in range(STATUS_MAX):
+        _c, _r = _si % 2, _si // 2
+        _mb = displayio.Bitmap(5, 5, 4)
+        _mtg = displayio.TileGrid(_mb, pixel_shader=_status_pal,
+                                  x=_STATUS_MARK_COL_X[_c], y=_STATUS_ROW_Y[_r])
+        _mtg.hidden = True
+        status_group.append(_mtg)
+        _snl = Label(FONT_SMALL, text="", color=_dim(0xCCCCCC),
+                     x=_STATUS_LBL_COL_X[_c], y=_STATUS_ROW_Y[_r] + 2)
+        status_group.append(_snl)
+        _status_marker_bmps.append(_mb)
+        _status_markers.append(_mtg)
+        _status_name_labels.append(_snl)
+    _status_footer = Label(FONT_SMALL, text="", color=_dim(0x00CC00))
+    _status_footer.anchor_point = (0.5, 0.5)
+    _status_footer.anchored_position = (64, 61)
+    status_group.append(_status_footer)
+
+    status_incident_group = displayio.Group()
+    _sti_provider = Label(FONT_MID, text="", color=_dim(0xFFFFFF))
+    _sti_provider.anchor_point = (0.5, 0.5)
+    _sti_provider.anchored_position = (64, 9)
+    status_incident_group.append(_sti_provider)
+    _sti_status = Label(FONT_MID, text="", color=_dim(0xFFAA00))
+    _sti_status.anchor_point = (0.5, 0.5)
+    _sti_status.anchored_position = (64, 22)
+    status_incident_group.append(_sti_status)
+    _sti_comp = Label(FONT_SMALL, text="", color=_dim(0x00CCDD))
+    _sti_comp.anchor_point = (0.5, 0.5)
+    _sti_comp.anchored_position = (64, 34)
+    status_incident_group.append(_sti_comp)
+    _sti_title1 = Label(FONT_SMALL, text="", color=_dim(0xCCCCCC))
+    _sti_title1.anchor_point = (0.5, 0.5)
+    _sti_title1.anchored_position = (64, 46)
+    status_incident_group.append(_sti_title1)
+    _sti_title2 = Label(FONT_SMALL, text="", color=_dim(0xCCCCCC))
+    _sti_title2.anchor_point = (0.5, 0.5)
+    _sti_title2.anchored_position = (64, 55)
+    status_incident_group.append(_sti_title2)
+
+
+def _set_status_marker(i, level):
+    """Fill marker bitmap i with the palette index for a 0/1/2 status level."""
+    idx = (level + 1) if level in (0, 1, 2) else 1
+    bmp = _status_marker_bmps[i]
+    for _y in range(5):
+        for _x in range(5):
+            bmp[_x, _y] = idx
+
+
+def _status_wrap2(text, width):
+    """Split text into two lines of <= width chars, breaking on a space."""
+    text = text or ""
+    if len(text) <= width:
+        return text, ""
+    cut = text.rfind(" ", 0, width + 1)
+    if cut <= 0:
+        cut = width
+    return text[:cut].rstrip(), text[cut:].lstrip()[: width]
+
+
+def show_status_summary():
+    """Render the always-in-rotation provider grid: a colored marker + name per
+    provider, with a footer summarizing overall health."""
+    try:
+        switch_screen("status")
+        n_issues = 0
+        for i in range(STATUS_MAX):
+            if i < len(status_providers):
+                p = status_providers[i]
+                lvl = p.get("level", 0)
+                if lvl >= 1:
+                    n_issues += 1
+                _status_markers[i].hidden = False
+                _set_status_marker(i, lvl)
+                _status_name_labels[i].text = str(p.get("name", ""))[:11]
+            else:
+                _status_markers[i].hidden = True
+                _status_name_labels[i].text = ""
+        if n_issues == 0:
+            _status_footer.text = "all operational"
+            _status_footer.color = _dim(0x00CC00)
+        else:
+            _status_footer.text = "{} incident{}".format(
+                n_issues, "" if n_issues == 1 else "s")
+            _status_footer.color = _dim(0xFF0000 if status_worst >= 2 else 0xFFAA00)
+    except MemoryError as _e:
+        print("show_status_summary MemoryError:", _e)
+        gc.collect()
+
+
+def _fmt_status_updated(epoch):
+    """UTC epoch -> last-update string for the incident card. A bare 'h:mmp'
+    clock is only meaningful within the last day; once the update is more than
+    24h old the wall-clock time is ambiguous (no date shown), so collapse it to
+    '>24H'. Empty string when unknown/unparseable."""
+    if not epoch:
+        return ""
+    try:
+        epoch = int(epoch)
+        # RTC holds local time, so mktime(localtime()) is a local epoch; back out
+        # the tz offset to compare against the UTC epoch the proxy sent.
+        now_utc = time.mktime(time.localtime()) - _tz_offset_secs
+        if now_utc - epoch > 86400:
+            return ">24H"
+        t = time.localtime(epoch + _tz_offset_secs)
+        return "{}:{:02d}{}".format(
+            t.tm_hour % 12 or 12, t.tm_min, "p" if t.tm_hour >= 12 else "a")
+    except (ValueError, OverflowError):
+        return ""
+
+
+def show_status_incident(p):
+    """Render the detail card for one degraded/down provider."""
+    try:
+        switch_screen("status_incident")
+        lvl = p.get("level", 0)
+        col = _dim(0xFF0000 if lvl >= 2 else 0xFFAA00)
+        _sti_provider.text = str(p.get("name", ""))[:20]
+        _upd = _fmt_status_updated(p.get("updated"))
+        _sti_status.text = ("OUTAGE" if lvl >= 2 else "DEGRADED") + (
+            "  " + _upd if _upd else "")
+        _sti_status.color = col
+        _sti_comp.text = str(p.get("component", ""))[:30]
+        _l1, _l2 = _status_wrap2(str(p.get("title", "")), 30)
+        _sti_title1.text = _l1
+        _sti_title2.text = _l2
+    except MemoryError as _e:
+        print("show_status_incident MemoryError:", _e)
+        gc.collect()
+
+
 def _fp(x, y, c):
     """Bounds-checked single pixel write into forecast_bmp."""
     if 0 <= x < FORECAST_W and 0 <= y < FORECAST_H:
@@ -1886,6 +2056,18 @@ _forecast_pending = False
 _forecast_showing = False
 _forecast_started_at = 0
 FORECAST_DWELL_SECS = 30      # how long the forecast card stays on screen
+# Service status board state. status_providers/status_worst are refreshed by
+# fetch_status() from /api/status. The rotation shows the summary card every
+# STATUS_SHOW_EVERY seconds of rest, then walks each degraded/down provider.
+status_providers = []
+status_worst = 0
+last_status_fetch = -STATUS_INTERVAL
+_last_status_summary = ""
+_showing_status = False        # True while any status card owns the screen
+_status_started_at = 0         # monotonic when the current status card appeared
+_status_last_shown = 0         # monotonic when the last status rotation ended
+_status_phase = 0              # 0 = summary; 1..N = incident cards
+_status_incidents = []         # provider indices with level >= 1 for this rotation
 last_plane_cycle = 0
 current_screen = "loading"
 
@@ -1924,6 +2106,10 @@ def switch_screen(name):
         display.root_group = plane_group
     elif name == "forecast":
         display.root_group = forecast_group
+    elif name == "status":
+        display.root_group = status_group
+    elif name == "status_incident":
+        display.root_group = status_incident_group
     elif name == "loading":
         display.root_group = loading_group
 
@@ -2131,6 +2317,24 @@ def fetch_health():
         if marker != _last_health_issues:
             device_log("Health err:{}".format(e))
             _last_health_issues = marker
+
+
+def fetch_status():
+    """Poll /api/status and cache the pre-normalized provider levels the status
+    board renders. A failure just leaves the last-known data in place (and logs)
+    rather than counting toward the fetch-error reboot threshold — a status feed
+    hiccup should never reboot the display."""
+    global status_providers, status_worst, _last_status_summary
+    try:
+        data = fetch_json("{}/api/status".format(PROXY_HOST))
+        status_providers = data.get("providers") or []
+        status_worst = data.get("worst", 0)
+        summary = "{}p/w{}".format(len(status_providers), status_worst)
+        if summary != _last_status_summary:
+            device_log("Status:{}".format(summary))
+            _last_status_summary = summary
+    except Exception as e:
+        device_log("Status err:{}".format(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2603,7 +2807,7 @@ while True:
                 fetch_tides()
             flush_device_log()
             last_weather_fetch = now
-            if not showing_planes and not _forecast_showing:
+            if not showing_planes and not _forecast_showing and not _showing_status:
                 show_weather_tides()
 
         # --- 3-day forecast refresh (sky mode only — the only rotation slot
@@ -2616,7 +2820,7 @@ while True:
         # --- Forecast card show/hide. Sky list view raises _forecast_pending
         # on exit; we honour it here unless a plane or ship is currently
         # owning the screen. Dwell expires → return to weather/tides.
-        if _forecast_pending and not showing_planes and not _showing_ship:
+        if _forecast_pending and not showing_planes and not _showing_ship and not _showing_status:
             _forecast_pending = False
             _forecast_showing = True
             _forecast_started_at = now
@@ -2629,6 +2833,11 @@ while True:
         if PROXY_HOST and now - last_health_fetch >= HEALTH_INTERVAL:
             fetch_health()
             last_health_fetch = now
+
+        # --- Service status board refresh (128x64 only) ---
+        if ENABLE_STATUS and PROXY_HOST and now - last_status_fetch >= STATUS_INTERVAL:
+            fetch_status()
+            last_status_fetch = now
 
         # --- OpenSky check ---
         # Skip plane fetches during quiet hours to save FlightAware API calls.
@@ -2660,6 +2869,7 @@ while True:
             # update_ship_ocean over pl_bg_bmp, clobbering the plane logo.
             _showing_ship = False
             _forecast_showing = False    # plane takes over the screen group
+            _showing_status = False      # plane preempts the status board too
             plane_idx = 0
             last_plane_cycle = now
             plane_screen_started_at = now
@@ -2707,6 +2917,7 @@ while True:
                     if not _showing_ship:
                         _showing_ship = True
                         _forecast_showing = False    # ship takes over the screen group
+                        _showing_status = False      # ship preempts the status board too
                         ship_idx = expected_idx
                         device_log("Ship:{} {}mi".format(ships[ship_idx].get("name","?")[:12], ships[ship_idx].get("distance_mi","?")))
                         show_ship(ships[ship_idx])
@@ -2724,13 +2935,38 @@ while True:
                 show_weather_tides()
                 device_log("Ship gone, weather")
 
+        # --- Service status board rotation (128x64 only) ---
+        # The summary card enters the rotation every STATUS_SHOW_EVERY seconds of
+        # rest; when providers are degraded/down, each one's incident card is
+        # walked after the summary. Planes and ships preempt (handled above), so
+        # this only runs on the resting screen.
+        if (ENABLE_STATUS and status_providers and not showing_planes
+                and not _showing_ship and not _forecast_showing):
+            if not _showing_status and now - _status_last_shown >= STATUS_SHOW_EVERY:
+                _showing_status = True
+                _status_phase = 0
+                _status_incidents = [i for i, p in enumerate(status_providers)
+                                     if p.get("level", 0) >= 1]
+                _status_started_at = now
+                show_status_summary()
+            elif _showing_status and now - _status_started_at >= STATUS_DWELL_SECS:
+                if _status_phase < len(_status_incidents):
+                    _p = status_providers[_status_incidents[_status_phase]]
+                    _status_phase += 1
+                    _status_started_at = now
+                    show_status_incident(_p)
+                else:
+                    _showing_status = False
+                    _status_last_shown = now
+                    show_weather_tides()
+
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame
     # instead of propagating to the top-level loop and crashing the device.
     # gc.collect() first to maximize the largest contiguous free block.
     # NOTE: do NOT call fetch_failed() here — render MemoryErrors are normal
     # and must not count toward the auto-reboot threshold.
-    if not showing_planes and not _showing_ship and not _forecast_showing:
+    if not showing_planes and not _showing_ship and not _forecast_showing and not _showing_status:
         try:
             gc.collect()
             t = time.localtime()
