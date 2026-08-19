@@ -440,6 +440,26 @@ FLIGHTAWARE_MONTHLY_LIMIT = int(_config.get("flightaware_monthly_limit", 450))
 # fall back to the old free-first-wins behavior.
 FLIGHTAWARE_OVERRIDE_FREE = bool(_config.get("flightaware_override_free_routes", True))
 _FA_USAGE_PATH = Path(__file__).parent / "flightaware_usage.json"
+
+# Optional schedule gate. When this flag file exists and reads as "off" (or
+# 0/false/no/free), FlightAware is skipped entirely — free routes only, zero
+# billable calls — regardless of the override and the monthly cap. A missing or
+# unreadable flag means enabled, so the default/normal behavior is unchanged and
+# the box fails safe toward its usual operation. The file is (re-)read cheaply on
+# each route lookup, so cron can flip it with no service restart. This is how the
+# unattended beach box runs free-only on weekdays and enables paid enrichment on
+# weekends (see the proxy crontab).
+_FA_ENABLED_FLAG_PATH = Path(__file__).parent / "flightaware_enabled"
+
+
+def flightaware_enabled_now():
+    """False only when the schedule flag file explicitly says off; True when the
+    flag is absent/unreadable (fail-safe to normal FlightAware behavior)."""
+    try:
+        val = _FA_ENABLED_FLAG_PATH.read_text().strip().lower()
+    except Exception:
+        return True
+    return val not in ("off", "0", "false", "no", "free")
 _fa_usage_lock = Lock()
 _fa_exhausted_logged_period = None
 
@@ -590,7 +610,8 @@ def handle_route(params):
     #    GA-registration skip, and the per-(callsign,icao24) route cache. With
     #    the override off, falls back to the old "only when free found nothing"
     #    behavior.
-    fa_should_consult = FLIGHTAWARE_OVERRIDE_FREE or not result["route"]
+    fa_should_consult = flightaware_enabled_now() and (
+        FLIGHTAWARE_OVERRIDE_FREE or not result["route"])
     if fa_should_consult and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         if not _flightaware_reserve():
             _flightaware_note_exhausted()   # cap hit — skip the billable call
@@ -1587,6 +1608,7 @@ def handle_health(params):
         "flightaware_month": _fa_period(),
         "flightaware_used": fa_used,
         "flightaware_limit": fa_limit,
+        "flightaware_enabled": flightaware_enabled_now(),
         "uptime_seconds": int(time.time() - _started_at),
     }).encode()
 
