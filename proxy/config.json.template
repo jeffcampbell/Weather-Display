@@ -28,6 +28,9 @@
   "_flightaware_override_free_routes_comment": "When true (default), FlightAware overrides a route the free DBs already resolved, fixing stale 'right tail, wrong route' answers from reused callsigns. Costs one FA lookup per airframe per cache window (bounded by the monthly limit above). Set false to only consult FlightAware when the free sources found nothing.",
   "flightaware_override_free_routes": true,
 
+  "_route_code_aliases_comment": "Exact airport codes to rewrite in resolved /api/route legs, applied just before caching/returning so it's uniform across all upstream sources. Keyed by the code as the source reports it. Omit to use the built-in default { DJT: PBI }.",
+  "route_code_aliases": { "DJT": "PBI" },
+
   "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
   "device_secret": "",
 

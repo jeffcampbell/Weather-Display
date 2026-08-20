@@ -416,6 +416,13 @@ def handle_planes(params):
 ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
 ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
 
+# Airport-code aliases applied to resolved routes just before they're cached
+# and returned. An exact code from any upstream source (OpenSky/adsbdb/
+# FlightAware) is rewritten to its alias, so the substitution is uniform
+# regardless of which source resolved the leg. Keyed by the code as the source
+# reports it. Default rewrites DJT -> PBI; override with "route_code_aliases".
+ROUTE_CODE_ALIASES = _config.get("route_code_aliases", {"DJT": "PBI"})
+
 # --- FlightAware AeroAPI monthly spend cap ---------------------------------
 # AeroAPI bills per successful /flights/{ident} query (~1¢ each). Free sources
 # are tried first and GA tails are skipped, but a runaway — a bug, or just a
@@ -670,6 +677,11 @@ def handle_route(params):
                     result["registration"] = ac_parsed.get("Registration", "")
                 except Exception:
                     pass
+
+    # Rewrite any aliased airport codes before caching/returning (e.g. DJT->PBI),
+    # so the substitution is applied uniformly across all upstream sources.
+    if result["route"] and ROUTE_CODE_ALIASES:
+        result["route"] = [ROUTE_CODE_ALIASES.get(code, code) for code in result["route"]]
 
     body = json.dumps(result).encode()
     if result["route"]:
