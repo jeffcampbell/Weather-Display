@@ -898,6 +898,63 @@ def fetch_sky():
         device_log("Sky err:{}".format(e))
 
 
+# ---------------------------------------------------------------------------
+# Sunrise / sunset footer
+# ---------------------------------------------------------------------------
+# On the horizon (map) sky view, the bottom strip drops the temp/condition/
+# wind weather readout in favour of the day's sunrise and sunset. The live
+# clock keeps its top-left slot; both sun times share the bottom row, each
+# tagged with an up/down arrow (present in the 5x8 font):
+#
+#     3:15 PM                    <- clock_label (live, untouched)
+#     ^5:56a         v7:35p      <- cond_label / wind_label (bright times)
+#
+# The freed top-right slot (temp_label) is blanked while the footer is up.
+# show_weather_tides() defers to it via the _sun_footer_on flag.
+_sun_footer_on = False
+_sun_footer_shown = (-1, -1)   # (sunrise_mins, sunset_mins) currently drawn
+
+
+def _fmt_sun_time(mins):
+    """Minutes-into-local-day -> compact 12h clock like '5:42a' / '7:38p'."""
+    if mins is None or mins < 0:
+        return "--:--"
+    h = (mins // 60) % 24
+    m = mins % 60
+    return "{}:{:02d}{}".format(h % 12 or 12, m, "a" if h < 12 else "p")
+
+
+def _apply_sun_footer():
+    """Put sunrise + sunset on the bottom row, leaving the clock in place.
+    Idempotent — only rewrites the labels when the footer state or the times
+    actually change, so it is cheap to call every tick while the view is up."""
+    global _sun_footer_on, _sun_footer_shown
+    want = (_sunrise_mins, _sunset_mins)
+    if _sun_footer_on and _sun_footer_shown == want:
+        return
+    temp_label.text = ""                              # clear freed top-right slot
+    cond_label.text = "↑" + _fmt_sun_time(_sunrise_mins)  # up-arrow  (rise)
+    cond_label.color = _dim(0xFFCC44)                 # gold  (bottom-left)
+    wind_label.font = FONT_MID                         # match the sunrise size
+    wind_label.text = "↓" + _fmt_sun_time(_sunset_mins)   # down-arrow (set)
+    wind_label.color = _dim(0xFF7733)                 # orange (bottom-right)
+    _sun_footer_on = True
+    _sun_footer_shown = want
+
+
+def _clear_sun_footer():
+    """Hand the bottom strip back to the weather readout."""
+    global _sun_footer_on, _sun_footer_shown
+    if not _sun_footer_on:
+        return
+    _sun_footer_on = False
+    _sun_footer_shown = (-1, -1)
+    wind_label.font = FONT_SMALL
+    # switch_screen("weather") is a no-op here (already on the weather group),
+    # so this just repaints temp/cond/wind from the current weather globals.
+    show_weather_tides()
+
+
 def _zoom_targets():
     """Names of objects we can zoom on, in cycle order: each visible
     planet plus "Moon" if it's above the horizon."""
@@ -1102,6 +1159,15 @@ def update_basin_planets():
         _sky_view_last_flip = now
         _set_view_mode(_sky_view_mode)
         _sky_last_drawn = ""
+
+    # The sunrise/sunset footer owns the bottom strip on the horizon (map)
+    # view; every other sub-view hands it back to the weather readout. Kept
+    # ahead of the marker early-return so the times track a mid-view sunrise/
+    # sunset refresh and mode transitions are always honoured.
+    if _sky_view_mode == "map":
+        _apply_sun_footer()
+    elif _sun_footer_on:
+        _clear_sun_footer()
 
     sun = _sky_data.get("sun") or {}
     moon = _sky_data.get("moon") or {}
@@ -2602,19 +2668,22 @@ def show_weather_tides():
     a label-realloc MemoryError just skips this render instead of crashing."""
     try:
         switch_screen("weather")
-        _center_mid(temp_label, weather_str)
-        try:
-            temp_val = int(weather_str.split(chr(176))[0])
-        except (ValueError, IndexError):
-            temp_val = 60
-        if temp_val >= 90:   tc = 0xFF2222
-        elif temp_val >= 70: tc = 0xFFDD00
-        elif temp_val >= 50: tc = 0x88FFCC
-        elif temp_val >= 30: tc = 0x44AAFF
-        else:                tc = 0x2255CC
-        temp_label.color = _dim(tc)
-        _center_small(cond_label, weather_cond[:10])
-        _center_small(wind_label, wind_str)
+        # In sky mode the horizon view's sunrise/sunset footer borrows the
+        # temp/cond/wind labels; leave them alone while it owns the strip.
+        if not (BASIN_MODE == "sky" and _sun_footer_on):
+            _center_mid(temp_label, weather_str)
+            try:
+                temp_val = int(weather_str.split(chr(176))[0])
+            except (ValueError, IndexError):
+                temp_val = 60
+            if temp_val >= 90:   tc = 0xFF2222
+            elif temp_val >= 70: tc = 0xFFDD00
+            elif temp_val >= 50: tc = 0x88FFCC
+            elif temp_val >= 30: tc = 0x44AAFF
+            else:                tc = 0x2255CC
+            temp_label.color = _dim(tc)
+            _center_small(cond_label, weather_cond[:10])
+            _center_small(wind_label, wind_str)
         if BASIN_MODE == "sky":
             # Planet-card labels are owned by update_basin_planets() — it
             # writes them on every glyph swap. Nothing to do here.
