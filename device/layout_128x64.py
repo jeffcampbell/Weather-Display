@@ -904,10 +904,10 @@ def fetch_sky():
 # On the horizon (map) sky view, the bottom strip drops the temp/condition/
 # wind weather readout in favour of the day's sunrise and sunset. The live
 # clock keeps its top-left slot; both sun times share the bottom row, each
-# tagged with an up/down arrow (present in the 5x8 font):
+# tagged with a sun / moon glyph (both present in the 5x8 font):
 #
 #     3:15 PM                    <- clock_label (live, untouched)
-#     ^5:56a         v7:35p      <- cond_label / wind_label (bright times)
+#     (sun)5:56a  (moon)7:35p    <- cond_label / wind_label (bright times)
 #
 # The freed top-right slot (temp_label) is blanked while the footer is up.
 # show_weather_tides() defers to it via the _sun_footer_on flag.
@@ -933,10 +933,10 @@ def _apply_sun_footer():
     if _sun_footer_on and _sun_footer_shown == want:
         return
     temp_label.text = ""                              # clear freed top-right slot
-    cond_label.text = "↑" + _fmt_sun_time(_sunrise_mins)  # up-arrow  (rise)
+    cond_label.text = chr(0x2600) + _fmt_sun_time(_sunrise_mins)  # sun glyph  (rise)
     cond_label.color = _dim(0xFFCC44)                 # gold  (bottom-left)
     wind_label.font = FONT_MID                         # match the sunrise size
-    wind_label.text = "↓" + _fmt_sun_time(_sunset_mins)   # down-arrow (set)
+    wind_label.text = chr(0x263E) + _fmt_sun_time(_sunset_mins)   # moon glyph (set)
     wind_label.color = _dim(0xFF7733)                 # orange (bottom-right)
     _sun_footer_on = True
     _sun_footer_shown = want
