@@ -950,6 +950,11 @@ def _clear_sun_footer():
     _sun_footer_on = False
     _sun_footer_shown = (-1, -1)
     wind_label.font = FONT_SMALL
+    # Restore the weather text colors the footer overwrote with gold/orange —
+    # _center_small() only rewrites .text, so without this the condition/wind
+    # readout keeps the sunrise/sunset colors. Match the label-creation values.
+    cond_label.color = _dim(0xAAAACC)
+    wind_label.color = _dim(0x88BBCC)
     # switch_screen("weather") is a no-op here (already on the weather group),
     # so this just repaints temp/cond/wind from the current weather globals.
     show_weather_tides()
