@@ -961,14 +961,13 @@ def _clear_sun_footer():
 
 
 def _zoom_targets():
-    """Names of objects we can zoom on, in cycle order: each visible
-    planet plus "Moon" if it's above the horizon."""
-    planets = _sky_data.get("planets") or []
-    names = [p.get("name", "") for p in planets]
+    """Objects the zoom slot can focus on. Planet zooms were dropped (they
+    didn't read well at this size), so this is just the Moon when it's above
+    the horizon — otherwise empty, and the cycle skips the zoom beat."""
     moon = _sky_data.get("moon") or {}
     if moon.get("alt", -90) > 0:
-        names.append("Moon")
-    return names
+        return ["Moon"]
+    return []
 
 
 def render_zoom_view():
@@ -998,7 +997,7 @@ def _render_moon_zoom():
     cy = SKY_CARD_H // 2 - 1      # 21
     _draw_moon_zoom(cx, cy, phase)
     if sky_zoom_label is not None:
-        sky_zoom_label.text = "ZOOM: Moon {}%".format(int(round(illum * 100)))
+        sky_zoom_label.text = "Moon {}%".format(int(round(illum * 100)))
         sky_zoom_label.color = _dim(0xDDCCAA)   # warm cream
 
 
@@ -1123,7 +1122,7 @@ def update_basin_planets():
     """Per-tick sky-area update.
 
     Normal cycle (each step _VIEW_DWELL_SECS):
-        map → zoom on each planet in turn → map → repeat
+        map → moon zoom (only when the moon is up) → map → repeat
 
     Independent every-_LIST_INTERVAL timer interrupts the cycle to show
     the list view for _LIST_DWELL_SECS, then normal cycle resumes from map.
@@ -1153,14 +1152,15 @@ def update_basin_planets():
             _sky_view_mode = "list"
             _last_list_time = now
         elif _sky_view_mode == "map":
-            # Map → zoom on first target (planet or moon).
-            _sky_view_mode = "zoom"
-            _zoom_idx = 0
-        else:                                # _sky_view_mode == "zoom"
-            _zoom_idx += 1
-            if _zoom_idx >= len(zoom_targets):
-                _sky_view_mode = "map"
+            # Map → moon zoom, but only when the moon is up; with no target
+            # we just hold the map until the next periodic list flash.
+            if zoom_targets:
+                _sky_view_mode = "zoom"
                 _zoom_idx = 0
+        else:                                # _sky_view_mode == "zoom"
+            # Only the moon lives here now, so zoom is a single beat → map.
+            _sky_view_mode = "map"
+            _zoom_idx = 0
         _sky_view_last_flip = now
         _set_view_mode(_sky_view_mode)
         _sky_last_drawn = ""
