@@ -515,6 +515,51 @@ _PLANET_COLOR_HEX = {
     "Saturn":  0xFFCC00,
 }
 
+# Zodiac sun-sign view. The proxy reports the sign the Sun is actually in
+# (_sky_data["zodiac"]["Sun"]); these static ranges/elements just dress the
+# card. Date ranges are the conventional tropical ones (they match the Sun's
+# ecliptic sign of date, which is what the proxy computes).
+_ZODIAC_INFO = {
+    "Aries":       ("Mar 21-Apr 19", "Fire"),
+    "Taurus":      ("Apr 20-May 20", "Earth"),
+    "Gemini":      ("May 21-Jun 20", "Air"),
+    "Cancer":      ("Jun 21-Jul 22", "Water"),
+    "Leo":         ("Jul 23-Aug 22", "Fire"),
+    "Virgo":       ("Aug 23-Sep 22", "Earth"),
+    "Libra":       ("Sep 23-Oct 22", "Air"),
+    "Scorpio":     ("Oct 23-Nov 21", "Water"),
+    "Sagittarius": ("Nov 22-Dec 21", "Fire"),
+    "Capricorn":   ("Dec 22-Jan 19", "Earth"),
+    "Aquarius":    ("Jan 20-Feb 18", "Air"),
+    "Pisces":      ("Feb 19-Mar 20", "Water"),
+}
+_ELEMENT_COLOR = {
+    "Fire":  0xFF6622,
+    "Earth": 0x66CC44,
+    "Air":   0x66CCEE,
+    "Water": 0x4488FF,
+}
+# Tropical sun-sign cutoffs (sign starts on this month/day) for the on-device
+# fallback used when the proxy hasn't supplied a zodiac block. A date on or
+# after a cutoff belongs to that sign; before Jan 20 it's Capricorn.
+_SUN_SIGN_CUTOFFS = (
+    (1, 20, "Aquarius"),  (2, 19, "Pisces"),  (3, 21, "Aries"),
+    (4, 20, "Taurus"),    (5, 21, "Gemini"),  (6, 21, "Cancer"),
+    (7, 23, "Leo"),       (8, 23, "Virgo"),   (9, 23, "Libra"),
+    (10, 23, "Scorpio"),  (11, 22, "Sagittarius"), (12, 22, "Capricorn"),
+)
+
+
+def _sun_sign_by_date():
+    """Fallback tropical sun sign from today's local date."""
+    t = time.localtime()
+    md = (t.tm_mon, t.tm_mday)
+    sign = "Capricorn"          # before the first cutoff (and late December)
+    for m, d, s in _SUN_SIGN_CUTOFFS:
+        if md >= (m, d):
+            sign = s
+    return sign
+
 # Cycle: 30s zoomed-out map → 30s zoom on each visible planet (one at a
 # time), then back to map. Independent 4.5-min timer interrupts for the
 # list (text info) view, which itself runs 30s before normal cycle resumes.
@@ -1102,18 +1147,52 @@ def _render_list_view():
             sky_list_info_labels[i].text = ""
 
 
+def _center_card(label, text):
+    """Center a label horizontally within the 128-wide sky card. FONT_MID
+    advances 5px/char, FONT_SMALL 4px."""
+    label.text = text
+    cw = 5 if label.font is FONT_MID else 4
+    label.x = max(0, (SKY_CARD_W - len(text) * cw) // 2)
+
+
+def _render_zodiac_view():
+    """Sun-sign spotlight: the zodiac sign the Sun is currently in, with its
+    conventional date range and element. Reads the sign the proxy computed in
+    _sky_data["zodiac"]["Sun"]; the rest is static dressing."""
+    # Prefer the sign the proxy actually computed; fall back to the date.
+    z = _sky_data.get("zodiac") or {}
+    sign = z.get("Sun") or _sun_sign_by_date()
+    info = _ZODIAC_INFO.get(sign)
+    _center_card(sky_zodiac_title_label, "SUN SIGN")
+    if not info:
+        # Unknown sign name — show a placeholder rather than crash.
+        _center_card(sky_zodiac_sign_label, chr(0x2600) + " --")
+        sky_zodiac_date_label.text = ""
+        sky_zodiac_elem_label.text = ""
+        return
+    dates, elem = info
+    _center_card(sky_zodiac_sign_label, chr(0x2600) + " " + sign)
+    _center_card(sky_zodiac_date_label, dates)
+    _center_card(sky_zodiac_elem_label, elem + " sign")
+    sky_zodiac_elem_label.color = _dim(_ELEMENT_COLOR.get(elem, 0xCCCCCC))
+
+
 def _set_view_mode(mode):
     """Toggle the right combination of widgets for the active view.
-    map  -> sky_card_tg only
-    zoom -> sky_card_tg + zoom title label
-    list -> 3 name + 3 info labels (sky_card_tg hidden)"""
+    map    -> sky_card_tg only
+    zoom   -> sky_card_tg + zoom title label
+    list   -> 3 name + 3 info labels (sky_card_tg hidden)
+    zodiac -> 4 sun-sign labels (sky_card_tg hidden)"""
     is_list = (mode == "list")
     is_zoom = (mode == "zoom")
-    sky_card_tg.hidden = is_list
+    is_zodiac = (mode == "zodiac")
+    sky_card_tg.hidden = is_list or is_zodiac
     for lbl in sky_list_name_labels:
         lbl.hidden = not is_list
     for lbl in sky_list_info_labels:
         lbl.hidden = not is_list
+    for lbl in sky_zodiac_labels:
+        lbl.hidden = not is_zodiac
     if sky_zoom_label is not None:
         sky_zoom_label.hidden = not is_zoom
 
@@ -1152,15 +1231,19 @@ def update_basin_planets():
             _sky_view_mode = "list"
             _last_list_time = now
         elif _sky_view_mode == "map":
-            # Map → moon zoom, but only when the moon is up; with no target
-            # we just hold the map until the next periodic list flash.
+            # Map → moon zoom (only when the moon is up), else straight to
+            # the zodiac sun-sign card.
             if zoom_targets:
                 _sky_view_mode = "zoom"
                 _zoom_idx = 0
-        else:                                # _sky_view_mode == "zoom"
-            # Only the moon lives here now, so zoom is a single beat → map.
-            _sky_view_mode = "map"
+            else:
+                _sky_view_mode = "zodiac"
+        elif _sky_view_mode == "zoom":
+            # Only the moon lives here now, so zoom is a single beat → zodiac.
+            _sky_view_mode = "zodiac"
             _zoom_idx = 0
+        else:                                # _sky_view_mode == "zodiac"
+            _sky_view_mode = "map"
         _sky_view_last_flip = now
         _set_view_mode(_sky_view_mode)
         _sky_last_drawn = ""
@@ -1176,13 +1259,14 @@ def update_basin_planets():
 
     sun = _sky_data.get("sun") or {}
     moon = _sky_data.get("moon") or {}
-    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}".format(
+    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}:z{}".format(
         _sky_view_mode, _zoom_idx,
         len(planets),
         ",".join(p.get("name", "") for p in planets),
         sun.get("az", -1), sun.get("alt", -91),
         moon.get("az", -1), moon.get("alt", -91),
         moon.get("phase", 0),
+        (_sky_data.get("zodiac") or {}).get("Sun", ""),
     )
     if marker == _sky_last_drawn:
         return
@@ -1191,6 +1275,8 @@ def update_basin_planets():
         render_sky_map()
     elif _sky_view_mode == "zoom":
         render_zoom_view()
+    elif _sky_view_mode == "zodiac":
+        _render_zodiac_view()
     else:
         _render_list_view()
     _sky_last_drawn = marker
@@ -1615,6 +1701,29 @@ if BASIN_MODE == "sky":
     sky_zoom_label = Label(FONT_SMALL, text="", color=0xCCCCCC, x=2, y=4)
     sky_zoom_label.hidden = True
     weather_group.append(sky_zoom_label)
+
+# Zodiac sun-sign card — a title, the sign name (sun gold), its date range,
+# and its element. Centered by _render_zodiac_view()/_center_card; x here is
+# just a placeholder. Shown only while _sky_view_mode == "zodiac".
+sky_zodiac_title_label = None
+sky_zodiac_sign_label  = None
+sky_zodiac_date_label  = None
+sky_zodiac_elem_label  = None
+sky_zodiac_labels = []
+if BASIN_MODE == "sky":
+    # Colors go through _dim() (dims + swaps R<->B for the BGR panel), same as
+    # every other label on this display.
+    sky_zodiac_title_label = Label(FONT_SMALL, text="", color=_dim(0x8899AA), x=2, y=6)
+    sky_zodiac_sign_label  = Label(FONT_MID,   text="", color=_dim(0xFFCC44), x=2, y=18)
+    sky_zodiac_date_label  = Label(FONT_SMALL, text="", color=_dim(0xBBBBBB), x=2, y=29)
+    sky_zodiac_elem_label  = Label(FONT_SMALL, text="", color=_dim(0x66CCEE), x=2, y=38)
+    sky_zodiac_labels = [
+        sky_zodiac_title_label, sky_zodiac_sign_label,
+        sky_zodiac_date_label,  sky_zodiac_elem_label,
+    ]
+    for _zl in sky_zodiac_labels:
+        _zl.hidden = True
+        weather_group.append(_zl)
 
 # In sky mode, hide the scale=2 basin + tide label + vertical separator
 # since the sky card overlays them and the separator no longer marks a

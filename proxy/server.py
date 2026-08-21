@@ -1099,6 +1099,18 @@ _PLANET_META = (
     ("Saturn",  "Sat",   "saturn barycenter",  0.5),
 )
 
+# Tropical zodiac: 12 equal 30° signs measured from the vernal equinox along
+# the ecliptic of date. Index = floor(ecliptic_longitude / 30).
+_ZODIAC_SIGNS = (
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
+)
+
+
+def _zodiac_sign(ecl_lon_deg):
+    """Ecliptic longitude (degrees) -> tropical zodiac sign name."""
+    return _ZODIAC_SIGNS[int(ecl_lon_deg // 30) % 12]
+
 
 def _ensure_skyfield():
     """Lazy-load skyfield + de421.bsp once per process. Idempotent; returns
@@ -1297,6 +1309,25 @@ def handle_v2_sky(params):
     from skyfield import almanac
     moon_phase = (almanac.moon_phase(_sky_eph, now_t).degrees / 360.0) % 1.0
 
+    # Tropical zodiac sign each classical body currently occupies. Geocentric
+    # apparent ecliptic longitude in the ecliptic/equinox of date (epoch=now_t)
+    # — this is what "the Sun is in Leo" means. Independent of tonight's
+    # visibility, so we cover the Sun, Moon, and all five naked-eye planets.
+    geo = _sky_eph["earth"]
+
+    def _sign_of(target):
+        _lat, ecl_lon, _dist = (
+            geo.at(now_t).observe(target).apparent().ecliptic_latlon(epoch=now_t)
+        )
+        return _zodiac_sign(ecl_lon.degrees)
+
+    zodiac = {
+        "Sun":  _sign_of(_sky_eph["sun"]),
+        "Moon": _sign_of(_sky_eph["moon"]),
+    }
+    for _name, _abbr, _eph_key, _mag in _PLANET_META:
+        zodiac[_name] = _sign_of(_sky_eph[_eph_key])
+
     body = json.dumps({
         "tonight":     tonight_iso,
         "cond":        cond_str,
@@ -1314,6 +1345,7 @@ def handle_v2_sky(params):
             "waxing": bool(moon_phase < 0.5),   # numpy → python bool
         },
         "planets":     planets_out,
+        "zodiac":      zodiac,
     }).encode()
     cache_set(cache_key, body, age_override=15 * 60)
     return 200, body
