@@ -847,6 +847,34 @@ def _is_night():
     return sun.get("alt", 90) < _NIGHT_SUN_ALT
 
 
+# OWM "main" conditions that read as overcast enough to show clouds on the
+# horizon map. Clear/Mist/Fog/etc. leave the sky bare.
+_CLOUDY_CONDS = ("Clouds", "Rain", "Drizzle", "Thunderstorm", "Snow")
+
+# A few clouds scattered across the upper sky, at fixed (x, y, width) so the
+# card stays stable between redraws. Kept small and high so they sit above the
+# horizon without crowding the sun/moon/planets, which draw on top.
+_HORIZON_CLOUDS = ((8, 6, 10), (54, 10, 12), (96, 4, 9))
+
+
+def _sky_card_cloud(x, y, w, c):
+    """Small fluffy cloud into sky_card_bmp: bumpy top row + 2 solid rows."""
+    for dx in range(1, w - 1):
+        _put(sky_card_bmp, x + dx, y, c)
+    for dx in range(w):
+        _put(sky_card_bmp, x + dx, y + 1, c)
+        _put(sky_card_bmp, x + dx, y + 2, c)
+
+
+def _draw_horizon_clouds():
+    """Light cloud cover on the horizon map when the weather is a cloudy form
+    (clouds/rain/snow). Palette slot 8 is the shared cloud gray."""
+    if weather_cond_main not in _CLOUDY_CONDS:
+        return
+    for cx, cy, cw in _HORIZON_CLOUDS:
+        _sky_card_cloud(cx, cy, cw, 8)
+
+
 def render_sky_map():
     """Draw the horizon sky map at full panel width. Layers (bottom to top):
        1. Stars (only when the sun is below civil twilight)
@@ -863,6 +891,11 @@ def render_sky_map():
             _STARS = _generate_stars()
         for sx, sy, bright in _STARS:
             sky_card_bmp[sx, sy] = _STAR_BRIGHT if bright else _STAR_DIM
+
+    # 1b) Clouds — light cover when the weather is a cloudy form. Drawn over
+    # the stars (clouds occlude them) but under the sun/moon/planets so those
+    # stay readable, as if breaking through the cover.
+    _draw_horizon_clouds()
 
     # 2) Horizon line — dim, doesn't compete with the dots
     for x in range(SKY_CARD_W):
@@ -1232,7 +1265,7 @@ def update_basin_planets():
 
     sun = _sky_data.get("sun") or {}
     moon = _sky_data.get("moon") or {}
-    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}:z{}".format(
+    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}:z{}:w{}".format(
         _sky_view_mode, _zoom_idx,
         len(planets),
         ",".join(p.get("name", "") for p in planets),
@@ -1240,6 +1273,7 @@ def update_basin_planets():
         moon.get("az", -1), moon.get("alt", -91),
         moon.get("phase", 0),
         (_sky_data.get("zodiac") or {}).get("Sun", ""),
+        weather_cond_main,
     )
     if marker == _sky_last_drawn:
         return
