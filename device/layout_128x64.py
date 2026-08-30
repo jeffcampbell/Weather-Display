@@ -515,6 +515,51 @@ _PLANET_COLOR_HEX = {
     "Saturn":  0xFFCC00,
 }
 
+# Per-sign (date range, element). The moon card's "Sign: <name>" line is tinted
+# by element; the date range is kept for reference/future use. Ranges are the
+# conventional tropical ones (they match the Sun's ecliptic sign of date, which
+# is what the proxy computes in _sky_data["zodiac"]["Sun"]).
+_ZODIAC_INFO = {
+    "Aries":       ("Mar 21-Apr 19", "Fire"),
+    "Taurus":      ("Apr 20-May 20", "Earth"),
+    "Gemini":      ("May 21-Jun 20", "Air"),
+    "Cancer":      ("Jun 21-Jul 22", "Water"),
+    "Leo":         ("Jul 23-Aug 22", "Fire"),
+    "Virgo":       ("Aug 23-Sep 22", "Earth"),
+    "Libra":       ("Sep 23-Oct 22", "Air"),
+    "Scorpio":     ("Oct 23-Nov 21", "Water"),
+    "Sagittarius": ("Nov 22-Dec 21", "Fire"),
+    "Capricorn":   ("Dec 22-Jan 19", "Earth"),
+    "Aquarius":    ("Jan 20-Feb 18", "Air"),
+    "Pisces":      ("Feb 19-Mar 20", "Water"),
+}
+_ELEMENT_COLOR = {
+    "Fire":  0xFF6622,
+    "Earth": 0x66CC44,
+    "Air":   0x66CCEE,
+    "Water": 0x4488FF,
+}
+# Tropical sun-sign cutoffs (sign starts on this month/day) for the on-device
+# fallback used when the proxy hasn't supplied a zodiac block. A date on or
+# after a cutoff belongs to that sign; before Jan 20 it's Capricorn.
+_SUN_SIGN_CUTOFFS = (
+    (1, 20, "Aquarius"),  (2, 19, "Pisces"),  (3, 21, "Aries"),
+    (4, 20, "Taurus"),    (5, 21, "Gemini"),  (6, 21, "Cancer"),
+    (7, 23, "Leo"),       (8, 23, "Virgo"),   (9, 23, "Libra"),
+    (10, 23, "Scorpio"),  (11, 22, "Sagittarius"), (12, 22, "Capricorn"),
+)
+
+
+def _sun_sign_by_date():
+    """Fallback tropical sun sign from today's local date."""
+    t = time.localtime()
+    md = (t.tm_mon, t.tm_mday)
+    sign = "Capricorn"          # before the first cutoff (and late December)
+    for m, d, s in _SUN_SIGN_CUTOFFS:
+        if md >= (m, d):
+            sign = s
+    return sign
+
 # Cycle: 30s zoomed-out map → 30s zoom on each visible planet (one at a
 # time), then back to map. Independent 4.5-min timer interrupts for the
 # list (text info) view, which itself runs 30s before normal cycle resumes.
@@ -802,6 +847,34 @@ def _is_night():
     return sun.get("alt", 90) < _NIGHT_SUN_ALT
 
 
+# OWM "main" conditions that read as overcast enough to show clouds on the
+# horizon map. Clear/Mist/Fog/etc. leave the sky bare.
+_CLOUDY_CONDS = ("Clouds", "Rain", "Drizzle", "Thunderstorm", "Snow")
+
+# A few clouds scattered across the upper sky, at fixed (x, y, width) so the
+# card stays stable between redraws. Kept small and high so they sit above the
+# horizon without crowding the sun/moon/planets, which draw on top.
+_HORIZON_CLOUDS = ((8, 6, 10), (54, 10, 12), (96, 4, 9))
+
+
+def _sky_card_cloud(x, y, w, c):
+    """Small fluffy cloud into sky_card_bmp: bumpy top row + 2 solid rows."""
+    for dx in range(1, w - 1):
+        _put(sky_card_bmp, x + dx, y, c)
+    for dx in range(w):
+        _put(sky_card_bmp, x + dx, y + 1, c)
+        _put(sky_card_bmp, x + dx, y + 2, c)
+
+
+def _draw_horizon_clouds():
+    """Light cloud cover on the horizon map when the weather is a cloudy form
+    (clouds/rain/snow). Palette slot 8 is the shared cloud gray."""
+    if weather_cond_main not in _CLOUDY_CONDS:
+        return
+    for cx, cy, cw in _HORIZON_CLOUDS:
+        _sky_card_cloud(cx, cy, cw, 8)
+
+
 def render_sky_map():
     """Draw the horizon sky map at full panel width. Layers (bottom to top):
        1. Stars (only when the sun is below civil twilight)
@@ -818,6 +891,11 @@ def render_sky_map():
             _STARS = _generate_stars()
         for sx, sy, bright in _STARS:
             sky_card_bmp[sx, sy] = _STAR_BRIGHT if bright else _STAR_DIM
+
+    # 1b) Clouds — light cover when the weather is a cloudy form. Drawn over
+    # the stars (clouds occlude them) but under the sun/moon/planets so those
+    # stay readable, as if breaking through the cover.
+    _draw_horizon_clouds()
 
     # 2) Horizon line — dim, doesn't compete with the dots
     for x in range(SKY_CARD_W):
@@ -898,15 +976,76 @@ def fetch_sky():
         device_log("Sky err:{}".format(e))
 
 
+# ---------------------------------------------------------------------------
+# Sunrise / sunset footer
+# ---------------------------------------------------------------------------
+# On the horizon (map) sky view, the bottom strip drops the temp/condition/
+# wind weather readout in favour of the day's sunrise and sunset. The live
+# clock keeps its top-left slot; both sun times share the bottom row, each
+# tagged with a sun / moon glyph (both present in the 5x8 font):
+#
+#     3:15 PM                    <- clock_label (live, untouched)
+#     (sun)5:56a  (moon)7:35p    <- cond_label / wind_label (bright times)
+#
+# The freed top-right slot (temp_label) is blanked while the footer is up.
+# show_weather_tides() defers to it via the _sun_footer_on flag.
+_sun_footer_on = False
+_sun_footer_shown = (-1, -1)   # (sunrise_mins, sunset_mins) currently drawn
+
+
+def _fmt_sun_time(mins):
+    """Minutes-into-local-day -> compact 12h clock like '5:42a' / '7:38p'."""
+    if mins is None or mins < 0:
+        return "--:--"
+    h = (mins // 60) % 24
+    m = mins % 60
+    return "{}:{:02d}{}".format(h % 12 or 12, m, "a" if h < 12 else "p")
+
+
+def _apply_sun_footer():
+    """Put sunrise + sunset on the bottom row, leaving the clock in place.
+    Idempotent — only rewrites the labels when the footer state or the times
+    actually change, so it is cheap to call every tick while the view is up."""
+    global _sun_footer_on, _sun_footer_shown
+    want = (_sunrise_mins, _sunset_mins)
+    if _sun_footer_on and _sun_footer_shown == want:
+        return
+    temp_label.text = ""                              # clear freed top-right slot
+    cond_label.text = chr(0x2600) + _fmt_sun_time(_sunrise_mins)  # sun glyph  (rise)
+    cond_label.color = _dim(0xFFCC44)                 # gold  (bottom-left)
+    wind_label.font = FONT_MID                         # match the sunrise size
+    wind_label.text = chr(0x263E) + _fmt_sun_time(_sunset_mins)   # moon glyph (set)
+    wind_label.color = _dim(0xFF7733)                 # orange (bottom-right)
+    _sun_footer_on = True
+    _sun_footer_shown = want
+
+
+def _clear_sun_footer():
+    """Hand the bottom strip back to the weather readout."""
+    global _sun_footer_on, _sun_footer_shown
+    if not _sun_footer_on:
+        return
+    _sun_footer_on = False
+    _sun_footer_shown = (-1, -1)
+    wind_label.font = FONT_SMALL
+    # Restore the weather text colors the footer overwrote with gold/orange —
+    # _center_small() only rewrites .text, so without this the condition/wind
+    # readout keeps the sunrise/sunset colors. Match the label-creation values.
+    cond_label.color = _dim(0xAAAACC)
+    wind_label.color = _dim(0x88BBCC)
+    # switch_screen("weather") is a no-op here (already on the weather group),
+    # so this just repaints temp/cond/wind from the current weather globals.
+    show_weather_tides()
+
+
 def _zoom_targets():
-    """Names of objects we can zoom on, in cycle order: each visible
-    planet plus "Moon" if it's above the horizon."""
-    planets = _sky_data.get("planets") or []
-    names = [p.get("name", "") for p in planets]
+    """Objects the zoom slot can focus on. Planet zooms were dropped (they
+    didn't read well at this size), so this is just the Moon when it's above
+    the horizon — otherwise empty, and the cycle skips the zoom beat."""
     moon = _sky_data.get("moon") or {}
     if moon.get("alt", -90) > 0:
-        names.append("Moon")
-    return names
+        return ["Moon"]
+    return []
 
 
 def render_zoom_view():
@@ -936,8 +1075,17 @@ def _render_moon_zoom():
     cy = SKY_CARD_H // 2 - 1      # 21
     _draw_moon_zoom(cx, cy, phase)
     if sky_zoom_label is not None:
-        sky_zoom_label.text = "ZOOM: Moon {}%".format(int(round(illum * 100)))
+        sky_zoom_label.text = "Moon {}%".format(int(round(illum * 100)))
         sky_zoom_label.color = _dim(0xDDCCAA)   # warm cream
+    if sky_moon_sign_label is not None:
+        # Current sun sign tucked onto the moon card (proxy value, else date).
+        z = _sky_data.get("zodiac") or {}
+        sign = z.get("Sun") or _sun_sign_by_date()
+        info = _ZODIAC_INFO.get(sign)
+        sky_moon_sign_label.text = "Sign: " + sign
+        sky_moon_sign_label.color = _dim(
+            _ELEMENT_COLOR.get(info[1], 0xBBBBBB) if info else 0xBBBBBB
+        )
 
 
 def _render_planet_zoom_at(focus_name):
@@ -1043,9 +1191,9 @@ def _render_list_view():
 
 def _set_view_mode(mode):
     """Toggle the right combination of widgets for the active view.
-    map  -> sky_card_tg only
-    zoom -> sky_card_tg + zoom title label
-    list -> 3 name + 3 info labels (sky_card_tg hidden)"""
+    map    -> sky_card_tg only
+    zoom   -> sky_card_tg + zoom title label + moon sun-sign line
+    list   -> 3 name + 3 info labels (sky_card_tg hidden)"""
     is_list = (mode == "list")
     is_zoom = (mode == "zoom")
     sky_card_tg.hidden = is_list
@@ -1055,13 +1203,15 @@ def _set_view_mode(mode):
         lbl.hidden = not is_list
     if sky_zoom_label is not None:
         sky_zoom_label.hidden = not is_zoom
+    if sky_moon_sign_label is not None:
+        sky_moon_sign_label.hidden = not is_zoom
 
 
 def update_basin_planets():
     """Per-tick sky-area update.
 
     Normal cycle (each step _VIEW_DWELL_SECS):
-        map → zoom on each planet in turn → map → repeat
+        map → moon zoom (only when the moon is up) → map → repeat
 
     Independent every-_LIST_INTERVAL timer interrupts the cycle to show
     the list view for _LIST_DWELL_SECS, then normal cycle resumes from map.
@@ -1091,27 +1241,39 @@ def update_basin_planets():
             _sky_view_mode = "list"
             _last_list_time = now
         elif _sky_view_mode == "map":
-            # Map → zoom on first target (planet or moon).
-            _sky_view_mode = "zoom"
-            _zoom_idx = 0
-        else:                                # _sky_view_mode == "zoom"
-            _zoom_idx += 1
-            if _zoom_idx >= len(zoom_targets):
-                _sky_view_mode = "map"
+            # Map → moon zoom, but only when the moon is up; with no target
+            # we just hold the map until the next periodic list flash.
+            if zoom_targets:
+                _sky_view_mode = "zoom"
                 _zoom_idx = 0
+        else:                                # _sky_view_mode == "zoom"
+            # Only the moon lives here now, so zoom is a single beat → map.
+            _sky_view_mode = "map"
+            _zoom_idx = 0
         _sky_view_last_flip = now
         _set_view_mode(_sky_view_mode)
         _sky_last_drawn = ""
 
+    # The sunrise/sunset footer owns the bottom strip on the horizon (map)
+    # view; every other sub-view hands it back to the weather readout. Kept
+    # ahead of the marker early-return so the times track a mid-view sunrise/
+    # sunset refresh and mode transitions are always honoured.
+    if _sky_view_mode == "map":
+        _apply_sun_footer()
+    elif _sun_footer_on:
+        _clear_sun_footer()
+
     sun = _sky_data.get("sun") or {}
     moon = _sky_data.get("moon") or {}
-    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}".format(
+    marker = "{}:{}:{}:{}:s{}@{}:m{}@{}/{}:z{}:w{}".format(
         _sky_view_mode, _zoom_idx,
         len(planets),
         ",".join(p.get("name", "") for p in planets),
         sun.get("az", -1), sun.get("alt", -91),
         moon.get("az", -1), moon.get("alt", -91),
         moon.get("phase", 0),
+        (_sky_data.get("zodiac") or {}).get("Sun", ""),
+        weather_cond_main,
     )
     if marker == _sky_last_drawn:
         return
@@ -1547,6 +1709,15 @@ if BASIN_MODE == "sky":
     sky_zoom_label.hidden = True
     weather_group.append(sky_zoom_label)
 
+# Current sun sign, shown as a small line at the bottom of the moon zoom
+# card ("Sign: Leo", element-colored). Filled in by _render_moon_zoom();
+# color set there. Shown only while _sky_view_mode == "zoom".
+sky_moon_sign_label = None
+if BASIN_MODE == "sky":
+    sky_moon_sign_label = Label(FONT_SMALL, text="", color=_dim(0xBBBBBB), x=2, y=39)
+    sky_moon_sign_label.hidden = True
+    weather_group.append(sky_moon_sign_label)
+
 # In sky mode, hide the scale=2 basin + tide label + vertical separator
 # since the sky card overlays them and the separator no longer marks a
 # meaningful boundary between planet glyph and weather text.
@@ -1922,11 +2093,17 @@ def _forecast_day_label(idx):
         return "TMRW"
     return _DOW_SHORT[(time.localtime().tm_wday + idx) % 7]
 
-# --- Health indicator: 1 px red dot at (63, 31) ---
-# Visible when /api/health reports a non-empty `issues` list (or when the
-# proxy is unreachable). One TileGrid per group because displayio doesn't
-# allow a TileGrid to be a child of multiple parents — they share the
-# same bitmap and palette so this stays cheap.
+# --- Health indicator: 1 px red dot in the bottom-right corner ---
+# Visible when /api/health reports a genuine problem (or when the proxy is
+# unreachable). One TileGrid per group because displayio doesn't allow a
+# TileGrid to be a child of multiple parents — they share the same bitmap
+# and palette so this stays cheap.
+#
+# The corner coordinate depends on the group's scale: plane_group and
+# loading_group are scale=2 children laid out on the 64x32 logical grid, so
+# (63, 31) is their corner. weather_group and forecast_group render at native
+# 128x64, where the corner is (127, 63) — using the logical coordinate there
+# would put the dot dead center of the panel.
 _health_bmp = displayio.Bitmap(1, 1, 2)
 _health_pal = displayio.Palette(2)
 _health_pal[0] = 0x000000
@@ -1934,22 +2111,42 @@ _health_pal.make_transparent(0)
 _health_pal[1] = 0xFF0000
 _health_bmp[0, 0] = 1
 _health_pixels = []
-for _grp in (weather_group, plane_group, loading_group):
-    _tg = displayio.TileGrid(_health_bmp, pixel_shader=_health_pal, x=63, y=31)
+for _grp, _hx, _hy in ((plane_group,    63,  31),
+                       (loading_group,  63,  31),
+                       (weather_group, 127,  63),
+                       (forecast_group, 127, 63)):
+    _tg = displayio.TileGrid(_health_bmp, pixel_shader=_health_pal, x=_hx, y=_hy)
     _tg.hidden = True
     _grp.append(_tg)
     _health_pixels.append(_tg)
-# forecast_group is native 128×64 (not scale=2), so position the health pixel
-# at the native bottom-right corner directly.
-_fcst_health_tg = displayio.TileGrid(_health_bmp, pixel_shader=_health_pal, x=127, y=63)
-_fcst_health_tg.hidden = True
-forecast_group.append(_fcst_health_tg)
-_health_pixels.append(_fcst_health_tg)
 
 def set_health_indicator(visible):
     """Show or hide the bottom-right red pixel across all screens."""
     for _tg in _health_pixels:
         _tg.hidden = not visible
+
+
+# --- Flight-view free-tier notice ---
+# Separate from the health dot above. When FlightAware isn't being consulted
+# — outside its enabled window, or the monthly cap is spent — the proxy falls
+# back to the free scheduled-route DBs. Everything still works, so that's not
+# a health problem; it just means the route on screen is scheduled data rather
+# than the live leg. Says so where it matters, on the flight view, by tinting
+# the route amber instead of white.
+ROUTE_COLOR = 0xFFFFFF
+ROUTE_COLOR_FREE = 0xFFAA33
+_route_free_tier = False
+
+def set_route_free_tier(free):
+    """Record whether route lookups are currently free-tier only. Applied by
+    the next show_plane(); repaints immediately if a plane is already up."""
+    global _route_free_tier
+    free = bool(free)
+    if free == _route_free_tier:
+        return
+    _route_free_tier = free
+    if route_label.text:
+        route_label.color = _dim(ROUTE_COLOR_FREE if free else ROUTE_COLOR)
 
 # --- Apply PANEL_BRIGHTNESS to every static palette and label color ---
 # HUB75 has no hardware dimming, so we scale RGB values in place.
@@ -2294,20 +2491,36 @@ def fetch_planes():
 _last_health_issues = None  # last known issue list — used to log only on change
 _consecutive_bad_polls = 0  # pixel only lights after 2 in a row, to absorb blips
 
+# Issues the proxy reports that are informational rather than a fault. A spent
+# FlightAware monthly quota only means route lookups fall back to the free
+# scheduled-route DBs — nothing is broken, so it must not light the red dot on
+# every screen. It surfaces on the flight view instead (see set_route_free_tier).
+_INFO_ONLY_ISSUES = ("flightaware_quota_exhausted",)
+
 def fetch_health():
     """Poll /api/health and toggle the bottom-right red pixel based on the
-    proxy's reported issues. Requires 2 consecutive bad polls before lighting
-    the pixel; one good poll clears it. Logs every state change."""
+    proxy's reported issues, ignoring the informational ones. Requires 2
+    consecutive bad polls before lighting the pixel; one good poll clears it.
+    Logs every state change. Also updates the flight view's free-tier tint."""
     global _last_health_issues, _consecutive_bad_polls
     try:
         url = "{}/api/health".format(PROXY_HOST)
         data = fetch_json(url)
         issues = data.get("issues") or []
-        if issues:
+        if [i for i in issues if i not in _INFO_ONLY_ISSUES]:
             _consecutive_bad_polls += 1
         else:
             _consecutive_bad_polls = 0
         set_health_indicator(_consecutive_bad_polls >= 2)
+        # Routes are free-tier whenever FlightAware is outside its enabled
+        # window or the monthly cap is spent. Older proxies omit these fields;
+        # the defaults then read as "FlightAware on", i.e. no tint.
+        _fa_limit = data.get("flightaware_limit", 0)
+        _fa_used = data.get("flightaware_used", 0)
+        set_route_free_tier(
+            not data.get("flightaware_enabled", True)
+            or (_fa_limit and _fa_used >= _fa_limit)
+        )
         if issues != _last_health_issues:
             device_log("Health:{}".format(",".join(issues) if issues else "ok"))
             _last_health_issues = issues
@@ -2604,19 +2817,22 @@ def show_weather_tides():
     a label-realloc MemoryError just skips this render instead of crashing."""
     try:
         switch_screen("weather")
-        _center_mid(temp_label, weather_str)
-        try:
-            temp_val = int(weather_str.split(chr(176))[0])
-        except (ValueError, IndexError):
-            temp_val = 60
-        if temp_val >= 90:   tc = 0xFF2222
-        elif temp_val >= 70: tc = 0xFFDD00
-        elif temp_val >= 50: tc = 0x88FFCC
-        elif temp_val >= 30: tc = 0x44AAFF
-        else:                tc = 0x2255CC
-        temp_label.color = _dim(tc)
-        _center_small(cond_label, weather_cond[:10])
-        _center_small(wind_label, wind_str)
+        # In sky mode the horizon view's sunrise/sunset footer borrows the
+        # temp/cond/wind labels; leave them alone while it owns the strip.
+        if not (BASIN_MODE == "sky" and _sun_footer_on):
+            _center_mid(temp_label, weather_str)
+            try:
+                temp_val = int(weather_str.split(chr(176))[0])
+            except (ValueError, IndexError):
+                temp_val = 60
+            if temp_val >= 90:   tc = 0xFF2222
+            elif temp_val >= 70: tc = 0xFFDD00
+            elif temp_val >= 50: tc = 0x88FFCC
+            elif temp_val >= 30: tc = 0x44AAFF
+            else:                tc = 0x2255CC
+            temp_label.color = _dim(tc)
+            _center_small(cond_label, weather_cond[:10])
+            _center_small(wind_label, wind_str)
         if BASIN_MODE == "sky":
             # Planet-card labels are owned by update_basin_planets() — it
             # writes them on every glyph swap. Nothing to do here.
@@ -2697,6 +2913,9 @@ def show_plane(plane):
             fetch_route(callsign, plane[1])
             route = flight_cache.get(callsign, {})
         route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
+        # Amber route = scheduled/free-tier data, white = FlightAware live leg.
+        route_label.color = _dim(
+            ROUTE_COLOR_FREE if _route_free_tier else ROUTE_COLOR)
 
         airline_label.text = name[:8]
         airline_label.color = _dim(color)
