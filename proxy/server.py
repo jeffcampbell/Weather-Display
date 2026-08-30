@@ -441,25 +441,43 @@ FLIGHTAWARE_MONTHLY_LIMIT = int(_config.get("flightaware_monthly_limit", 450))
 FLIGHTAWARE_OVERRIDE_FREE = bool(_config.get("flightaware_override_free_routes", True))
 _FA_USAGE_PATH = Path(__file__).parent / "flightaware_usage.json"
 
-# Optional schedule gate. When this flag file exists and reads as "off" (or
-# 0/false/no/free), FlightAware is skipped entirely — free routes only, zero
-# billable calls — regardless of the override and the monthly cap. A missing or
-# unreadable flag means enabled, so the default/normal behavior is unchanged and
-# the box fails safe toward its usual operation. The file is (re-)read cheaply on
-# each route lookup, so cron can flip it with no service restart. This is how the
-# unattended beach box runs free-only on weekdays and enables paid enrichment on
-# weekends (see the proxy crontab).
+# Optional schedule gate. When the applicable flag file exists and reads as
+# "off" (or 0/false/no/free), FlightAware is skipped entirely for that scope —
+# free routes only, zero billable calls — regardless of the override and the
+# monthly cap. A missing or unreadable flag means enabled, so the
+# default/normal behavior is unchanged and the box fails safe toward its usual
+# operation. Files are (re-)read cheaply on each route lookup, so cron can flip
+# them with no service restart.
+#
+# Per-location file (flightaware_enabled_<loc>) takes precedence over the
+# master file (flightaware_enabled) when a request carries a ?loc=<name>, so
+# one shared proxy can run paid enrichment on a schedule for a single location
+# (e.g. weekends-only for a shared multi-location box) without affecting
+# others. Requests with no loc (single-location v1 callers) only ever consult
+# the master file.
 _FA_ENABLED_FLAG_PATH = Path(__file__).parent / "flightaware_enabled"
 
 
-def flightaware_enabled_now():
-    """False only when the schedule flag file explicitly says off; True when the
-    flag is absent/unreadable (fail-safe to normal FlightAware behavior)."""
-    try:
-        val = _FA_ENABLED_FLAG_PATH.read_text().strip().lower()
-    except Exception:
-        return True
-    return val not in ("off", "0", "false", "no", "free")
+def _fa_flag_dir():
+    return _FA_ENABLED_FLAG_PATH.parent
+
+
+def flightaware_enabled_now(loc=""):
+    """False only when the applicable schedule flag file explicitly says off;
+    True when it's absent/unreadable (fail-safe to normal FlightAware
+    behavior). Checks the per-location file first, then falls back to the
+    master file."""
+    candidates = []
+    if loc:
+        candidates.append(_fa_flag_dir() / f"flightaware_enabled_{loc}")
+    candidates.append(_FA_ENABLED_FLAG_PATH)
+    for path in candidates:
+        try:
+            val = path.read_text().strip().lower()
+        except Exception:
+            continue
+        return val not in ("off", "0", "false", "no", "free")
+    return True
 _fa_usage_lock = Lock()
 _fa_exhausted_logged_period = None
 
@@ -560,6 +578,7 @@ def handle_route(params):
 
     callsign = params.get("callsign", [""])[0].strip()
     icao24 = params.get("icao24", [""])[0].strip()
+    loc = params.get("loc", [""])[0].strip()
     if not callsign:
         return 400, json.dumps({"error": "missing callsign"}).encode()
 
@@ -610,7 +629,7 @@ def handle_route(params):
     #    GA-registration skip, and the per-(callsign,icao24) route cache. With
     #    the override off, falls back to the old "only when free found nothing"
     #    behavior.
-    fa_should_consult = flightaware_enabled_now() and (
+    fa_should_consult = flightaware_enabled_now(loc) and (
         FLIGHTAWARE_OVERRIDE_FREE or not result["route"])
     if fa_should_consult and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         if not _flightaware_reserve():
