@@ -33,6 +33,11 @@ NOAA_STATION = secrets["noaa_station"]
 LAT = float(secrets["latitude"])
 LON = float(secrets["longitude"])
 OWM_KEY = secrets["openweather_key"]
+# Named location for the proxy's v2 API / location-scoped route lookups. Only
+# used to tag /api/route calls so a shared proxy can gate FlightAware
+# per-location; weather/planes/ships/tides on this layout still always use
+# the proxy's v1 endpoints (its top-level lat/lon/bbox), not this location.
+LOCATION_NAME = secrets.get("location", "")
 # Static UTC offset used at boot. After the first weather fetch, the
 # OpenWeatherMap response carries the accurate offset (DST-aware) and the
 # RTC re-syncs automatically, so this only needs to be roughly right.
@@ -747,6 +752,8 @@ def fetch_route(callsign, icao24=""):
         url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
         if icao24:
             url += "&icao24={}".format(icao24)
+        if LOCATION_NAME:
+            url += "&loc={}".format(LOCATION_NAME)
         data = fetch_json(url)
         route = data.get("route", [])
         if route:

@@ -1436,6 +1436,8 @@ def fetch_route(callsign, icao24=""):
         url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
         if icao24:
             url += "&icao24={}".format(icao24)
+        if LOCATION_NAME:
+            url += "&loc={}".format(LOCATION_NAME)
         data = fetch_json(url)
         route = data.get("route", [])
         if route:
