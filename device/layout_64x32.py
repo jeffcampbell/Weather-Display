@@ -871,8 +871,8 @@ ip_label = Label(FONT_SMALL, text=_ip_text, color=0x00AAFF, x=6, y=22)
 loading_group.append(ip_label)
 
 # --- Health indicator: 1 px red dot at (63, 31) ---
-# Visible when /api/health reports a non-empty `issues` list (or when the
-# proxy is unreachable). One TileGrid per group because displayio doesn't
+# Visible when /api/health reports a genuine problem (or when the proxy is
+# unreachable). One TileGrid per group because displayio doesn't
 # allow a TileGrid to be a child of multiple parents — they share the
 # same bitmap and palette so this stays cheap.
 _health_bmp = displayio.Bitmap(1, 1, 2)
@@ -892,6 +892,29 @@ def set_health_indicator(visible):
     """Show or hide the bottom-right red pixel across all screens."""
     for _tg in _health_pixels:
         _tg.hidden = not visible
+
+
+# --- Flight-view free-tier notice ---
+# Separate from the health dot above. When FlightAware isn't being consulted
+# — outside its enabled window, or the monthly cap is spent — the proxy falls
+# back to the free scheduled-route DBs. Everything still works, so that's not
+# a health problem; it just means the route on screen is scheduled data rather
+# than the live leg. Says so where it matters, on the flight view, by tinting
+# the route amber instead of white.
+ROUTE_COLOR = 0xFFFFFF
+ROUTE_COLOR_FREE = 0xFFAA33
+_route_free_tier = False
+
+def set_route_free_tier(free):
+    """Record whether route lookups are currently free-tier only. Applied by
+    the next show_plane(); repaints immediately if a plane is already up."""
+    global _route_free_tier
+    free = bool(free)
+    if free == _route_free_tier:
+        return
+    _route_free_tier = free
+    if route_label.text:
+        route_label.color = ROUTE_COLOR_FREE if free else ROUTE_COLOR
 
 # Start with loading screen
 display.root_group = loading_group
@@ -1182,20 +1205,36 @@ def fetch_planes():
 _last_health_issues = None  # last known issue list — used to log only on change
 _consecutive_bad_polls = 0  # pixel only lights after 2 in a row, to absorb blips
 
+# Issues the proxy reports that are informational rather than a fault. A spent
+# FlightAware monthly quota only means route lookups fall back to the free
+# scheduled-route DBs — nothing is broken, so it must not light the red dot on
+# every screen. It surfaces on the flight view instead (see set_route_free_tier).
+_INFO_ONLY_ISSUES = ("flightaware_quota_exhausted",)
+
 def fetch_health():
     """Poll /api/health and toggle the bottom-right red pixel based on the
-    proxy's reported issues. Requires 2 consecutive bad polls before lighting
-    the pixel; one good poll clears it. Logs every state change."""
+    proxy's reported issues, ignoring the informational ones. Requires 2
+    consecutive bad polls before lighting the pixel; one good poll clears it.
+    Logs every state change. Also updates the flight view's free-tier tint."""
     global _last_health_issues, _consecutive_bad_polls
     try:
         url = "{}/api/health".format(PROXY_HOST)
         data = fetch_json(url)
         issues = data.get("issues") or []
-        if issues:
+        if [i for i in issues if i not in _INFO_ONLY_ISSUES]:
             _consecutive_bad_polls += 1
         else:
             _consecutive_bad_polls = 0
         set_health_indicator(_consecutive_bad_polls >= 2)
+        # Routes are free-tier whenever FlightAware is outside its enabled
+        # window or the monthly cap is spent. Older proxies omit these fields;
+        # the defaults then read as "FlightAware on", i.e. no tint.
+        _fa_limit = data.get("flightaware_limit", 0)
+        _fa_used = data.get("flightaware_used", 0)
+        set_route_free_tier(
+            not data.get("flightaware_enabled", True)
+            or (_fa_limit and _fa_used >= _fa_limit)
+        )
         if issues != _last_health_issues:
             device_log("Health:{}".format(",".join(issues) if issues else "ok"))
             _last_health_issues = issues
@@ -1490,6 +1529,8 @@ def show_plane(plane):
             fetch_route(callsign, plane[1])
             route = flight_cache.get(callsign, {})
         route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
+        # Amber route = scheduled/free-tier data, white = FlightAware live leg.
+        route_label.color = ROUTE_COLOR_FREE if _route_free_tier else ROUTE_COLOR
 
         airline_label.text = name[:8]
         airline_label.color = color
