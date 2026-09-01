@@ -138,14 +138,16 @@ LOCATION_NAME = secrets.get("location", "")
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths
-# (temp_str, cond_str, cond_main, wind_spd, wind_dir, tide_level, tide_type)
+# (temp_str, cond_str, cond_main, wind_spd, wind_dir, tide_level, tide_type,
+#  tide_offset_min — minutes from "now" to that tide; near 0 exercises the
+#  HIGH/LOW slack indicator, larger values exercise the plain countdown)
 _DEMO_WEATHER = (
-    ("72\xb0F",  "Clear Sky",  "Clear",        5, "SW", 0.8, "H"),
-    ("-5\xb0F",  "Heavy Snow", "Snow",         18, "NW", 0.5, "L"),
-    ("95\xb0F",  "Thndrstm",   "Thunderstorm", 28, "S",  0.2, "L"),
-    ("55\xb0F",  "Heavy Rain", "Rain",         22, "NE", 0.6, "H"),
-    ("68\xb0F",  "Fog",        "Fog",           3, "W",  0.4, "L"),
-    ("82\xb0F",  "Sctd Cloud", "Clouds",       12, "E",  0.9, "H"),
+    ("72\xb0F",  "Clear Sky",  "Clear",        5, "SW", 0.8, "H",    0),
+    ("-5\xb0F",  "Heavy Snow", "Snow",         18, "NW", 0.5, "L",  180),
+    ("95\xb0F",  "Thndrstm",   "Thunderstorm", 28, "S",  0.2, "L",    0),
+    ("55\xb0F",  "Heavy Rain", "Rain",         22, "NE", 0.6, "H",   45),
+    ("68\xb0F",  "Fog",        "Fog",           3, "W",  0.4, "L",  -20),
+    ("82\xb0F",  "Sctd Cloud", "Clouds",       12, "E",  0.9, "H",  200),
 )
 # (callsign, alt_ft, spd_kt, hdg, origin, dest, actype, reg)
 _DEMO_PLANES = (
@@ -164,6 +166,44 @@ _DEMO_SHIPS = (
      "destination": "HOUSTON",   "length": 220, "distance_mi": 5.7, "heading": 45},
     {"name": "FREEDOM",   "type": 50, "type_name": "Special",
      "destination": "BOSTON",    "length": 80,  "distance_mi": 5.1, "heading": 315},
+)
+# Astronomy fixture (sky-mode/enable_astronomy devices only). Seeded once into
+# _sky_data at demo startup — the existing per-tick update_basin_planets()
+# cycle (horizon map w/ sunrise-sunset footer -> moon zoom -> planet list ->
+# forecast card) is already unconditional (not gated on DEMO_MODE), so simply
+# having real-shaped data present makes the whole cycle run on its own.
+_DEMO_SKY = {
+    "sun": {"az": 250, "alt": -14},
+    "moon": {"az": 95, "alt": 38, "phase": 0.52, "illum": 0.81},
+    "planets": [
+        {"name": "Jupiter", "best_az": 120, "best_alt": 42, "mag": -2.1,
+         "best_dir": "SE", "best_time": "9:15p", "set": "2:40a"},
+        {"name": "Saturn", "best_az": 200, "best_alt": 27, "mag": 0.5,
+         "best_dir": "S", "best_time": "8:05p", "set": "1:10a"},
+        {"name": "Venus", "best_az": 80, "best_alt": 12, "mag": -4.0,
+         "best_dir": "E", "best_time": "5:40a", "rise": "5:10a"},
+    ],
+    "zodiac": {"Sun": "Virgo"},
+    "cloud_score": "Clear",
+    "cond": "Clear",
+}
+# Forecast fixture (sky-mode only — the only rotation slot that surfaces the
+# card). Seeded once into forecast_days at demo startup.
+_DEMO_FORECAST_DAYS = (
+    {"cond_id": 800, "cond": "Clear",  "hi": 78, "wind": 8,  "wind_deg": 220},
+    {"cond_id": 500, "cond": "Rain",   "hi": 64, "wind": 15, "wind_deg": 40},
+    {"cond_id": 803, "cond": "Clouds", "hi": 71, "wind": 10, "wind_deg": 160},
+)
+# Status-board fixture (enable_status only). Seeded once into status_providers
+# at demo startup — a mix of healthy/degraded/down so both the summary grid
+# and the incident detail card get exercised.
+_DEMO_STATUS_PROVIDERS = (
+    {"name": "GitHub",     "level": 0, "component": "", "title": "", "updated": 0},
+    {"name": "AWS",        "level": 2, "component": "us-east-1",
+     "title": "Elevated error rates on EC2 API", "updated": 0},
+    {"name": "Cloudflare", "level": 1, "component": "Dashboard",
+     "title": "Dashboard intermittently slow to load", "updated": 0},
+    {"name": "OpenAI",     "level": 0, "component": "", "title": "", "updated": 0},
 )
 
 # ---------------------------------------------------------------------------
@@ -2937,11 +2977,17 @@ def show_plane(plane):
 
 
 def _demo_advance():
-    """Advance to the next demo view: weather → plane → ship → weather…"""
+    """Advance to the next demo view: weather → plane → ship → weather…
+    Astronomy (sky map/zoom/list), the sunrise/sunset footer, the 3-day
+    forecast card, and the status board are NOT part of this step cycle —
+    they're driven by the same timers/state machines real mode uses, which
+    run unconditionally per-tick below; demo mode just seeds the data they
+    read (_sky_data / forecast_days / status_providers) once at startup."""
     global _demo_step, _demo_weather_idx, _demo_plane_idx, _demo_ship_idx
     global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed
     global tide_str, tide_type_val, _tide_level, _tide_predictions
     global planes, ships, showing_planes, _showing_ship
+    global _forecast_showing, _showing_status
     _demo_step = (_demo_step + 1) % 3
     if _demo_step == 0:                        # weather
         w = _DEMO_WEATHER[_demo_weather_idx % len(_DEMO_WEATHER)]
@@ -2949,10 +2995,19 @@ def _demo_advance():
         weather_str = w[0]; weather_cond = w[1]; weather_cond_main = w[2]
         _wind_speed = w[3]; wind_str = "{}mph {}".format(w[3], w[4])
         _tide_level = w[5]; tide_type_val = w[6]
-        tide_str = "4:30"; _tide_predictions = []
+        now = time.localtime()
+        now_secs = time.mktime(now)
+        tide_secs = now_secs + w[7] * 60
+        th = time.localtime(tide_secs)
+        h12 = th.tm_hour % 12 or 12
+        tide_str = "{}:{:02d}".format(h12, th.tm_min)
+        _tide_predictions = [(tide_secs, tide_type_val, th.tm_hour, "{:02d}".format(th.tm_min))]
         planes = []; ships = []
         showing_planes = False; _showing_ship = False
-        show_weather_tides()
+        # Don't cut off a forecast/status card that's mid-dwell — matches how
+        # the real weather-refresh path defers to those screens too.
+        if not (_forecast_showing or _showing_status):
+            show_weather_tides()
         print("Demo weather:", weather_str, weather_cond)
     elif _demo_step == 1:                      # plane
         p = _DEMO_PLANES[_demo_plane_idx % len(_DEMO_PLANES)]
@@ -2961,6 +3016,8 @@ def _demo_advance():
         planes = [[call, "", p[1], p[2], p[3], 0]]
         flight_cache[call] = {"origin": p[4], "dest": p[5], "type": p[6], "reg": p[7]}
         showing_planes = True; _showing_ship = False
+        _forecast_showing = False   # plane takes over the screen group
+        _showing_status = False     # plane preempts the status board too
         show_plane(planes[0])
         print("Demo plane:", call, p[4], ">", p[5])
     else:                                      # ship
@@ -2968,6 +3025,8 @@ def _demo_advance():
         _demo_ship_idx += 1
         ships = [s]; planes = []
         showing_planes = False; _showing_ship = True
+        _forecast_showing = False   # ship takes over the screen group
+        _showing_status = False     # ship preempts the status board too
         show_ship(s)
         print("Demo ship:", s["name"])
 
@@ -2996,6 +3055,16 @@ if SHIPS_TEST:
 if DEMO_MODE:
     print("DEMO MODE — cycling test fixtures, no network needed")
     display.brightness = 1.0
+    # Seed the data that the *unconditional* per-tick/rotation logic below
+    # reads, so astronomy, the sunrise/sunset footer, the forecast card, and
+    # the status board all run the same state machines real mode uses —
+    # nothing display-specific needed beyond having realistic data present.
+    if BASIN_MODE == "sky":
+        _sky_data = _DEMO_SKY
+        forecast_days = list(_DEMO_FORECAST_DAYS)
+    if ENABLE_STATUS:
+        status_providers = list(_DEMO_STATUS_PROVIDERS)
+        status_worst = max([p["level"] for p in status_providers]) if status_providers else 0
     _demo_advance()
     _demo_last_switch = time.monotonic()
 
@@ -3037,18 +3106,6 @@ while True:
         if BASIN_MODE == "sky" and now - last_forecast_fetch >= FORECAST_INTERVAL:
             fetch_forecast()
             last_forecast_fetch = now
-
-        # --- Forecast card show/hide. Sky list view raises _forecast_pending
-        # on exit; we honour it here unless a plane or ship is currently
-        # owning the screen. Dwell expires → return to weather/tides.
-        if _forecast_pending and not showing_planes and not _showing_ship and not _showing_status:
-            _forecast_pending = False
-            _forecast_showing = True
-            _forecast_started_at = now
-            show_forecast()
-        if _forecast_showing and now - _forecast_started_at >= FORECAST_DWELL_SECS:
-            _forecast_showing = False
-            show_weather_tides()
 
         # --- Proxy health check (drives the bottom-right red pixel) ---
         if PROXY_HOST and now - last_health_fetch >= HEALTH_INTERVAL:
@@ -3156,30 +3213,46 @@ while True:
                 show_weather_tides()
                 device_log("Ship gone, weather")
 
-        # --- Service status board rotation (128x64 only) ---
-        # The summary card enters the rotation every STATUS_SHOW_EVERY seconds of
-        # rest; when providers are degraded/down, each one's incident card is
-        # walked after the summary. Planes and ships preempt (handled above), so
-        # this only runs on the resting screen.
-        if (ENABLE_STATUS and status_providers and not showing_planes
-                and not _showing_ship and not _forecast_showing):
-            if not _showing_status and now - _status_last_shown >= STATUS_SHOW_EVERY:
-                _showing_status = True
-                _status_phase = 0
-                _status_incidents = [i for i, p in enumerate(status_providers)
-                                     if p.get("level", 0) >= 1]
+    # --- Forecast card show/hide. Sky list view raises _forecast_pending on
+    # exit (unconditionally, whether or not DEMO_MODE); we honour it here
+    # unless a plane or ship is currently owning the screen. Dwell expires ->
+    # return to weather/tides. Runs in both modes: real mode drives it via
+    # fetch_forecast() above, demo mode via the fixture seeded at startup.
+    if _forecast_pending and not showing_planes and not _showing_ship and not _showing_status:
+        _forecast_pending = False
+        _forecast_showing = True
+        _forecast_started_at = now
+        show_forecast()
+    if _forecast_showing and now - _forecast_started_at >= FORECAST_DWELL_SECS:
+        _forecast_showing = False
+        show_weather_tides()
+
+    # --- Service status board rotation (128x64 only) ---
+    # The summary card enters the rotation every STATUS_SHOW_EVERY seconds of
+    # rest; when providers are degraded/down, each one's incident card is
+    # walked after the summary. Planes and ships preempt (handled above), so
+    # this only runs on the resting screen. Runs in both modes: real mode
+    # populates status_providers via fetch_status() above, demo mode via the
+    # fixture seeded at startup.
+    if (ENABLE_STATUS and status_providers and not showing_planes
+            and not _showing_ship and not _forecast_showing):
+        if not _showing_status and now - _status_last_shown >= STATUS_SHOW_EVERY:
+            _showing_status = True
+            _status_phase = 0
+            _status_incidents = [i for i, p in enumerate(status_providers)
+                                 if p.get("level", 0) >= 1]
+            _status_started_at = now
+            show_status_summary()
+        elif _showing_status and now - _status_started_at >= STATUS_DWELL_SECS:
+            if _status_phase < len(_status_incidents):
+                _p = status_providers[_status_incidents[_status_phase]]
+                _status_phase += 1
                 _status_started_at = now
-                show_status_summary()
-            elif _showing_status and now - _status_started_at >= STATUS_DWELL_SECS:
-                if _status_phase < len(_status_incidents):
-                    _p = status_providers[_status_incidents[_status_phase]]
-                    _status_phase += 1
-                    _status_started_at = now
-                    show_status_incident(_p)
-                else:
-                    _showing_status = False
-                    _status_last_shown = now
-                    show_weather_tides()
+                show_status_incident(_p)
+            else:
+                _showing_status = False
+                _status_last_shown = now
+                show_weather_tides()
 
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame

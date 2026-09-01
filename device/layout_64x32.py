@@ -84,14 +84,16 @@ DEVICE_SECRET = secrets.get("device_secret", "")
 
 # ---------------------------------------------------------------------------
 # Demo fixtures — varied conditions to exercise all display paths
-# (temp_str, cond_str, cond_main, wind_spd, wind_dir, tide_level, tide_type)
+# (temp_str, cond_str, cond_main, wind_spd, wind_dir, tide_level, tide_type,
+#  tide_offset_min — minutes from "now" to that tide; near 0 exercises the
+#  HIGH/LOW slack indicator, larger values exercise the plain countdown)
 _DEMO_WEATHER = (
-    ("72\xb0F",  "Clear Sky",  "Clear",        5, "SW", 0.8, "H"),
-    ("-5\xb0F",  "Heavy Snow", "Snow",         18, "NW", 0.5, "L"),
-    ("95\xb0F",  "Thndrstm",   "Thunderstorm", 28, "S",  0.2, "L"),
-    ("55\xb0F",  "Heavy Rain", "Rain",         22, "NE", 0.6, "H"),
-    ("68\xb0F",  "Fog",        "Fog",           3, "W",  0.4, "L"),
-    ("82\xb0F",  "Sctd Cloud", "Clouds",       12, "E",  0.9, "H"),
+    ("72\xb0F",  "Clear Sky",  "Clear",        5, "SW", 0.8, "H",    0),
+    ("-5\xb0F",  "Heavy Snow", "Snow",         18, "NW", 0.5, "L",  180),
+    ("95\xb0F",  "Thndrstm",   "Thunderstorm", 28, "S",  0.2, "L",    0),
+    ("55\xb0F",  "Heavy Rain", "Rain",         22, "NE", 0.6, "H",   45),
+    ("68\xb0F",  "Fog",        "Fog",           3, "W",  0.4, "L",  -20),
+    ("82\xb0F",  "Sctd Cloud", "Clouds",       12, "E",  0.9, "H",  200),
 )
 # (callsign, alt_ft, spd_kt, hdg, origin, dest, actype, reg)
 _DEMO_PLANES = (
@@ -1571,7 +1573,13 @@ def _demo_advance():
         weather_str = w[0]; weather_cond = w[1]; weather_cond_main = w[2]
         _wind_speed = w[3]; wind_str = "{}mph {}".format(w[3], w[4])
         _tide_level = w[5]; tide_type_val = w[6]
-        tide_str = "4:30"; _tide_predictions = []
+        now = time.localtime()
+        now_secs = time.mktime(now)
+        tide_secs = now_secs + w[7] * 60
+        th = time.localtime(tide_secs)
+        h12 = th.tm_hour % 12 or 12
+        tide_str = "{}:{:02d}".format(h12, th.tm_min)
+        _tide_predictions = [(tide_secs, tide_type_val, th.tm_hour, "{:02d}".format(th.tm_min))]
         planes = []; ships = []
         showing_planes = False; _showing_ship = False
         show_weather_tides()
