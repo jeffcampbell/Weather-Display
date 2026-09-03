@@ -73,6 +73,7 @@ _DEFAULT_STATUS_PROVIDERS = [
     {"name": "Cloudflare", "type": "statuspage", "host": "www.cloudflarestatus.com"},
     {"name": "Supabase",   "type": "statuspage", "host": "status.supabase.com"},
     {"name": "HashiCorp",  "type": "statuspage", "host": "status.hashicorp.com"},
+    {"name": "Anthropic",  "type": "statuspage", "host": "status.claude.com"},
     {"name": "AWS",        "type": "aws"},
     {"name": "GCP",        "type": "gcp"},
     {"name": "Azure",      "type": "azure"},
