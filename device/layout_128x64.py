@@ -1541,12 +1541,21 @@ def update_ship_ocean(tick):
                 pl_bg_bmp[x, y] = pal_idx
 
 
-# Route cache: callsign -> {"origin": "BOS", "dest": "JFK", "type":..., "reg":...}
+# Route cache: "callsign|icao24" -> {"origin": "BOS", "dest": "JFK", "type":...,
+# "reg":..., "_fetched": <time.monotonic()>}. Keyed by callsign+icao24 (not
+# callsign alone) so a callsign reused later by a *different* aircraft isn't
+# served the previous aircraft's route, and entries expire after
+# _FLIGHT_CACHE_TTL so a stale scheduled-route answer gets re-checked too.
 # Sized for a full day of traffic in the bbox — too small and fetch_route
 # starts evicting the currently-displayed plane mid-iteration of
 # get_displayable_planes(), leaving show_plane() with an empty lookup.
 flight_cache = {}
 _FLIGHT_CACHE_MAX = 50
+_FLIGHT_CACHE_TTL = 3600  # seconds — matches the proxy's route-cache hit TTL
+
+
+def _flight_cache_key(callsign, icao24):
+    return "{}|{}".format(callsign, icao24 or "")
 
 
 _consecutive_fetch_errs = 0
@@ -1629,11 +1638,14 @@ def flush_device_log():
 
 
 def fetch_route(callsign, icao24=""):
-    """Fetch route + aircraft type via proxy. Caches results."""
-    if callsign in flight_cache:
-        return flight_cache[callsign]
+    """Fetch route + aircraft type via proxy. Caches results, keyed by
+    callsign+icao24 with a TTL — see the flight_cache comment above."""
+    key = _flight_cache_key(callsign, icao24)
+    cached = flight_cache.get(key)
+    if cached and (time.monotonic() - cached.get("_fetched", 0)) < _FLIGHT_CACHE_TTL:
+        return cached
     gc.collect()
-    info = {"origin": "???", "dest": "???", "type": "", "reg": ""}
+    info = {"origin": "???", "dest": "???", "type": "", "reg": "", "_fetched": time.monotonic()}
     try:
         url = "{}/api/route?callsign={}".format(PROXY_HOST, callsign)
         if icao24:
@@ -1656,7 +1668,7 @@ def fetch_route(callsign, icao24=""):
     # Evict oldest if cache full
     if len(flight_cache) >= _FLIGHT_CACHE_MAX:
         flight_cache.pop(next(iter(flight_cache)))
-    flight_cache[callsign] = info
+    flight_cache[key] = info
     gc.collect()
     return info
 
@@ -2893,9 +2905,9 @@ def show_weather_tides():
         gc.collect()
 
 
-def has_route(callsign):
-    """Check if a plane has route data in the cache."""
-    route = flight_cache.get(callsign, {})
+def has_route(callsign, icao24=""):
+    """Check if a plane has (fresh) route data in the cache."""
+    route = flight_cache.get(_flight_cache_key(callsign, icao24), {})
     return route.get("origin", "???") != "???" and route.get("dest", "???") != "???"
 
 
@@ -2904,10 +2916,9 @@ def get_displayable_planes():
     Plane format from proxy: [call, icao24, alt, spd, hdg, vrate]"""
     result = []
     for p in planes:
-        call = p[0]
-        if call not in flight_cache:
-            fetch_route(call, p[1])
-        if has_route(call):
+        call, icao24 = p[0], p[1]
+        fetch_route(call, icao24)  # no-op if already cached and fresh
+        if has_route(call, icao24):
             result.append(p)
     return result
 
@@ -2948,10 +2959,10 @@ def show_plane(plane):
         # fetch_route call during get_displayable_planes' iteration) or
         # empty for any other reason, repopulate it synchronously so the
         # display never shows a callsign with blank origin/dest/type/reg.
-        route = flight_cache.get(callsign, {})
+        route = flight_cache.get(_flight_cache_key(callsign, plane[1]), {})
         if not route.get("origin") or route.get("origin") == "???":
             fetch_route(callsign, plane[1])
-            route = flight_cache.get(callsign, {})
+            route = flight_cache.get(_flight_cache_key(callsign, plane[1]), {})
         route_label.text = "{}>{}".format(route.get("origin", ""), route.get("dest", ""))
         # Amber route = scheduled/free-tier data, white = FlightAware live leg.
         route_label.color = _dim(
@@ -3014,7 +3025,9 @@ def _demo_advance():
         _demo_plane_idx += 1
         call = p[0]
         planes = [[call, "", p[1], p[2], p[3], 0]]
-        flight_cache[call] = {"origin": p[4], "dest": p[5], "type": p[6], "reg": p[7]}
+        flight_cache[_flight_cache_key(call, "")] = {
+            "origin": p[4], "dest": p[5], "type": p[6], "reg": p[7],
+            "_fetched": time.monotonic()}
         showing_planes = True; _showing_ship = False
         _forecast_showing = False   # plane takes over the screen group
         _showing_status = False     # plane preempts the status board too
