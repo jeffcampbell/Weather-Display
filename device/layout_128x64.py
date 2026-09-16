@@ -52,6 +52,10 @@ PLANE_QUIET_END_HR = 5        # local hour to resume fetching planes
 STATUS_INTERVAL = 180         # poll proxy /api/status every 3 min (proxy caches 180s)
 STATUS_SHOW_EVERY = 45        # rest-screen seconds before the status board shows again
 STATUS_DWELL_SECS = 10        # how long the summary + each incident card stays up
+CALENDAR_INTERVAL = 600       # poll proxy /api/calendar every 10 min (proxy caches 600s)
+CAL_SHOW_EVERY = 90           # rest-screen seconds before the agenda shows again
+CAL_DWELL_SECS = 12           # how long each day's agenda card stays up
+CAL_ROWS = 5                  # event rows per agenda card; overflow becomes "+N more"
 # ---------------------------------------------------------------------------
 # Feature + display configuration (per-device, from secrets.py)
 #
@@ -65,6 +69,7 @@ STATUS_DWELL_SECS = 10        # how long the summary + each incident card stays 
 #   enable_planes     overhead aircraft screen
 #   enable_boats      nearby AIS vessel screen              (coastal displays)
 #   enable_status     cloud/dev provider outage board       (128x64 only)
+#   enable_calendar   today/tomorrow calendar agenda        (128x64 only)
 #
 # Tide and astronomy share the left basin / sky card, so on a single panel
 # they are alternatives — if both are enabled, astronomy takes the basin.
@@ -80,6 +85,7 @@ ENABLE_TIDE      = _flag("enable_tide", _LEGACY_BASIN != "sky")
 ENABLE_PLANES    = _flag("enable_planes", True)
 ENABLE_BOATS     = _flag("enable_boats", _LEGACY_BASIN != "sky")
 ENABLE_STATUS    = _flag("enable_status", False)   # 128x64-only outage board
+ENABLE_CALENDAR  = _flag("enable_calendar", False) # 128x64-only agenda board
 
 # --- Display panel size ---
 # "128x64" (default, verified) renders the 64x32 layout at scale=2 plus
@@ -206,6 +212,24 @@ _DEMO_STATUS_PROVIDERS = (
     {"name": "OpenAI",     "level": 0, "component": "", "title": "", "updated": 0},
 )
 
+# Shaped exactly like /api/calendar's `days` array (see proxy/API.md), including
+# a day that overflows CAL_ROWS so the "+N more" path gets exercised.
+_DEMO_CALENDAR_DAYS = (
+    {"label": "TODAY", "date": "WED SEP 16", "more": 0, "events": [
+        {"time": "ALL DAY", "name": "Jeff PTO", "all_day": True},
+        {"time": "8:30a", "name": "Daily standup", "all_day": False},
+        {"time": "11:00a", "name": "Dentist", "all_day": False},
+        {"time": "1:00p", "name": "Lunch with Sam", "all_day": False},
+        {"time": "3:30p", "name": "Design review", "all_day": False},
+        {"time": "6:00p", "name": "Soccer practice", "all_day": False},
+    ]},
+    {"label": "TOMORROW", "date": "THU SEP 17", "more": 0, "events": [
+        {"time": "9:00a", "name": "Daily standup", "all_day": False},
+        {"time": "12:00p", "name": "Third Wednesday sync", "all_day": False},
+        {"time": "7:30p", "name": "Anniversary dinner", "all_day": False},
+    ]},
+)
+
 # ---------------------------------------------------------------------------
 # Buttons — UP and DOWN on the Matrix Portal M4
 # ---------------------------------------------------------------------------
@@ -219,10 +243,13 @@ btn_down.switch_to_input(pull=digitalio.Pull.UP)
 # file can reach it; show_weather_tides is defined before that block runs.
 def force_weather_screen():
     global planes, showing_planes, _forecast_showing, _forecast_pending
+    global _showing_status, _showing_calendar
     planes = []
     showing_planes = False
     _forecast_showing = False
     _forecast_pending = False
+    _showing_status = False
+    _showing_calendar = False
     show_weather_tides()
 
 # ---------------------------------------------------------------------------
@@ -2020,6 +2047,94 @@ def show_status_incident(p):
         gc.collect()
 
 
+# ---------------------------------------------------------------------------
+# Calendar agenda (128x64 only) — one card per day: today, then tomorrow
+# ---------------------------------------------------------------------------
+# The proxy's /api/calendar merges every configured .ics feed and hands back
+# two ready-to-render day lists (name + preformatted time), so nothing here
+# parses dates or knows which calendar an event came from. Built only when
+# ENABLE_CALENDAR is set, to avoid the label memory cost on displays that
+# don't use it.
+_CAL_ROW_Y = (20, 29, 38, 47, 56)   # baseline of each event row
+_CAL_TIME_X = 2                     # time column: fits "ALL DAY" at 4px/char
+_CAL_NAME_X = 32                    # name column: 96px left = 24 chars
+
+calendar_group = None
+_cal_day_label = None
+_cal_date_label = None
+_cal_times = []
+_cal_names = []
+
+if ENABLE_CALENDAR:
+    calendar_group = displayio.Group()
+    # Header rule — separates the day heading from the event list.
+    _cal_rule_bmp = displayio.Bitmap(128, 1, 2)
+    _cal_rule_pal = displayio.Palette(2)
+    _cal_rule_pal[0] = 0x000000
+    _cal_rule_pal[1] = _dim(0x444444)
+    for _cx in range(128):
+        _cal_rule_bmp[_cx, 0] = 1
+    calendar_group.append(displayio.TileGrid(
+        _cal_rule_bmp, pixel_shader=_cal_rule_pal, x=0, y=13))
+    _cal_day_label = Label(FONT_MID, text="", color=_dim(0xFFFFFF), x=3, y=6)
+    calendar_group.append(_cal_day_label)
+    _cal_date_label = Label(FONT_SMALL, text="", color=_dim(0x888888))
+    _cal_date_label.anchor_point = (1.0, 0.5)
+    _cal_date_label.anchored_position = (125, 6)
+    calendar_group.append(_cal_date_label)
+    for _ci in range(CAL_ROWS):
+        _ct = Label(FONT_SMALL, text="", color=_dim(0x00CCDD),
+                    x=_CAL_TIME_X, y=_CAL_ROW_Y[_ci])
+        calendar_group.append(_ct)
+        _cn = Label(FONT_SMALL, text="", color=_dim(0xFFFFFF),
+                    x=_CAL_NAME_X, y=_CAL_ROW_Y[_ci])
+        calendar_group.append(_cn)
+        _cal_times.append(_ct)
+        _cal_names.append(_cn)
+
+
+def show_calendar_day(day):
+    """Render one day's agenda card. Events past what CAL_ROWS can hold (plus
+    any the proxy already capped, reported as `more`) collapse into a final
+    "+N more" row, so the card never silently hides part of the day."""
+    try:
+        switch_screen("calendar")
+        events = day.get("events") or []
+        _cal_day_label.text = str(day.get("label", ""))[:10]
+        _cal_date_label.text = str(day.get("date", ""))[:16]
+        total = len(events) + day.get("more", 0)
+        if total > CAL_ROWS:
+            shown = events[:CAL_ROWS - 1]
+            extra = total - len(shown)
+        else:
+            shown = events
+            extra = 0
+        for i in range(CAL_ROWS):
+            if i < len(shown):
+                ev = shown[i]
+                _cal_times[i].text = str(ev.get("time", ""))[:7]
+                # All-day events have no clock time to anchor on, so they get
+                # their own color rather than reading as a missing value.
+                _cal_times[i].color = _dim(
+                    0xFFAA00 if ev.get("all_day") else 0x00CCDD)
+                _cal_names[i].text = str(ev.get("name", ""))[:24]
+                _cal_names[i].color = _dim(0xFFFFFF)
+            elif i == len(shown) and extra:
+                _cal_times[i].text = ""
+                _cal_names[i].text = "+{} more".format(extra)
+                _cal_names[i].color = _dim(0x888888)
+            elif i == 0:
+                _cal_times[i].text = ""
+                _cal_names[i].text = "nothing scheduled"
+                _cal_names[i].color = _dim(0x888888)
+            else:
+                _cal_times[i].text = ""
+                _cal_names[i].text = ""
+    except MemoryError as _e:
+        print("show_calendar_day MemoryError:", _e)
+        gc.collect()
+
+
 def _fp(x, y, c):
     """Bounds-checked single pixel write into forecast_bmp."""
     if 0 <= x < FORECAST_W and 0 <= y < FORECAST_H:
@@ -2319,6 +2434,17 @@ _status_started_at = 0         # monotonic when the current status card appeared
 _status_last_shown = 0         # monotonic when the last status rotation ended
 _status_phase = 0              # 0 = summary; 1..N = incident cards
 _status_incidents = []         # provider indices with level >= 1 for this rotation
+# Calendar agenda state. calendar_days is the two-entry list (today, tomorrow)
+# fetch_calendar() pulls from /api/calendar; the rotation shows one card per
+# day every CAL_SHOW_EVERY seconds of rest.
+calendar_days = []
+last_calendar_fetch = -CALENDAR_INTERVAL
+_last_calendar_summary = ""
+_showing_calendar = False      # True while an agenda card owns the screen
+_cal_started_at = 0            # monotonic when the current agenda card appeared
+_cal_last_shown = 0            # monotonic when the last agenda rotation ended
+_cal_phase = 0                 # index into _cal_pages
+_cal_pages = []                # the day cards this rotation will show
 last_plane_cycle = 0
 current_screen = "loading"
 
@@ -2361,6 +2487,8 @@ def switch_screen(name):
         display.root_group = status_group
     elif name == "status_incident":
         display.root_group = status_incident_group
+    elif name == "calendar":
+        display.root_group = calendar_group
     elif name == "loading":
         display.root_group = loading_group
 
@@ -2602,6 +2730,26 @@ def fetch_status():
             _last_status_summary = summary
     except Exception as e:
         device_log("Status err:{}".format(e))
+
+
+def fetch_calendar():
+    """Poll /api/calendar and cache the two day lists the agenda renders. Like
+    fetch_status(), a failure leaves the last-known days in place (and logs)
+    rather than counting toward the fetch-error reboot threshold — and the
+    proxy answers an all-feeds outage with an error rather than empty days, so
+    a transient calendar hiccup never blanks the card."""
+    global calendar_days, _last_calendar_summary
+    try:
+        data = fetch_json("{}/api/calendar".format(PROXY_HOST))
+        days = data.get("days") or []
+        if days:
+            calendar_days = days
+        summary = "/".join(str(len(d.get("events") or [])) for d in days)
+        if summary != _last_calendar_summary:
+            device_log("Cal:{}".format(summary or "none"))
+            _last_calendar_summary = summary
+    except Exception as e:
+        device_log("Cal err:{}".format(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2998,7 +3146,7 @@ def _demo_advance():
     global weather_str, weather_cond, weather_cond_main, wind_str, _wind_speed
     global tide_str, tide_type_val, _tide_level, _tide_predictions
     global planes, ships, showing_planes, _showing_ship
-    global _forecast_showing, _showing_status
+    global _forecast_showing, _showing_status, _showing_calendar
     _demo_step = (_demo_step + 1) % 3
     if _demo_step == 0:                        # weather
         w = _DEMO_WEATHER[_demo_weather_idx % len(_DEMO_WEATHER)]
@@ -3015,9 +3163,9 @@ def _demo_advance():
         _tide_predictions = [(tide_secs, tide_type_val, th.tm_hour, "{:02d}".format(th.tm_min))]
         planes = []; ships = []
         showing_planes = False; _showing_ship = False
-        # Don't cut off a forecast/status card that's mid-dwell — matches how
-        # the real weather-refresh path defers to those screens too.
-        if not (_forecast_showing or _showing_status):
+        # Don't cut off a forecast/status/agenda card that's mid-dwell —
+        # matches how the real weather-refresh path defers to those screens.
+        if not (_forecast_showing or _showing_status or _showing_calendar):
             show_weather_tides()
         print("Demo weather:", weather_str, weather_cond)
     elif _demo_step == 1:                      # plane
@@ -3031,6 +3179,7 @@ def _demo_advance():
         showing_planes = True; _showing_ship = False
         _forecast_showing = False   # plane takes over the screen group
         _showing_status = False     # plane preempts the status board too
+        _showing_calendar = False   # ...and the agenda card
         show_plane(planes[0])
         print("Demo plane:", call, p[4], ">", p[5])
     else:                                      # ship
@@ -3040,6 +3189,7 @@ def _demo_advance():
         showing_planes = False; _showing_ship = True
         _forecast_showing = False   # ship takes over the screen group
         _showing_status = False     # ship preempts the status board too
+        _showing_calendar = False   # ...and the agenda card
         show_ship(s)
         print("Demo ship:", s["name"])
 
@@ -3078,6 +3228,8 @@ if DEMO_MODE:
     if ENABLE_STATUS:
         status_providers = list(_DEMO_STATUS_PROVIDERS)
         status_worst = max([p["level"] for p in status_providers]) if status_providers else 0
+    if ENABLE_CALENDAR:
+        calendar_days = list(_DEMO_CALENDAR_DAYS)
     _demo_advance()
     _demo_last_switch = time.monotonic()
 
@@ -3110,7 +3262,8 @@ while True:
                 fetch_tides()
             flush_device_log()
             last_weather_fetch = now
-            if not showing_planes and not _forecast_showing and not _showing_status:
+            if (not showing_planes and not _forecast_showing
+                    and not _showing_status and not _showing_calendar):
                 show_weather_tides()
 
         # --- 3-day forecast refresh (sky mode only — the only rotation slot
@@ -3129,6 +3282,11 @@ while True:
         if ENABLE_STATUS and PROXY_HOST and now - last_status_fetch >= STATUS_INTERVAL:
             fetch_status()
             last_status_fetch = now
+
+        # --- Calendar agenda refresh (128x64 only) ---
+        if ENABLE_CALENDAR and PROXY_HOST and now - last_calendar_fetch >= CALENDAR_INTERVAL:
+            fetch_calendar()
+            last_calendar_fetch = now
 
         # --- OpenSky check ---
         # Skip plane fetches during quiet hours to save FlightAware API calls.
@@ -3161,6 +3319,7 @@ while True:
             _showing_ship = False
             _forecast_showing = False    # plane takes over the screen group
             _showing_status = False      # plane preempts the status board too
+            _showing_calendar = False    # ...and the agenda card
             plane_idx = 0
             last_plane_cycle = now
             plane_screen_started_at = now
@@ -3209,6 +3368,7 @@ while True:
                         _showing_ship = True
                         _forecast_showing = False    # ship takes over the screen group
                         _showing_status = False      # ship preempts the status board too
+                        _showing_calendar = False    # ...and the agenda card
                         ship_idx = expected_idx
                         device_log("Ship:{} {}mi".format(ships[ship_idx].get("name","?")[:12], ships[ship_idx].get("distance_mi","?")))
                         show_ship(ships[ship_idx])
@@ -3231,7 +3391,8 @@ while True:
     # unless a plane or ship is currently owning the screen. Dwell expires ->
     # return to weather/tides. Runs in both modes: real mode drives it via
     # fetch_forecast() above, demo mode via the fixture seeded at startup.
-    if _forecast_pending and not showing_planes and not _showing_ship and not _showing_status:
+    if (_forecast_pending and not showing_planes and not _showing_ship
+            and not _showing_status and not _showing_calendar):
         _forecast_pending = False
         _forecast_showing = True
         _forecast_started_at = now
@@ -3248,7 +3409,8 @@ while True:
     # populates status_providers via fetch_status() above, demo mode via the
     # fixture seeded at startup.
     if (ENABLE_STATUS and status_providers and not showing_planes
-            and not _showing_ship and not _forecast_showing):
+            and not _showing_ship and not _forecast_showing
+            and not _showing_calendar):
         if not _showing_status and now - _status_last_shown >= STATUS_SHOW_EVERY:
             _showing_status = True
             _status_phase = 0
@@ -3267,13 +3429,43 @@ while True:
                 _status_last_shown = now
                 show_weather_tides()
 
+    # --- Calendar agenda rotation (128x64 only) ---
+    # Same shape as the status rotation above: after CAL_SHOW_EVERY seconds of
+    # rest the today card appears, then tomorrow's, then the screen goes back
+    # to weather. Planes and ships preempt (handled above), and the status
+    # board and agenda exclude each other so whichever starts first finishes
+    # its rotation before the other begins.
+    if (ENABLE_CALENDAR and calendar_days and not showing_planes
+            and not _showing_ship and not _forecast_showing
+            and not _showing_status):
+        if not _showing_calendar and now - _cal_last_shown >= CAL_SHOW_EVERY:
+            # Today's card always shows — "nothing scheduled" is an answer.
+            # Tomorrow's only earns a slot when it has something on it, so a
+            # quiet stretch costs one card instead of two identical blanks.
+            _cal_pages = [calendar_days[0]] + [
+                d for d in calendar_days[1:] if d.get("events")]
+            _showing_calendar = True
+            _cal_phase = 0
+            _cal_started_at = now
+            show_calendar_day(_cal_pages[0])
+        elif _showing_calendar and now - _cal_started_at >= CAL_DWELL_SECS:
+            _cal_phase += 1
+            if _cal_phase < len(_cal_pages):
+                _cal_started_at = now
+                show_calendar_day(_cal_pages[_cal_phase])
+            else:
+                _showing_calendar = False
+                _cal_last_shown = now
+                show_weather_tides()
+
     # Per-tick updates: clock + basin wave animation + tide direction pixel.
     # Wrapped in try/except so a transient MemoryError just skips this frame
     # instead of propagating to the top-level loop and crashing the device.
     # gc.collect() first to maximize the largest contiguous free block.
     # NOTE: do NOT call fetch_failed() here — render MemoryErrors are normal
     # and must not count toward the auto-reboot threshold.
-    if not showing_planes and not _showing_ship and not _forecast_showing and not _showing_status:
+    if (not showing_planes and not _showing_ship and not _forecast_showing
+            and not _showing_status and not _showing_calendar):
         try:
             gc.collect()
             t = time.localtime()

@@ -34,6 +34,12 @@
   "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
   "device_secret": "",
 
+  "_calendar_ics_urls_comment": "Private .ics feeds for /api/calendar (the today/tomorrow agenda view). In Google Calendar: Settings -> <calendar> -> Integrate calendar -> 'Secret address in iCal format'. Add as many as you like; the endpoint pools their events and never reports which calendar an event came from. TREAT EACH URL AS A PASSWORD - anyone holding one can read that whole calendar. Leave the list empty to disable the endpoint.",
+  "calendar_ics_urls": [],
+
+  "_timezone_comment": "IANA timezone name that /api/calendar measures 'today' and 'tomorrow' in. Omit to use the host's own timezone (/etc/timezone), which is normally what you want.",
+  "timezone": "",
+
   "_status_providers_comment": "Providers monitored by /api/status (the 128x64 outage board). type 'statuspage' is fully config-driven — add any Atlassian Statuspage site with just name+host, no code. type 'aws'/'gcp'/'azure' use built-in adapters (host ignored). Omit this key to use the built-in default set below.",
   "status_providers": [
     { "name": "GitHub",     "type": "statuspage", "host": "www.githubstatus.com" },

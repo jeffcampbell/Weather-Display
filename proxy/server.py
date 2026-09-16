@@ -15,6 +15,7 @@ Usage:
 """
 
 import calendar
+import datetime
 import json
 import math
 import os
@@ -2091,6 +2092,547 @@ def handle_status(params):
     return 200, body
 
 
+# ---------------------------------------------------------------------------
+# Calendar  (/api/calendar)
+# ---------------------------------------------------------------------------
+# Reduces one or more private .ics feeds (Google Calendar's "Secret address in
+# iCal format") to the only thing the display needs: what is happening today
+# and tomorrow, as a name plus a start time. Everything awkward about
+# iCalendar — folded lines, TZID resolution, RRULE expansion, EXDATE holes,
+# RECURRENCE-ID overrides — is handled here so the memory-constrained device
+# just renders two short lists. Events from every configured calendar are
+# pooled; which feed one came from is deliberately not reported.
+#
+# The feed URLs are secrets (anyone holding one can read the whole calendar),
+# so they live in config.json and are never echoed back or logged.
+
+CALENDAR_CACHE_SEC = 600      # device polls at this cadence; feeds change slowly
+_CAL_NAME_MAX = 24            # chars — exactly what the device's 4x6 row fits
+_CAL_MAX_PER_DAY = 12         # events per day sent to the device
+_CAL_ITER_CAP = 2000          # hard bound on RRULE expansion steps per event
+_CAL_NO_TITLE = "(no title)"
+_CAL_DOW = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+_CAL_MON = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+# Accepts either bare URL strings or {"url": ...} objects, so a calendar can be
+# given a config-side label without the endpoint caring.
+CALENDAR_FEEDS = []
+for _entry in (_config.get("calendar_ics_urls") or []):
+    _url = str((_entry.get("url", "") if isinstance(_entry, dict) else _entry) or "").strip()
+    if _url.startswith("webcal://"):
+        _url = "https://" + _url[len("webcal://"):]
+    if _url:
+        CALENDAR_FEEDS.append(_url)
+
+
+# --- Timezones -------------------------------------------------------------
+
+_cal_zone_cache = {}
+
+
+def _cal_zone(tzid):
+    """ZoneInfo for an IANA TZID, or None when it can't be resolved (unknown
+    name, or no tzdata installed). Cached — ZoneInfo construction hits disk."""
+    if not tzid:
+        return None
+    if tzid in _cal_zone_cache:
+        return _cal_zone_cache[tzid]
+    zone = None
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tzid)
+    except Exception as e:
+        _log_proxy_event("calendar: unresolved TZID {} ({})".format(tzid, e))
+    _cal_zone_cache[tzid] = zone
+    return zone
+
+
+def _cal_local_zone():
+    """The timezone "today" and "tomorrow" are measured in. Prefers the
+    `timezone` config key, then the host's /etc/timezone, and finally the fixed
+    UTC offset the C library reports for right now — which is correct across
+    the two days this endpoint spans."""
+    zone = _cal_zone(str(_config.get("timezone", "")).strip())
+    if zone:
+        return zone
+    try:
+        with open("/etc/timezone") as f:
+            zone = _cal_zone(f.read().strip())
+    except OSError:
+        zone = None
+    return zone or datetime.datetime.now().astimezone().tzinfo
+
+
+# --- iCalendar parsing -----------------------------------------------------
+
+def _ics_unfold(text):
+    """Logical iCalendar lines. Long content lines are folded at 75 octets with
+    a leading space or tab on each continuation (RFC 5545 3.1), so they have to
+    be rejoined before anything else can be parsed."""
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def _ics_unescape(value):
+    r"""Undo TEXT escaping (RFC 5545 3.3.11): \n and \N are newlines, and a
+    backslash before any other character (comma, semicolon, backslash) escapes
+    it. Scanned left to right so an escaped backslash can't swallow the
+    character after it."""
+    out = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            out.append("\n" if nxt in ("n", "N") else nxt)
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _ics_parse_line(line):
+    """'DTSTART;TZID=America/New_York:20260916T090000' ->
+    ('DTSTART', {'TZID': 'America/New_York'}, '20260916T090000'). The value is
+    separated by the first colon that isn't inside a quoted parameter."""
+    quoted = False
+    head = value = None
+    for i, ch in enumerate(line):
+        if ch == '"':
+            quoted = not quoted
+        elif ch == ":" and not quoted:
+            head, value = line[:i], line[i + 1:]
+            break
+    if head is None:
+        return "", {}, ""
+    parts = head.split(";")
+    params = {}
+    for part in parts[1:]:
+        key, sep, val = part.partition("=")
+        if sep:
+            params[key.strip().upper()] = val.strip().strip('"')
+    return parts[0].strip().upper(), params, value
+
+
+def _ics_events(text):
+    """Yield one dict per VEVENT: {PROP: [(params, value), ...]}. Properties of
+    nested components are skipped — a VALARM carries its own SUMMARY /
+    DESCRIPTION that would otherwise overwrite the event's."""
+    event = None
+    depth = 0
+    for line in _ics_unfold(text):
+        name, _params, value = _ics_parse_line(line)
+        if not name:
+            continue
+        kind = value.strip().upper()
+        if name == "BEGIN":
+            if event is None:
+                if kind == "VEVENT":
+                    event = {}
+            else:
+                depth += 1
+        elif name == "END":
+            if event is None:
+                continue
+            if depth:
+                depth -= 1
+            elif kind == "VEVENT":
+                yield event
+                event = None
+        elif event is not None and not depth:
+            event.setdefault(name, []).append((_params, value))
+
+
+def _cal_prop(event, name):
+    """First raw value of a property, or "" when absent."""
+    entries = event.get(name)
+    return entries[0][1].strip() if entries else ""
+
+
+def _ics_datetime(params, value, local_zone):
+    """Parse a DTSTART / DTEND / RECURRENCE-ID / EXDATE value into
+    (naive local datetime, is_all_day). Date-only values mark an all-day event
+    and come back as local midnight. UTC ("...Z") and TZID values are converted
+    into local_zone; a floating value is already local. (None, False) when the
+    value is missing or malformed."""
+    v = (value or "").strip()
+    if not v:
+        return None, False
+    if params.get("VALUE", "").upper() == "DATE" or len(v) == 8:
+        try:
+            return datetime.datetime.strptime(v[:8], "%Y%m%d"), True
+        except ValueError:
+            return None, False
+    try:
+        naive = datetime.datetime.strptime(v[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None, False
+    source = datetime.timezone.utc if v.endswith("Z") else \
+        (_cal_zone(params.get("TZID", "")) or local_zone)
+    return naive.replace(tzinfo=source).astimezone(local_zone).replace(tzinfo=None), False
+
+
+def _cal_duration(value):
+    """iCalendar DURATION ('PT1H30M', 'P2D') -> timedelta; 0 if unparseable.
+    'M' is minutes — months aren't legal in an iCalendar duration."""
+    v = (value or "").strip().upper().lstrip("+")
+    sign = -1 if v.startswith("-") else 1
+    v = v.lstrip("-")
+    if not v.startswith("P"):
+        return datetime.timedelta(0)
+    units = {"W": 604800, "D": 86400, "H": 3600, "M": 60, "S": 1}
+    secs = 0
+    digits = ""
+    for ch in v[1:]:
+        if ch.isdigit():
+            digits += ch
+        else:
+            if digits and ch in units:
+                secs += int(digits) * units[ch]
+            digits = ""      # 'T' separator, or anything unexpected
+    return datetime.timedelta(seconds=sign * secs)
+
+
+# --- RRULE expansion -------------------------------------------------------
+
+_ICS_WEEKDAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+
+
+def _rrule_parse(value):
+    """'FREQ=WEEKLY;BYDAY=MO,WE' -> {'FREQ': 'WEEKLY', 'BYDAY': 'MO,WE'}."""
+    rule = {}
+    for part in (value or "").split(";"):
+        key, sep, val = part.partition("=")
+        if key.strip() and sep:
+            rule[key.strip().upper()] = val.strip()
+    return rule
+
+
+def _rrule_int(rule, key, default=None):
+    try:
+        return int(rule[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def _rrule_ints(rule, key):
+    out = []
+    for piece in rule.get(key, "").split(","):
+        piece = piece.strip()
+        if piece:
+            try:
+                out.append(int(piece))
+            except ValueError:
+                pass
+    return out
+
+
+def _rrule_weekdays(rule):
+    """BYDAY tokens ('MO', '2TU', '-1FR') as given, minus anything malformed."""
+    return [t.strip().upper() for t in rule.get("BYDAY", "").split(",")
+            if t.strip()[-2:].upper() in _ICS_WEEKDAYS]
+
+
+def _cal_month_days(year, month, byday, monthdays, default_day):
+    """Concrete dates in one month selected by a MONTHLY/YEARLY rule's BYDAY
+    ('2TU', '-1FR', bare 'MO') and BYMONTHDAY (negative counts from the end),
+    defaulting to DTSTART's day-of-month. Days the month doesn't have (Feb 30,
+    a 5th Friday in a month with four) are skipped, per RFC 5545."""
+    last = calendar.monthrange(year, month)[1]
+    first_weekday = datetime.date(year, month, 1).weekday()
+    days = set()
+    for token in byday:
+        weekday = _ICS_WEEKDAYS.index(token[-2:])
+        matches = list(range(1 + (weekday - first_weekday) % 7, last + 1, 7))
+        ordinal = token[:-2]
+        if not ordinal:
+            days.update(matches)
+            continue
+        try:
+            nth = int(ordinal)
+        except ValueError:
+            continue
+        if 0 < nth <= len(matches):
+            days.add(matches[nth - 1])
+        elif 0 > nth >= -len(matches):
+            days.add(matches[nth])
+    for day in monthdays:
+        if day < 0:
+            day = last + 1 + day
+        if 1 <= day <= last:
+            days.add(day)
+    if not days and default_day <= last:
+        days.add(default_day)
+    return [datetime.date(year, month, d) for d in sorted(days)]
+
+
+def _rrule_dates(start, rule, win_start, win_end, local_zone):
+    """Dates a recurring event starts on, restricted to [win_start, win_end].
+
+    Covers the subset Google Calendar emits: FREQ DAILY/WEEKLY/MONTHLY/YEARLY
+    with INTERVAL, COUNT, UNTIL, BYDAY, BYMONTHDAY and BYMONTH. An unrecognized
+    FREQ degrades to DTSTART's own date, so an exotic rule shows one event
+    rather than vanishing or spinning. Without COUNT the generator skips whole
+    periods straight to the window — a daily event set up years ago costs a
+    couple of steps, not one per elapsed day. With COUNT every occurrence has
+    to be walked (the limit counts from DTSTART), but COUNT itself bounds it."""
+    freq = rule.get("FREQ", "").upper()
+    interval = max(1, _rrule_int(rule, "INTERVAL", 1) or 1)
+    count = _rrule_int(rule, "COUNT")
+    until_dt, _ = _ics_datetime({}, rule.get("UNTIL", ""), local_zone)
+    until = until_dt.date() if until_dt else None
+    start_date = start.date()
+    skip_to = win_start if count is None else None
+
+    if freq == "DAILY":
+        def candidates():
+            day = start_date
+            if skip_to and day < skip_to:
+                day += datetime.timedelta(
+                    days=((skip_to - day).days // interval) * interval)
+            for _ in range(_CAL_ITER_CAP):
+                yield day
+                day += datetime.timedelta(days=interval)
+    elif freq == "WEEKLY":
+        wanted = sorted({_ICS_WEEKDAYS.index(t[-2:]) for t in _rrule_weekdays(rule)}) \
+            or [start_date.weekday()]
+
+        def candidates():
+            # Weeks are anchored on Monday (WKST defaults to MO, and Google
+            # never sends anything else).
+            week = start_date - datetime.timedelta(days=start_date.weekday())
+            if skip_to and week < skip_to:
+                week += datetime.timedelta(
+                    weeks=(((skip_to - week).days // 7) // interval) * interval)
+            for _ in range(_CAL_ITER_CAP):
+                for weekday in wanted:
+                    yield week + datetime.timedelta(days=weekday)
+                week += datetime.timedelta(weeks=interval)
+    elif freq in ("MONTHLY", "YEARLY"):
+        byday = _rrule_weekdays(rule)
+        monthdays = _rrule_ints(rule, "BYMONTHDAY")
+        months = sorted(_rrule_ints(rule, "BYMONTH")) or [start_date.month]
+
+        def candidates():
+            step = 0
+            if skip_to:
+                if freq == "MONTHLY":
+                    elapsed = ((skip_to.year - start_date.year) * 12
+                               + skip_to.month - start_date.month)
+                else:
+                    elapsed = skip_to.year - start_date.year
+                step = max(0, elapsed // interval)
+            while step < _CAL_ITER_CAP:
+                if freq == "MONTHLY":
+                    total = (start_date.year * 12 + start_date.month - 1) + step * interval
+                    spans = [(total // 12, total % 12 + 1)]
+                else:
+                    spans = [(start_date.year + step * interval, m) for m in months]
+                for year, month in spans:
+                    for day in _cal_month_days(year, month, byday, monthdays,
+                                               start_date.day):
+                        yield day
+                step += 1
+    else:
+        return [start_date] if win_start <= start_date <= win_end else []
+
+    out = []
+    occurrences = 0
+    for day in candidates():
+        if day < start_date:
+            continue                       # BYDAY can back-fill before DTSTART
+        if until and day > until:
+            break
+        occurrences += 1
+        if count is not None and occurrences > count:
+            break
+        if day > win_end:
+            break
+        if day >= win_start:
+            out.append(day)
+    return out
+
+
+# --- Feed -> events --------------------------------------------------------
+
+def _cal_overlaps(start, end, all_day, win_start, win_end):
+    """Whether a single (non-recurring) occurrence touches the day window.
+    All-day events carry an exclusive DTEND date — a Sep 16 all-day event ends
+    at Sep 17 00:00 — so a second is trimmed before taking its last day."""
+    if start.date() > win_end:
+        return False
+    last = end or start
+    if all_day and end:
+        last = last - datetime.timedelta(seconds=1)
+    return last.date() >= win_start
+
+
+def _cal_feed_events(text, win_start, win_end, local_zone):
+    """Every occurrence in one .ics feed touching [win_start, win_end], as
+    {"start", "end", "all_day", "name"} dicts with naive local datetimes."""
+    events = list(_ics_events(text))
+    # A VEVENT carrying RECURRENCE-ID is one modified instance of its parent
+    # series; the parent's expansion has to skip that slot, since the instance
+    # may have been moved to another day (or cancelled outright).
+    overrides = set()
+    for event in events:
+        rid = event.get("RECURRENCE-ID")
+        uid = _cal_prop(event, "UID")
+        if rid and uid:
+            slot, _ = _ics_datetime(rid[0][0], rid[0][1], local_zone)
+            if slot:
+                overrides.add((uid, slot))
+
+    out = []
+    for event in events:
+        if _cal_prop(event, "STATUS").upper() == "CANCELLED":
+            continue
+        dtstart = event.get("DTSTART")
+        if not dtstart:
+            continue
+        start, all_day = _ics_datetime(dtstart[0][0], dtstart[0][1], local_zone)
+        if not start:
+            continue
+        end = None
+        if event.get("DTEND"):
+            end, _ = _ics_datetime(event["DTEND"][0][0], event["DTEND"][0][1], local_zone)
+        elif event.get("DURATION"):
+            end = start + _cal_duration(event["DURATION"][0][1])
+        name = _ics_unescape(_cal_prop(event, "SUMMARY")).strip() or _CAL_NO_TITLE
+        rrule = event.get("RRULE")
+
+        if not rrule or event.get("RECURRENCE-ID"):
+            if _cal_overlaps(start, end, all_day, win_start, win_end):
+                out.append({"start": start, "end": end,
+                            "all_day": all_day, "name": name})
+            continue
+
+        uid = _cal_prop(event, "UID")
+        exdates = set()
+        for params, value in event.get("EXDATE", []):
+            for piece in value.split(","):
+                hole, _ = _ics_datetime(params, piece, local_zone)
+                if hole:
+                    exdates.add(hole)
+        span = (end - start) if end else datetime.timedelta(0)
+        for day in _rrule_dates(start, _rrule_parse(rrule[0][1]),
+                                win_start, win_end, local_zone):
+            occurrence = datetime.datetime.combine(day, start.time())
+            if occurrence in exdates or (uid, occurrence) in overrides:
+                continue
+            out.append({"start": occurrence, "end": occurrence + span,
+                        "all_day": all_day, "name": name})
+    return out
+
+
+def _cal_fmt_time(dt):
+    """'9:00a' / '12:30p' — the compact form the display's 4x6 font fits."""
+    return "{}:{:02d}{}".format(dt.hour % 12 or 12, dt.minute,
+                                "p" if dt.hour >= 12 else "a")
+
+
+def _cal_day_entry(label, day, events, local_zone):
+    """One day's payload: all-day events first, then chronological. Identical
+    events are collapsed, so an invite that lands on two of the configured
+    calendars is listed once."""
+    picked = []
+    for event in events:
+        if event["all_day"]:
+            end = event["end"]
+            last = (end - datetime.timedelta(seconds=1)).date() if end \
+                else event["start"].date()
+            if not (event["start"].date() <= day <= last):
+                continue
+        elif event["start"].date() != day:
+            # Timed events are listed on the day they start. One running past
+            # midnight belongs to the day it began, not to both.
+            continue
+        picked.append(event)
+    picked.sort(key=lambda e: (not e["all_day"], e["start"], e["name"]))
+
+    listed = []
+    seen = set()
+    for event in picked:
+        key = (event["all_day"], event["start"], event["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        listed.append({
+            "time": "ALL DAY" if event["all_day"] else _cal_fmt_time(event["start"]),
+            "name": _status_trunc(event["name"], _CAL_NAME_MAX) or _CAL_NO_TITLE,
+            "all_day": bool(event["all_day"]),
+            "start": int(event["start"].replace(tzinfo=local_zone).timestamp()),
+        })
+    return {
+        "label": label,
+        "date": "{} {} {}".format(_CAL_DOW[day.weekday()],
+                                  _CAL_MON[day.month - 1], day.day),
+        "iso": day.isoformat(),
+        "events": listed[:_CAL_MAX_PER_DAY],
+        "more": max(0, len(listed) - _CAL_MAX_PER_DAY),
+    }
+
+
+def handle_calendar(params):
+    """Today's and tomorrow's events, pooled across every configured .ics feed.
+    One bad feed is logged and skipped so the rest of the board still renders;
+    only an all-feeds failure is an error, and that returns 502 rather than an
+    empty day so the device keeps displaying its last good lists."""
+    if not CALENDAR_FEEDS:
+        return 200, json.dumps({
+            "days": [], "calendars": 0, "errors": 0, "ts": int(time.time()),
+        }).encode()
+
+    local_zone = _cal_local_zone()
+    today = datetime.datetime.now(local_zone).date()
+    tomorrow = today + datetime.timedelta(days=1)
+    # Keyed by date as well as TTL: past midnight the cached payload's "TODAY"
+    # is yesterday's list, and must not be served for the rest of the window.
+    cache_key = "calendar:{}".format(today.isoformat())
+    cached = cache_get(cache_key, max_age_sec=CALENDAR_CACHE_SEC)
+    if cached:
+        return 200, cached
+
+    events = []
+    errors = 0
+    for i, url in enumerate(CALENDAR_FEEDS):
+        try:
+            status, body = fetch(url, timeout=20)
+            if status != 200:
+                raise RuntimeError("HTTP {}".format(status))
+            events.extend(_cal_feed_events(
+                body.decode("utf-8", "replace"), today, tomorrow, local_zone))
+        except Exception as e:
+            errors += 1
+            # Identify the feed by position only — the URL is a secret.
+            _log_proxy_event("calendar feed {}/{} failed: {}".format(
+                i + 1, len(CALENDAR_FEEDS), e))
+    if errors == len(CALENDAR_FEEDS):
+        return 502, json.dumps({
+            "error": "all calendar feeds failed",
+            "calendars": len(CALENDAR_FEEDS),
+        }).encode()
+
+    body = json.dumps({
+        "days": [
+            _cal_day_entry("TODAY", today, events, local_zone),
+            _cal_day_entry("TOMORROW", tomorrow, events, local_zone),
+        ],
+        "calendars": len(CALENDAR_FEEDS),
+        "errors": errors,
+        "ts": int(time.time()),
+    }).encode()
+    cache_set(cache_key, body, age_override=CALENDAR_CACHE_SEC)
+    return 200, body
+
+
 ROUTES = {
     "/api/planes":      handle_planes,
     "/api/route":       handle_route,
@@ -2106,6 +2648,7 @@ ROUTES = {
     "/api/devicelog":   handle_devicelog_get,
     "/api/health":      handle_health,
     "/api/status":      handle_status,
+    "/api/calendar":    handle_calendar,
     "/api/time":        handle_time,
 }
 

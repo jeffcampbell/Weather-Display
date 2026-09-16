@@ -612,6 +612,63 @@ Aggregates the public status feeds of major cloud/dev providers into one compact
 
 ---
 
+## `GET /api/calendar`
+
+Merges every configured private `.ics` feed into two ready-to-render day lists — today and tomorrow — for the 128x64 agenda view. All of iCalendar's awkward parts (folded lines, `TZID` resolution, `RRULE` expansion, `EXDATE` holes, `RECURRENCE-ID` overrides) are handled here, so the device receives nothing but a name and a preformatted time per event. Events from all calendars are pooled; which feed an event came from is deliberately not reported.
+
+Feeds come from the `calendar_ics_urls` config block. **Each URL is a secret** — anyone holding one can read that entire calendar — so they are never echoed in a response and a failing feed is logged by position (`calendar feed 2/3 failed`), never by URL.
+
+**Response:**
+
+```json
+{
+  "days": [
+    {
+      "label": "TODAY",
+      "date": "WED SEP 16",
+      "iso": "2026-09-16",
+      "events": [
+        { "time": "ALL DAY", "name": "Jeff PTO", "all_day": true, "start": 1789358400 },
+        { "time": "8:30a", "name": "Daily standup", "all_day": false, "start": 1789561800 }
+      ],
+      "more": 0
+    },
+    { "label": "TOMORROW", "date": "THU SEP 17", "iso": "2026-09-17", "events": [], "more": 0 }
+  ],
+  "calendars": 2,
+  "errors": 0,
+  "ts": 1789567718
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `days` | array | Always two entries — today first, then tomorrow. Empty only when no feeds are configured. |
+| `days[].label` | string | `TODAY` / `TOMORROW`, ready to render as the card heading |
+| `days[].date` | string | Uppercase `DOW MON D` (e.g. `WED SEP 16`), ASCII-only |
+| `days[].iso` | string | `YYYY-MM-DD` for the day, in the proxy's local timezone |
+| `days[].events` | array | All-day events first, then chronological. Identical events are collapsed, so an invite that lands on two configured calendars is listed once. |
+| `days[].events[].time` | string | `9:00a` / `12:30p`, or the literal `ALL DAY` |
+| `days[].events[].name` | string | Event summary, ASCII-only, truncated to 24 chars at a word boundary (`Anniversary dinne..`) |
+| `days[].events[].all_day` | bool | True for a date-valued (all-day) event; the device colors those differently |
+| `days[].events[].start` | int | Unix seconds of the event's start — unused by the current view, handy for anything that wants to sort or compare against "now" |
+| `days[].more` | int | Events beyond the 12-per-day cap (`_CAL_MAX_PER_DAY`). The device adds its own row-count overflow to this for the `+N more` row. |
+| `calendars` | int | How many feeds are configured |
+| `errors` | int | How many of them failed this refresh |
+| `ts` | int | Unix seconds when this snapshot was built |
+
+**Which events land on a day.** An all-day event covers every day it spans (`DTEND` is exclusive, per RFC 5545, so a Sep 16 all-day event does not leak into Sep 17). A timed event is listed on the day it *starts* — one running past midnight belongs to the day it began, not to both. Events with `STATUS:CANCELLED` are dropped.
+
+**Recurrence support.** `FREQ=DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` (including ordinals like `2TU`, `-1FR`), `BYMONTHDAY` and `BYMONTH` — the subset Google Calendar emits. `EXDATE` deletions and `RECURRENCE-ID` overrides (a moved or cancelled single instance) are honored. An unrecognized `FREQ` degrades to the event's own `DTSTART` rather than vanishing or looping. Expansion skips whole periods straight to the two-day window, so a daily event created years ago costs a couple of steps rather than one per elapsed day; every rule is additionally capped at 2000 steps.
+
+**Timezones.** `TZID` values are resolved through the host's tzdata (`zoneinfo`); `...Z` values are UTC; a floating value is taken as local. An unresolvable `TZID` (e.g. a Windows-style name) logs once and falls back to local. "Today" and "tomorrow" are measured in the `timezone` config key, else `/etc/timezone`, else the host's current UTC offset.
+
+**Resilience:** each feed is fetched inside a `try`/`except`; one bad feed is logged and skipped so the remaining calendars still render. If *every* feed fails the endpoint returns **502** rather than empty days — the device treats that as a fetch error and keeps displaying its last good lists instead of blanking the card.
+
+**Cache TTL:** 600s (`CALENDAR_CACHE_SEC`), keyed by the local date as well — past midnight the cached payload's "TODAY" is yesterday's list, so the rollover invalidates it immediately instead of serving a stale day for the rest of the window.
+
+---
+
 ## Configuration (`config.json`)
 
 ```json
@@ -640,6 +697,8 @@ Aggregates the public status feeds of major cloud/dev providers into one compact
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Overrides the free OpenSky / adsbdb route by default (see `flightaware_override_free_routes`); if missing, those are the only route sources. |
 | `flightaware_override_free_routes` | `/api/route` | When `true` (default), FlightAware overrides a route the free DBs already resolved, fixing stale "right tail, wrong route" answers from reused callsigns. `false` reverts to consulting FlightAware only when the free sources found nothing. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
+| `calendar_ics_urls` | `/api/calendar` | Private `.ics` feed URLs (Google Calendar → Settings → *Integrate calendar* → **Secret address in iCal format**), as bare strings or `{"url": ...}` objects. Events from every feed are pooled. **Each URL is a password** — treat `config.json` accordingly. Empty list disables the endpoint. |
+| `timezone` | `/api/calendar` | IANA timezone name that "today" and "tomorrow" are measured in. Omit to use the host's own timezone. |
 | `status_providers` | `/api/status` | Providers to monitor, in display order. Each has `name` and `type`. `type: "statuspage"` needs a `host` (any Atlassian Statuspage site — add one with no code). `type: "aws"`/`"gcp"`/`"azure"` use built-in adapters (no `host`). Omit the whole key to use the built-in default set (GitHub, Cloudflare, Supabase, HashiCorp, Anthropic, AWS, GCP, Azure). |
 
 The server's listening port is set via the `PORT` environment variable (default `6590`).
