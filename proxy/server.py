@@ -15,7 +15,9 @@ Usage:
 """
 
 import calendar
+import csv
 import json
+import syslog
 import math
 import os
 import socket
@@ -449,6 +451,50 @@ FLIGHTAWARE_MONTHLY_LIMIT = int(_config.get("flightaware_monthly_limit", 450))
 FLIGHTAWARE_OVERRIDE_FREE = bool(_config.get("flightaware_override_free_routes", True))
 _FA_USAGE_PATH = Path(__file__).parent / "flightaware_usage.json"
 
+# Geo-plausibility check on the free-tier route: a narrower, self-limiting
+# alternative to FLIGHTAWARE_OVERRIDE_FREE for deciding when a paid lookup is
+# worth it. See route_geo_implausible() below. "observe" computes and logs a
+# verdict without gating spend; "enforce" lets a flagged verdict trigger the
+# paid call; "off" skips the check entirely. Defaults to "observe" — new code
+# that can spend money should never ship pre-armed.
+ROUTE_GEO_CHECK_MODE = str(_config.get("route_geo_check_mode", "observe")).strip().lower()
+if ROUTE_GEO_CHECK_MODE not in ("off", "observe", "enforce"):
+    ROUTE_GEO_CHECK_MODE = "observe"   # unrecognized value fails safe, not open
+ROUTE_GEO_CHECK_DEADBAND_DEG = max(0.0, float(_config.get("route_geo_check_deadband_deg", 0.5)))
+
+_AIRPORT_COORDS_PATH = Path(__file__).parent / "airport_coords.csv"
+
+
+def _load_airport_coords():
+    """icao -> longitude (float), for the route geo-plausibility check.
+    Missing/unreadable/malformed file -> empty dict, which fails the whole
+    check open (see route_geo_implausible) rather than crashing startup."""
+    d = {}
+    try:
+        with open(_AIRPORT_COORDS_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                icao = (row.get("icao") or "").strip().upper()
+                lon = row.get("lon")
+                if not icao or lon in (None, ""):
+                    continue
+                try:
+                    d[icao] = float(lon)
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"airport_coords.csv load failed: {e}")
+    return d
+
+
+_AIRPORT_LON = _load_airport_coords()
+_geo_check_lock = Lock()
+_geo_check_stats = {"total": 0, "flagged": 0, "unknown": 0, "enforced": 0}
+
+# Also opened by other alert paths in this file (harmless if called more than
+# once) — routes actual geo-check-triggered spend to the system journal so
+# it's visible in ops-review's Log tab, not just this proxy's own device.log.
+syslog.openlog(ident="matrix-portal-proxy")
+
 # Optional schedule gate. When the applicable flag file exists and reads as
 # "off" (or 0/false/no/free), FlightAware is skipped entirely for that scope —
 # free routes only, zero billable calls — regardless of the override and the
@@ -564,6 +610,58 @@ def _is_ga_registration(callsign):
     return callsign[:1] == "N" and callsign[1:2].isdigit()
 
 
+def _observer_lon_for_route_check(loc):
+    """Best-effort observer longitude for the geo-plausibility check. Unlike
+    resolve_location(), this never errors: an unknown/blank loc or a
+    malformed locations{} entry falls back to the global LONGITUDE default.
+    The geo check is a heuristic nudge toward spending money, not a
+    correctness requirement — it must never block a route lookup."""
+    entry = LOCATIONS.get(loc) if loc else None
+    if entry:
+        try:
+            return float(entry.get("lon", LONGITUDE))
+        except (TypeError, ValueError):
+            return LONGITUDE
+    return LONGITUDE
+
+
+def _route_lon_plausible(origin_icao, dest_icao, observer_lon, deadband_deg):
+    """True/False if we can evaluate whether observer_lon plausibly lies
+    between origin/dest longitude (with deadband_deg slack past either
+    endpoint); None ("unknown") if either ICAO isn't in the coordinate
+    table. Callers must treat None as "don't gate on this", not as either
+    verdict — that's the fail-open contract for unrecognized airports."""
+    o_lon = _AIRPORT_LON.get((origin_icao or "").strip().upper())
+    d_lon = _AIRPORT_LON.get((dest_icao or "").strip().upper())
+    if o_lon is None or d_lon is None:
+        return None
+    lo, hi = (o_lon, d_lon) if o_lon <= d_lon else (d_lon, o_lon)
+    return (lo - deadband_deg) <= observer_lon <= (hi + deadband_deg)
+
+
+def _geo_check_note(verdict):
+    with _geo_check_lock:
+        _geo_check_stats["total"] += 1
+        if verdict is None:
+            _geo_check_stats["unknown"] += 1
+        elif verdict is False:
+            _geo_check_stats["flagged"] += 1
+
+
+def route_geo_implausible(route, loc):
+    """True only when the free-tier route looks confidently wrong for this
+    observer — a positive signal to spend on FlightAware. Every failure mode
+    (check off, route not a [origin, dest] pair, unrecognized airport)
+    returns False: this function is only ever allowed to add spend, never to
+    add certainty it doesn't have."""
+    if ROUTE_GEO_CHECK_MODE == "off" or not route or len(route) != 2:
+        return False
+    observer_lon = _observer_lon_for_route_check(loc)
+    verdict = _route_lon_plausible(route[0], route[1], observer_lon, ROUTE_GEO_CHECK_DEADBAND_DEG)
+    _geo_check_note(verdict)
+    return verdict is False
+
+
 def handle_route(params):
     """Proxy route + aircraft type lookup. Falls through:
         OpenSky routes  ->  adsbdb  ->  FlightAware (real-time, paid)
@@ -630,19 +728,59 @@ def handle_route(params):
             except Exception:
                 pass
 
+    # 2.5. Geo-plausibility check on whatever free-tier route was found above.
+    #      If the observer isn't plausibly between the origin/dest longitudes
+    #      (see route_geo_implausible), the free answer is likely stale for a
+    #      reused callsign — worth a paid lookup in "enforce" mode. Always
+    #      evaluated (even in "observe" mode) so its counters/log stay useful
+    #      for tuning before it's allowed to gate spend.
+    geo_flag = route_geo_implausible(result["route"], loc)
+    if geo_flag:
+        _log_proxy_event(
+            f"route geo-check: {callsign} route={result['route']} "
+            f"loc={loc or 'default'} deadband={ROUTE_GEO_CHECK_DEADBAND_DEG}deg "
+            f"mode={ROUTE_GEO_CHECK_MODE}"
+            + ("" if ROUTE_GEO_CHECK_MODE == "enforce" else " [observe-only, not gating]")
+        )
+
     # 3. FlightAware AeroAPI — paid, best accuracy, real-time. Consulted to
     #    *override* the free scheduled-route answer (which can be stale when a
     #    callsign is reused for a different leg), not merely as a last resort.
     #    Bounded by: FLIGHTAWARE_OVERRIDE_FREE, the monthly spend cap, the
     #    GA-registration skip, and the per-(callsign,icao24) route cache. With
     #    the override off, falls back to the old "only when free found nothing"
-    #    behavior.
+    #    behavior — except now the geo-plausibility check (above) can also
+    #    promote a "free tier found something, but it looks geographically
+    #    wrong" case into a paid lookup, once ROUTE_GEO_CHECK_MODE is
+    #    "enforce".
+    # True only when the geo check is the *reason* fa_should_consult fires —
+    # i.e. override is off and the free tier did find a route, so without the
+    # geo check this callsign would NOT have been consulted. Used to log/count
+    # actual paid pickups attributable to this check, not just flagged verdicts.
+    geo_is_deciding_reason = (
+        ROUTE_GEO_CHECK_MODE == "enforce" and geo_flag
+        and not FLIGHTAWARE_OVERRIDE_FREE and result["route"])
+
     fa_should_consult = flightaware_enabled_now(loc) and (
-        FLIGHTAWARE_OVERRIDE_FREE or not result["route"])
+        FLIGHTAWARE_OVERRIDE_FREE
+        or not result["route"]
+        or (ROUTE_GEO_CHECK_MODE == "enforce" and geo_flag))
     if fa_should_consult and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
         if not _flightaware_reserve():
             _flightaware_note_exhausted()   # cap hit — skip the billable call
         else:
+            if geo_is_deciding_reason:
+                with _geo_check_lock:
+                    _geo_check_stats["enforced"] += 1
+                geo_msg = (
+                    f"route geo-check ENFORCED: {callsign} route={result['route']} "
+                    f"loc={loc or 'default'} — paid FlightAware call triggered by the geo check"
+                )
+                _log_proxy_event(geo_msg)
+                # Also to syslog (not just device.log) so this shows up in
+                # ops-review's Log tab, same mechanism as the FlightAware
+                # budget-threshold alerts.
+                syslog.syslog(syslog.LOG_WARNING, geo_msg)
             fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
             fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
             if fa_status != 200:
@@ -1671,6 +1809,11 @@ def handle_health(params):
         "flightaware_used": fa_used,
         "flightaware_limit": fa_limit,
         "flightaware_enabled": flightaware_enabled_now(),
+        "route_geo_check_mode": ROUTE_GEO_CHECK_MODE,
+        "route_geo_checks_total": _geo_check_stats["total"],
+        "route_geo_checks_flagged": _geo_check_stats["flagged"],
+        "route_geo_checks_unknown": _geo_check_stats["unknown"],
+        "route_geo_checks_enforced": _geo_check_stats["enforced"],
         "uptime_seconds": int(time.time() - _started_at),
     }).encode()
 
@@ -2089,6 +2232,7 @@ def handle_status(params):
     }).encode()
     cache_set(cache_key, body, age_override=STATUS_CACHE_SEC)
     return 200, body
+
 
 
 ROUTES = {
