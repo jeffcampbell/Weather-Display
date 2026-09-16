@@ -209,6 +209,12 @@ def _db_init():
         """)
         con.execute("CREATE INDEX IF NOT EXISTS ships_ts  ON ships(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS planes_ts ON planes(ts)")
+        # planes.loc names which display's bounding box saw the aircraft, so
+        # traffic — and the FlightAware spend it drives — can be attributed per
+        # display. Added after the table shipped, so migrate in place rather
+        # than requiring a rebuild; PRAGMA check keeps it idempotent.
+        if "loc" not in {r[1] for r in con.execute("PRAGMA table_info(planes)")}:
+            con.execute("ALTER TABLE planes ADD COLUMN loc TEXT")
 
 # Deduplicate: don't log the same vessel again within this window
 _SHIP_LOG_INTERVAL  = 300   # 5 minutes
@@ -232,11 +238,21 @@ def log_ship(s):
                  s.get("distance_mi"), s.get("destination",""))
             )
 
-def log_plane(callsign, icao24, alt_ft, speed_kt, heading, lat, lon):
+def log_plane(callsign, icao24, alt_ft, speed_kt, heading, lat, lon,
+              loc="default", obs_lat=None, obs_lon=None):
+    """Record one aircraft sighting. `loc` names the display whose bounding box
+    saw it — "default" for the v1 endpoint, which uses the proxy's own
+    lat/lon/bbox rather than a named location. obs_lat/obs_lon are the observer
+    the distance is measured from, defaulting to the proxy's globals."""
     now = int(time.time())
-    if now - _last_plane_log.get(callsign, 0) < _PLANE_LOG_INTERVAL:
+    # Throttle per (loc, callsign), not per callsign: one aircraft can sit
+    # inside both displays' boxes at once, and a shared key would silently drop
+    # the second display's sighting — exactly the under-count this logging is
+    # meant to fix.
+    throttle_key = (loc, callsign)
+    if now - _last_plane_log.get(throttle_key, 0) < _PLANE_LOG_INTERVAL:
         return
-    _last_plane_log[callsign] = now
+    _last_plane_log[throttle_key] = now
     import math
     def _dist(la1, lo1, la2, lo2):
         if not la2 or not lo2:
@@ -247,13 +263,15 @@ def log_plane(callsign, icao24, alt_ft, speed_kt, heading, lat, lon):
         dlam = math.radians(lo2 - lo1)
         a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
         return round(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
-    distance_mi = _dist(LATITUDE, LONGITUDE, lat, lon)
+    distance_mi = _dist(LATITUDE if obs_lat is None else obs_lat,
+                        LONGITUDE if obs_lon is None else obs_lon, lat, lon)
     with _db_lock:
         with sqlite3.connect(DB_PATH) as con:
             con.execute(
-                "INSERT INTO planes (ts,callsign,icao24,alt_ft,speed_kt,heading,lat,lon,distance_mi) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (now, callsign, icao24, alt_ft, speed_kt, heading, lat, lon, distance_mi)
+                "INSERT INTO planes (ts,callsign,icao24,alt_ft,speed_kt,heading,lat,lon,distance_mi,loc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (now, callsign, icao24, alt_ft, speed_kt, heading, lat, lon,
+                 distance_mi, loc)
             )
 
 
@@ -404,7 +422,8 @@ def handle_planes(params):
                     int(s[11] or 0),                    # vrate
                 ]
                 planes.append(entry)
-                log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4], p_lat, p_lon)
+                log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4],
+                          p_lat, p_lon, loc="default")
             except Exception:
                 continue                                 # skip malformed rows, keep the rest
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
@@ -502,7 +521,8 @@ def _fa_usage_read():
     except Exception:
         d = {}
     if d.get("period") != _fa_period():
-        d = {"period": _fa_period(), "count": 0}
+        d = {"period": _fa_period(), "count": 0, "by_loc": {}}
+    d.setdefault("by_loc", {})      # usage files written before per-loc split
     return d
 
 
@@ -513,32 +533,49 @@ def _fa_usage_write(d):
         print(f"FlightAware usage write failed: {e}")
 
 
+def flightaware_usage_by_loc():
+    """This month's billable-call count per display, e.g. {"home": 412,
+    "beach": 1588}. "default" covers the v1 endpoint (no loc param)."""
+    with _fa_usage_lock:
+        return dict(_fa_usage_read().get("by_loc", {}))
+
+
 def flightaware_usage_status():
     """(used, limit) for the current month — surfaced on /api/health."""
     with _fa_usage_lock:
         return _fa_usage_read().get("count", 0), FLIGHTAWARE_MONTHLY_LIMIT
 
 
-def _flightaware_reserve():
+def _flightaware_reserve(loc=""):
     """Atomically reserve one billable FlightAware call against the monthly
     cap. Returns True (and increments) if under the limit, else False. Reserving
-    *before* the call makes the ceiling hard even under concurrent requests."""
+    *before* the call makes the ceiling hard even under concurrent requests.
+    `loc` attributes the spend to the display that triggered it — the cap is
+    shared between displays, so without this there's no way to see which one is
+    consuming it (surfaced as flightaware_used_by_loc on /api/health)."""
+    key = loc or "default"
     with _fa_usage_lock:
         d = _fa_usage_read()
         if d.get("count", 0) >= FLIGHTAWARE_MONTHLY_LIMIT:
             return False
         d["count"] = d.get("count", 0) + 1
+        d["by_loc"][key] = d["by_loc"].get(key, 0) + 1
         _fa_usage_write(d)
         return True
 
 
-def _flightaware_refund():
+def _flightaware_refund(loc=""):
     """Return a reserved slot to the pool when the request didn't actually bill
-    (non-2xx response, or a network error before reaching FlightAware)."""
+    (non-2xx response, or a network error before reaching FlightAware). Must be
+    given the same `loc` the reservation used, or the per-display tallies drift
+    from the total."""
+    key = loc or "default"
     with _fa_usage_lock:
         d = _fa_usage_read()
         if d.get("count", 0) > 0:
             d["count"] -= 1
+            if d["by_loc"].get(key, 0) > 0:
+                d["by_loc"][key] -= 1
             _fa_usage_write(d)
 
 
@@ -640,13 +677,13 @@ def handle_route(params):
     fa_should_consult = flightaware_enabled_now(loc) and (
         FLIGHTAWARE_OVERRIDE_FREE or not result["route"])
     if fa_should_consult and FLIGHTAWARE_KEY and not _is_ga_registration(callsign):
-        if not _flightaware_reserve():
+        if not _flightaware_reserve(loc):
             _flightaware_note_exhausted()   # cap hit — skip the billable call
         else:
             fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
             fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
             if fa_status != 200:
-                _flightaware_refund()   # non-2xx doesn't bill — reclaim the slot
+                _flightaware_refund(loc)   # non-2xx doesn't bill — reclaim the slot
             if fa_status == 200 and fa_data:
                 try:
                     fa = json.loads(fa_data)
@@ -1071,6 +1108,13 @@ def handle_v2_planes(params):
                     int(s[11] or 0),
                 ]
                 planes.append(entry)
+                # The v1 path has always logged sightings; this one never did,
+                # so every named-location display was invisible in the planes
+                # table. Distances are measured from this location, not the
+                # proxy's globals. OpenSky state vector: s[5]=lon, s[6]=lat.
+                log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4],
+                          s[6] or 0, s[5] or 0, loc=loc_or_err,
+                          obs_lat=lat, obs_lon=lon)
             except Exception:
                 continue
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
@@ -1669,6 +1713,7 @@ def handle_health(params):
         "ships_tracked": len(_ships),
         "flightaware_month": _fa_period(),
         "flightaware_used": fa_used,
+        "flightaware_used_by_loc": flightaware_usage_by_loc(),
         "flightaware_limit": fa_limit,
         "flightaware_enabled": flightaware_enabled_now(),
         "uptime_seconds": int(time.time() - _started_at),

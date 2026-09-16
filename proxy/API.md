@@ -526,6 +526,7 @@ Liveness check.
   "ships_tracked": 3,
   "flightaware_month": "2026-08",
   "flightaware_used": 37,
+  "flightaware_used_by_loc": { "home": 12, "beach": 25 },
   "flightaware_limit": 450,
   "uptime_seconds": 8412
 }
@@ -539,6 +540,7 @@ Liveness check.
 | `ships_tracked` | int | Total ships in the AIS cache (before filtering) |
 | `flightaware_month` | string | Current billing period (`YYYY-MM`, UTC) the quota is counting against |
 | `flightaware_used` | int | Billable FlightAware `/flights` calls made this month |
+| `flightaware_used_by_loc` | object | The same count split by the display that triggered it, keyed by `loc` (`default` = the v1 endpoint, which has no `loc`). The monthly cap is **shared across every display** using this proxy, so this is what tells you which one is consuming it. Tallies start at zero when a new billing period begins; they always sum to `flightaware_used` within a period. |
 | `flightaware_limit` | int | Configured monthly cap (`flightaware_monthly_limit`) |
 | `uptime_seconds` | int | Seconds since the proxy process started |
 
