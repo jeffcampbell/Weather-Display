@@ -23,8 +23,23 @@ adafruit_bus_device/
 adafruit_connection_manager/
 adafruit_esp32spi/        # M4 only (not needed on S3)
 adafruit_requests/
+adafruit_ticks.mpy        # bitmap_label dependency
+adafruit_imageload/       # adafruit_portalbase.graphics dependency
+adafruit_fakerequests.mpy # adafruit_portalbase.network dependency
+adafruit_io/              # adafruit_portalbase.network dependency
+adafruit_minimqtt/        # adafruit_io dependency
 neopixel.mpy
 ```
+
+> These five (`adafruit_ticks`, `adafruit_imageload`, `adafruit_fakerequests`,
+> `adafruit_io`, `adafruit_minimqtt`) aren't used directly by this project's
+> code, but `adafruit_portalbase` imports them unconditionally at module load
+> time on current bundle versions, so the board fails at `import layout_*`
+> without them. Missing any one produces an `ImportError` at boot naming the
+> specific module — check the traceback over the serial console (`screen
+> /dev/tty.usbmodem* 115200`, then Ctrl-D to reload) or, once the web
+> workflow is up, `curl -u :PASSWORD http://DEVICE_IP/fs/lib/` to list
+> what's actually on the board.
 
 ## 3. Copy Font Files
 
