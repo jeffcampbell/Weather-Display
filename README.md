@@ -82,13 +82,13 @@ The device ships two complete layouts and picks one at boot from the `display` k
 | `display` | Layout | Notes |
 |-----------|--------|-------|
 | `"64x32"` (default) | [`device/layout_64x32.py`](device/layout_64x32.py) | Native 64×32 — weather/tides, aircraft, ships |
-| `"128x64"` | [`device/layout_128x64.py`](device/layout_128x64.py) | Full-panel superset — everything above at `scale=2`, plus a wide sky map, planet views, a 3-day forecast, and a service-status board |
+| `"128x64"` | [`device/layout_128x64.py`](device/layout_128x64.py) | Full-panel superset — everything above at `scale=2`, plus a wide sky map, planet views, a 3-day forecast, a service-status board, and a calendar agenda |
 
 The launcher (`device/code.py`) imports the matching layout module and hands off; nothing else picks the size. Change `display`, save, and CircuitPython restarts into the other layout — no reflash needed.
 
 ### Feature flags
 
-Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit a key to use its default. The four core flags work on both panels; two are 128×64-only and are simply ignored by the 64×32 layout.
+Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit a key to use its default. The four core flags work on both panels; three are 128×64-only and are simply ignored by the 64×32 layout.
 
 | Flag | Default | Panels | Enables |
 |------|---------|--------|---------|
@@ -98,6 +98,7 @@ Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit 
 | `enable_boats` | on | both | Nearby AIS vessels (coastal displays) |
 | `enable_astronomy` | off | **128×64 only** | Sky map, planet views, and the 3-day forecast |
 | `enable_status` | off | **128×64 only** | Cloud/dev-service outage board (see below) |
+| `enable_calendar` | off | **128×64 only** | Today/tomorrow calendar agenda (see below) |
 
 ```python
 # secrets.py — an inland 128×64 display with the outage board on:
@@ -106,9 +107,20 @@ Each screen is toggled independently by an `enable_*` key in `secrets.py`. Omit 
 "enable_boats":     False,
 "enable_astronomy": True,
 "enable_status":    True,
+"enable_calendar":  True,
 ```
 
 (`enable_astronomy` supersedes the older `basin_mode: "sky"` switch, which still works and just sets the astronomy/tide defaults.)
+
+### Calendar agenda
+
+With `enable_calendar` on, the 128×64 display rotates in an agenda card for today — and one for tomorrow when there's anything on it — listing each event's start time and name. Today's card always appears, so "nothing scheduled" is an answer rather than a blank rotation slot. All-day events sort first and get their own color; anything past the five rows a card holds collapses into a `+N more` line.
+
+Calendars are configured on the proxy, not the device: put one or more private `.ics` URLs in `proxy/config.json` under `calendar_ics_urls`. In Google Calendar these come from **Settings → *(your calendar)* → Integrate calendar → "Secret address in iCal format"**. Any number of calendars can be listed; `GET /api/calendar` pools their events into a single agenda and never reports which calendar an event came from, so the display just shows what's happening.
+
+> **Treat each `.ics` URL as a password.** Anyone holding one can read that entire calendar, and rotating it means revoking the old address in Google Calendar. `proxy/config.json` is gitignored for this reason; the proxy never echoes a feed URL in a response or a log line.
+
+The proxy does all the iCalendar work — recurring events (including moved and deleted instances), timezones, and multi-day spans — and hands the device a plain list of names and times. See [proxy/API.md](proxy/API.md#get-apicalendar) for the payload shape and exactly which recurrence rules are supported.
 
 ### Service-status board
 
