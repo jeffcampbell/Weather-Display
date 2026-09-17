@@ -993,10 +993,15 @@ def handle_route(params):
                     f"loc={loc or 'default'} — paid FlightAware call triggered by the geo check"
                 )
                 _log_proxy_event(geo_msg)
-                # Also to the system journal, same as the budget-threshold
-                # alerts — this is real money being spent, so it belongs
-                # somewhere a host's log tooling can see it.
-                syslog.syslog(syslog.LOG_WARNING, geo_msg)
+                # Also to the system journal, so spend is visible to a host's
+                # log tooling and not just this proxy's device.log. Logged at
+                # INFO, not WARNING: the geo check doing its job and buying a
+                # correction is the expected outcome, not a fault, and it fires
+                # often enough (~120/day here) to drown a channel that escalates
+                # warn-and-above. The budget-threshold alerts stay at WARNING/ERR
+                # because those do want a human. Counted either way in
+                # route_geo_checks_enforced on /api/health.
+                syslog.syslog(syslog.LOG_INFO, geo_msg)
             fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
             fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})
             if fa_status != 200:

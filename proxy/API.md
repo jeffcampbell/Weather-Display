@@ -674,7 +674,14 @@ def on_event(event, fields):
 
 **Best-effort by contract.** No module, no `on_event`, or an exception inside the hook is caught and logged; serving is never affected. Hooks are called outside the usage lock, but a hook that blocks still delays the request that triggered it, so keep them quick.
 
-**You may not need one.** Budget-threshold crossings and geo-check enforcement are already written to the **system journal** via syslog under the ident `matrix-portal-proxy`, at `WARNING` (or `ERR` for the highest threshold). Any host tooling that watches the journal picks those up with no hook at all.
+**You may not need one.** The proxy writes to the **system journal** via syslog under the ident `matrix-portal-proxy`, and the level is chosen to match how much a human should care:
+
+| Event | Level | Why |
+|-------|-------|-----|
+| FlightAware budget threshold crossed | `WARNING`, or `ERR` for the highest threshold | Wants a person to know — spend is approaching its ceiling |
+| Geo-check triggered a paid lookup | `INFO` | The check working as designed, not a fault. It fires often (on the order of 100/day), so it stays below the level most journal watchers escalate |
+
+Any host tooling that watches the journal picks up the first with no hook at all; tools that tail `-p warning` (a common default) will not see the second.
 
 ---
 
