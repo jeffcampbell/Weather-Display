@@ -5,9 +5,10 @@
   "longitude": -71.06,
   "bbox": 0.1,
 
-  "_locations_comment": "Named locations for the /api/v2 endpoints (?loc=<name>). The v1 endpoints ignore this and keep using latitude/longitude/bbox above. Each entry may set lat, lon, and bbox; omitted keys fall back to the globals.",
+  "_locations_comment": "Named locations, selected per request with ?loc=<name>. Omitting loc uses the latitude/longitude/bbox above, reported as the location \"default\". Each entry may set lat, lon and bbox; omitted keys fall back to the globals. Optional per-location keys: ship_radius_mi opts the location in to AIS ship tracking (and sets its display radius in miles) - only opted-in locations are subscribed on AISStream, so an inland location costs no bandwidth; changing it needs a service restart because the subscription is fixed at connect time.",
   "locations": {
-    "home": { "lat": 42.36, "lon": -71.06, "bbox": 0.1 }
+    "home": { "lat": 42.36, "lon": -71.06, "bbox": 0.1 },
+    "_shore_example": { "lat": 42.14, "lon": -70.69, "bbox": 0.07, "ship_radius_mi": 10, "station": "8443970" }
   },
 
   "openweather_key": "YOUR_OPENWEATHERMAP_API_KEY",

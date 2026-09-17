@@ -289,6 +289,9 @@ def _db_init():
         # than requiring a rebuild; PRAGMA check keeps it idempotent.
         if "loc" not in {r[1] for r in con.execute("PRAGMA table_info(planes)")}:
             con.execute("ALTER TABLE planes ADD COLUMN loc TEXT")
+        # Same for vessels: which display's radius the sighting was inside.
+        if "loc" not in {r[1] for r in con.execute("PRAGMA table_info(ships)")}:
+            con.execute("ALTER TABLE ships ADD COLUMN loc TEXT")
 
 
 def _route_cache_persist(key, entry):
@@ -338,20 +341,26 @@ _PLANE_LOG_INTERVAL = 120   # 2 minutes
 _last_ship_log  = {}  # mmsi  -> last logged ts
 _last_plane_log = {}  # callsign -> last logged ts
 
-def log_ship(s):
+def log_ship(s, loc=DEFAULT_LOC_NAME):
+    """Record one vessel sighting. `loc` is the display whose radius it was
+    inside — distances are measured from there, so the same vessel can be a
+    different distance away in two rows."""
     mmsi = s.get("mmsi", "")
     now = int(time.time())
-    if now - _last_ship_log.get(mmsi, 0) < _SHIP_LOG_INTERVAL:
+    # Throttle per (loc, mmsi): a vessel can sit inside two coastal locations'
+    # radii at once, and a shared key would drop the second display's row.
+    throttle_key = (loc, mmsi)
+    if now - _last_ship_log.get(throttle_key, 0) < _SHIP_LOG_INTERVAL:
         return
-    _last_ship_log[mmsi] = now
+    _last_ship_log[throttle_key] = now
     with _db_lock:
         with sqlite3.connect(DB_PATH) as con:
             con.execute(
-                "INSERT INTO ships (ts,mmsi,name,type_name,lat,lon,speed,heading,distance_mi,destination) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO ships (ts,mmsi,name,type_name,lat,lon,speed,heading,distance_mi,destination,loc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (now, mmsi, s.get("name",""), s.get("type_name",""),
                  s.get("lat"), s.get("lon"), s.get("speed"), s.get("heading"),
-                 s.get("distance_mi"), s.get("destination",""))
+                 s.get("distance_mi"), s.get("destination",""), loc)
             )
 
 def log_plane(callsign, icao24, alt_ft, speed_kt, heading, lat, lon,
@@ -1703,9 +1712,59 @@ def _vessel_cache_upsert(mmsi, fields):
 
 SHIP_STALE_SECS = 600  # remove ships not seen in 10 min
 SHIP_MIN_LENGTH = 30   # meters — filter out small vessels
-SHIP_CENTER_LAT = LATITUDE   # center of ship search radius (same as home location)
-SHIP_CENTER_LON = LONGITUDE
-SHIP_MAX_MILES = 10    # only show ships within this radius
+SHIP_MAX_MILES = 10    # display radius when a location doesn't set its own
+
+# A location opts in to ship tracking by giving its `locations` entry a
+# `ship_radius_mi`. Only those places are subscribed to on AISStream, so an
+# inland location costs no bandwidth and simply has no vessels near it. With
+# nothing opted in, the proxy's own coordinates are used — what this endpoint
+# has always done.
+_AIS_BOX_DEGREES = 1.0   # ~69 miles; see _ais_boxes() for why it stays wide
+
+
+def ship_locations():
+    """[(name, lat, lon, radius_mi), ...] for every location tracking ships."""
+    out = []
+    for name, entry in sorted(LOCATIONS.items()):
+        radius = entry.get("ship_radius_mi")
+        if radius is None:
+            continue
+        try:
+            radius = float(radius)
+        except (TypeError, ValueError):
+            _log_proxy_event(f"ships: bad ship_radius_mi for {name}, ignoring")
+            continue
+        out.append((name, float(entry.get("lat", LATITUDE)),
+                    float(entry.get("lon", LONGITUDE)), radius))
+    if not out:
+        out.append((DEFAULT_LOC_NAME, LATITUDE, LONGITUDE, float(SHIP_MAX_MILES)))
+    return out
+
+
+def ship_radius_for(loc):
+    """Display radius in miles for one location. A location that never opted in
+    still gets an answer — the shared vessel pool just won't hold anything near
+    it, so the list comes back empty on its own rather than by special case."""
+    entry = LOCATIONS.get(loc) or {}
+    try:
+        return float(entry.get("ship_radius_mi", SHIP_MAX_MILES))
+    except (TypeError, ValueError):
+        return float(SHIP_MAX_MILES)
+
+
+def _ais_boxes():
+    """AISStream bounding boxes — one per ship-tracking location.
+
+    Deliberately generous (±1°, ~69 miles) rather than sized to the display
+    radius. A vessel's name, type and length arrive in sporadic Type 5 messages
+    rather than with every position report, so tracking it long before it comes
+    into range is what lets _vessel_static_cache know what it is by the time it
+    matters — and handle_ships drops any vessel it can't name. Overlapping boxes
+    are harmless: _process_ais_message upserts by MMSI, so a duplicate delivery
+    costs a little CPU and changes nothing."""
+    d = _AIS_BOX_DEGREES
+    return [[[lat - d, lon - d], [lat + d, lon + d]]
+            for _name, lat, lon, _radius in ship_locations()]
 
 # Decades 4-9 each map to a single category, so bucketing by tens digit works.
 AIS_TYPE_NAMES = {
@@ -1749,15 +1808,16 @@ def _ais_listener():
         while True:
             try:
                 url = "wss://stream.aisstream.io/v0/stream"
+                # Boxes are fixed at connect time, so a change to which
+                # locations track ships needs a service restart, not just a
+                # config edit.
                 subscribe = {
                     "APIKey": AISSTREAM_KEY,
-                    "BoundingBoxes": [
-                        [[LATITUDE - 1.0, LONGITUDE - 1.0],
-                         [LATITUDE + 1.0, LONGITUDE + 1.0]]
-                    ],
+                    "BoundingBoxes": _ais_boxes(),
                     "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
                 }
-                print(f"AIS: connecting to {url}...")
+                print("AIS: connecting to {} for {}".format(
+                    url, ", ".join(n for n, _la, _lo, _r in ship_locations())))
                 async with websockets.connect(url) as ws:
                     await ws.send(json.dumps(subscribe))
                     print("AIS: subscribed, listening for ships")
@@ -1847,11 +1907,17 @@ def _prune_stale_ships():
 
 
 def handle_ships(params):
-    """Return list of nearby ships — filtered by size and distance.
+    """Return list of nearby ships — filtered by size and distance from
+    ?loc=<name>, or the proxy's own location when none is given.
+
     Static fields (name/type/type_name/callsign/length) missing from the
     live AIS feed are filled in from the persistent vessel_static cache,
     so vessels we've seen before always carry full context even when
     today's WebSocket session hasn't received a fresh Type 5 message."""
+    lat0, lon0, _bbox, loc = resolve_location(params)
+    if lat0 is None:
+        return 400, loc
+    max_miles = ship_radius_for(loc)
     _prune_stale_ships()
     with _ships_lock:
         live_snapshot = [dict(s) for s in _ships.values()]
@@ -1878,11 +1944,11 @@ def handle_ships(params):
         lon = s.get("lon", 0)
         if not lat or not lon:
             continue
-        dist = _distance_miles(SHIP_CENTER_LAT, SHIP_CENTER_LON, lat, lon)
-        if dist > SHIP_MAX_MILES:
+        dist = _distance_miles(lat0, lon0, lat, lon)
+        if dist > max_miles:
             continue
         dist_mi = round(dist, 1)
-        log_ship({**s, "distance_mi": dist_mi})
+        log_ship({**s, "distance_mi": dist_mi}, loc=loc)
         ship_list.append({
             "name":        s.get("name", ""),
             "type":        s.get("type", 0),
@@ -1941,23 +2007,26 @@ def handle_time(params):
 
 
 def handle_ships_debug(params):
-    """Return raw ship data without filtering, for diagnostics."""
+    """Return raw ship data without filtering, for diagnostics. Distances are
+    measured from ?loc=<name>, like /api/ships."""
+    lat0, lon0, _bbox, loc = resolve_location(params)
+    if lat0 is None:
+        return 400, loc
     _prune_stale_ships()
     with _ships_lock:
         ships_raw = list(_ships.values())
     ships_raw.sort(key=lambda s: _distance_miles(
-        SHIP_CENTER_LAT, SHIP_CENTER_LON,
-        s.get("lat", 0), s.get("lon", 0)
+        lat0, lon0, s.get("lat", 0), s.get("lon", 0)
     ))
     annotated = []
     for s in ships_raw[:20]:
         d = dict(s)
         d["distance_mi"] = round(_distance_miles(
-            SHIP_CENTER_LAT, SHIP_CENTER_LON,
-            s.get("lat", 0), s.get("lon", 0)
+            lat0, lon0, s.get("lat", 0), s.get("lon", 0)
         ), 1)
         annotated.append(d)
-    return 200, json.dumps({"ships": annotated, "total": len(ships_raw)}).encode()
+    return 200, json.dumps({"ships": annotated, "total": len(ships_raw),
+                            "loc": loc}).encode()
 
 
 # ---------------------------------------------------------------------------

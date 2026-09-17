@@ -322,6 +322,13 @@ Returns nearby vessels from the live AIS WebSocket feed (aisstream.io). Filters:
 
 Static fields (`name`, `type`, `type_name`, `callsign`, `length`) missing from the live feed are filled in from the persistent `vessel_static` table in `sightings.db`. Each time we receive a Type 5 static report we UPSERT those fields for that MMSI, so vessels we've seen before always carry full context — even after a proxy restart, and even if today's WebSocket session hasn't received a fresh Type 5 yet. `destination` is intentionally **not** cached: it's voyage data and changes every trip, so we'd risk showing a stale port.
 
+
+Takes an optional `?loc=<name>`: distances are measured from that location and filtered by its radius. Without one, the proxy's own coordinates are used.
+
+**Ship tracking is opt-in per location.** A location tracks vessels only if its `locations` entry sets `ship_radius_mi` (its display radius in miles); the AIS subscription covers exactly those places, so an inland location costs no bandwidth and simply has nothing near it. If no location opts in, the proxy's own coordinates are used, which is the historical behavior. A location that never opted in still answers — the shared vessel pool just holds nothing within range, so the list comes back empty on its own.
+
+The AIS bounding boxes are deliberately wider (±1°, ~69 miles) than any display radius: a vessel's name, type and length arrive in sporadic Type 5 messages rather than with every position report, so tracking it well before it comes into range is what lets the static cache identify it by the time it matters — and an unnamed vessel is dropped from the response entirely. Because the subscription is sent when the WebSocket connects, **changing which locations track ships requires a service restart**, not just a config edit.
+
 **Query parameters:** none
 
 **Cache TTL:** none (live in-memory snapshot from the WebSocket listener)
