@@ -3,6 +3,7 @@
 device/secrets.py
 device/settings.toml
 proxy/config.json
+proxy/local_hooks.py
 
 # Runtime logs / state
 proxy/device.log

@@ -1,0 +1,29 @@
+"""Site-local integrations for this proxy. OPTIONAL.
+
+Copy to `local_hooks.py` (gitignored) on a host that wants proxy events
+forwarded somewhere machine-specific — a dashboard, a notifier, a metrics
+sink. The proxy imports this module if it exists and calls `on_event` for
+each event; anything not handled should simply be ignored.
+
+Keep handlers quick and failure-tolerant. The proxy wraps every call in a
+try/except and will log and continue, but a hook that blocks for a long time
+still delays the request that triggered it.
+
+Events currently emitted:
+
+    flightaware_usage   fields: count (billable calls used this month),
+                        limit (the configured monthly cap)
+                        Fired on every reserve and refund, i.e. whenever the
+                        running total changes.
+
+Budget thresholds and geo-check enforcement are already written to the system
+journal by the proxy itself (via syslog, ident "matrix-portal-proxy"), so a
+host whose tooling watches the journal needs no hook at all for those.
+"""
+
+
+def on_event(event, fields):
+    if event == "flightaware_usage":
+        pct = round(100 * fields["count"] / fields["limit"]) if fields["limit"] else 0
+        print(f"[local_hooks] FlightAware budget {pct}% used "
+              f"({fields['count']} of {fields['limit']})")

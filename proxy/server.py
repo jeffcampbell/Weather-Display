@@ -109,6 +109,38 @@ def resolve_location(params):
     )
 
 # ---------------------------------------------------------------------------
+# Site-local hooks
+# ---------------------------------------------------------------------------
+# A deployment can drop a `local_hooks.py` next to this file to receive proxy
+# events — budget usage, and whatever else gets added — and forward them to
+# whatever that particular machine cares about: a dashboard, a notifier, a
+# metrics sink. Such integrations are specific to one host, so they are
+# deliberately NOT part of this repository (local_hooks.py is gitignored); see
+# local_hooks.py.example for the interface.
+#
+# Everything here is best-effort by design: no module, no `on_event`, a slow
+# hook or an exception inside one must never affect serving. The proxy states
+# facts; it holds no opinion about alerting policy.
+try:
+    import local_hooks as _local_hooks
+except ImportError:
+    _local_hooks = None
+
+
+def notify_local(event, **fields):
+    """Hand one event to the site-local hook module, if this host has one."""
+    if _local_hooks is None:
+        return
+    handler = getattr(_local_hooks, "on_event", None)
+    if handler is None:
+        return
+    try:
+        handler(event, fields)
+    except Exception as e:
+        print(f"local_hooks {event} failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
 
@@ -571,10 +603,19 @@ _AIRPORT_LON = _load_airport_coords()
 _geo_check_lock = Lock()
 _geo_check_stats = {"total": 0, "flagged": 0, "unknown": 0, "enforced": 0}
 
-# Also opened by other alert paths in this file (harmless if called more than
-# once) — routes actual geo-check-triggered spend to the system journal so
-# it's visible in ops-review's Log tab, not just this proxy's own device.log.
+# Notable events also go to the system journal, not just this proxy's own
+# device.log — the journal is where a host's existing log tooling already
+# looks, so the proxy can state a fact and stay out of alerting policy.
 syslog.openlog(ident="matrix-portal-proxy")
+
+# Budget-approaching warnings: the first time this month's usage crosses each
+# configured threshold, say so on the system journal. The highest configured
+# threshold logs at ERR, earlier ones at WARNING. State is in-memory only, so
+# a restart right after a crossing can re-log it once — harmless, since
+# journal-watching tools group by message text and apply their own cooldown.
+FLIGHTAWARE_ALERT_THRESHOLDS = sorted(
+    int(t) for t in _config.get("flightaware_alert_thresholds", [1000, 1800]))
+_fa_alert_logged = set()   # {(period, threshold), ...} logged this process
 
 # Optional schedule gate. When the applicable flag file exists and reads as
 # "off" (or 0/false/no/free), FlightAware is skipped entirely for that scope —
@@ -634,6 +675,28 @@ def _fa_usage_read():
     return d
 
 
+def _flightaware_check_thresholds(count, limit):
+    """Warn on the system journal the first time usage crosses each configured
+    threshold this month. Purely informational — it never gates a call."""
+    period = _fa_period()
+    for i, threshold in enumerate(FLIGHTAWARE_ALERT_THRESHOLDS):
+        if count < threshold:
+            continue
+        key = (period, threshold)
+        if key in _fa_alert_logged:
+            continue
+        _fa_alert_logged.add(key)
+        pct = round(100 * threshold / limit) if limit else 0
+        priority = (syslog.LOG_ERR
+                    if i == len(FLIGHTAWARE_ALERT_THRESHOLDS) - 1
+                    else syslog.LOG_WARNING)
+        syslog.syslog(
+            priority,
+            f"FlightAware AeroAPI usage crossed {threshold} of {limit} calls "
+            f"this month ({pct}%) — {count} used so far",
+        )
+
+
 def _fa_usage_write(d):
     try:
         _FA_USAGE_PATH.write_text(json.dumps(d))
@@ -669,7 +732,12 @@ def _flightaware_reserve(loc=""):
         d["count"] = d.get("count", 0) + 1
         d["by_loc"][key] = d["by_loc"].get(key, 0) + 1
         _fa_usage_write(d)
-        return True
+        count = d["count"]
+    # Outside the lock: neither the journal nor a site-local hook should be
+    # able to stall a request that's holding the usage file.
+    _flightaware_check_thresholds(count, FLIGHTAWARE_MONTHLY_LIMIT)
+    notify_local("flightaware_usage", count=count, limit=FLIGHTAWARE_MONTHLY_LIMIT)
+    return True
 
 
 def _flightaware_refund(loc=""):
@@ -685,6 +753,8 @@ def _flightaware_refund(loc=""):
             if d["by_loc"].get(key, 0) > 0:
                 d["by_loc"][key] -= 1
             _fa_usage_write(d)
+        count = d.get("count", 0)
+    notify_local("flightaware_usage", count=count, limit=FLIGHTAWARE_MONTHLY_LIMIT)
 
 
 def _flightaware_note_exhausted():
@@ -876,9 +946,9 @@ def handle_route(params):
                     f"loc={loc or 'default'} — paid FlightAware call triggered by the geo check"
                 )
                 _log_proxy_event(geo_msg)
-                # Also to syslog (not just device.log) so this shows up in
-                # ops-review's Log tab, same mechanism as the FlightAware
-                # budget-threshold alerts.
+                # Also to the system journal, same as the budget-threshold
+                # alerts — this is real money being spent, so it belongs
+                # somewhere a host's log tooling can see it.
                 syslog.syslog(syslog.LOG_WARNING, geo_msg)
             fa_url = f"https://aeroapi.flightaware.com/aeroapi/flights/{callsign}"
             fa_status, fa_data = fetch(fa_url, headers={"x-apikey": FLIGHTAWARE_KEY})

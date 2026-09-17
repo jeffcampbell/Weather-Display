@@ -671,6 +671,27 @@ Feeds come from the `calendar_ics_urls` config block. **Each URL is a secret** �
 
 ---
 
+## Site-local hooks (`local_hooks.py`)
+
+Some integrations only make sense on one machine — a dashboard that happens to run on the same Pi, a notifier, a metrics sink. Rather than carry that in this repo, the proxy offers a hook point: drop a `local_hooks.py` next to `server.py` and it will be imported at startup and called for each event.
+
+```python
+# proxy/local_hooks.py   (gitignored; see local_hooks.py.example)
+def on_event(event, fields):
+    if event == "flightaware_usage":
+        ...   # forward fields["count"] / fields["limit"] wherever you like
+```
+
+| Event | Fields | Fired when |
+|-------|--------|-----------|
+| `flightaware_usage` | `count`, `limit` | A billable FlightAware call is reserved or refunded — i.e. whenever the month's running total changes |
+
+**Best-effort by contract.** No module, no `on_event`, or an exception inside the hook is caught and logged; serving is never affected. Hooks are called outside the usage lock, but a hook that blocks still delays the request that triggered it, so keep them quick.
+
+**You may not need one.** Budget-threshold crossings and geo-check enforcement are already written to the **system journal** via syslog under the ident `matrix-portal-proxy`, at `WARNING` (or `ERR` for the highest threshold). Any host tooling that watches the journal picks those up with no hook at all.
+
+---
+
 ## Configuration (`config.json`)
 
 ```json
@@ -697,6 +718,7 @@ Feeds come from the `calendar_ics_urls` config block. **Each URL is a secret** �
 | `opensky_client_id` / `opensky_client_secret` | `/api/planes`, `/api/route`, `/api/aircraft` | OpenSky OAuth2 client credentials (generate at opensky-network.org → Account → API Client). The proxy exchanges them for short-lived bearer tokens automatically. |
 | `aisstream_key` | `/api/ships` | AISStream.io WebSocket API key. If missing, ship tracking is disabled. |
 | `flightaware_key` | `/api/route` | FlightAware AeroAPI key (paid). Overrides the free OpenSky / adsbdb route by default (see `flightaware_override_free_routes`); if missing, those are the only route sources. |
+| `flightaware_alert_thresholds` | syslog | Billable-call counts at which a budget warning is written to the system journal, once each per month. Highest logs at `ERR`, earlier at `WARNING`. Informational only — they never gate a call. Default `[1000, 1800]`. |
 | `flightaware_override_free_routes` | `/api/route` | When `true` (default), FlightAware overrides a route the free DBs already resolved, fixing stale "right tail, wrong route" answers from reused callsigns. `false` reverts to consulting FlightAware only when the free sources found nothing. |
 | `device_secret` | every endpoint | Shared secret the device must send as `X-Device-Secret`. Leave blank to disable the check (recommended only when the proxy is LAN-only). |
 | `calendar_ics_urls` | `/api/calendar` | Private `.ics` feed URLs (Google Calendar → Settings → *Integrate calendar* → **Secret address in iCal format**), as bare strings or `{"url": ...}` objects. Events from every feed are pooled. **Each URL is a password** — treat `config.json` accordingly. Empty list disables the endpoint. |
