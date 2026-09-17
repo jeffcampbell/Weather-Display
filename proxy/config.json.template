@@ -31,6 +31,10 @@
   "_route_code_aliases_comment": "Airport codes to rewrite in a resolved /api/route leg, applied uniformly across all upstream sources (OpenSky, adsbdb, FlightAware) right before the route is cached and returned. Exact, case-sensitive match on the code as the source reports it (which may be ICAO, e.g. KDJT, rather than IATA). Default rewrites DJT -> PBI (its former airport code).",
   "route_code_aliases": {"DJT": "PBI"},
 
+  "_route_geo_check_comment": "Geographic plausibility check on the free-tier route (OpenSky/adsbdb): a narrower, self-limiting alternative to flightaware_override_free_routes for deciding when to pay for FlightAware. Looks up origin/destination ICAO longitudes in airport_coords.csv; if the observer's longitude doesn't fall between them (plus route_geo_check_deadband_deg slack), the free route is treated as likely stale. Unknown airports or a disabled check always fail open. route_geo_check_mode: 'off' disables it; 'observe' (default) computes and logs but never gates spend; 'enforce' lets a flagged verdict trigger a paid call. Ship in 'observe', check /api/health route_geo_checks_* plus 'route geo-check:' lines in device.log for at least a week, then flip to 'enforce' once route_geo_check_deadband_deg looks right.",
+  "route_geo_check_mode": "observe",
+  "route_geo_check_deadband_deg": 0.5,
+
   "_device_secret_comment": "Shared secret the device must send as X-Device-Secret on POST /api/devicelog. Leave blank to disable the check.",
   "device_secret": "",
 
