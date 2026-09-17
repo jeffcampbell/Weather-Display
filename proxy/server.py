@@ -157,6 +157,13 @@ _cache_lock = Lock()
 ROUTE_CACHE_PREFIX = "route:"   # cache keys under this prefix persist to disk
 ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
 ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
+
+# Airport-code aliases applied to resolved routes just before they're cached
+# and returned. An exact code from any upstream source (OpenSky/adsbdb/
+# FlightAware) is rewritten to its alias, so the substitution is uniform
+# regardless of which source resolved the leg. Keyed by the code as the source
+# reports it. Default rewrites DJT -> PBI; override with "route_code_aliases".
+ROUTE_CODE_ALIASES = _config.get("route_code_aliases", {"DJT": "PBI"})
 _started_at = time.time()
 
 # Consecutive OpenSky 429s; reset on the next successful upstream fetch.
