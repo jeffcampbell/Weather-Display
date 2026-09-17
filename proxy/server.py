@@ -2910,17 +2910,21 @@ DEPRECATED_ROUTES = {
     "/api/v2/forecast": ("/api/forecast", handle_forecast),
     "/api/v2/sky":      ("/api/sky",      handle_sky),
 }
-_deprecated_logged = {}        # path -> last time we logged a hit
+_deprecated_logged = {}        # (path, client) -> last time we logged a hit
 _DEPRECATED_LOG_INTERVAL = 3600
 
 
 def note_deprecated_path(path, replacement, client):
-    """Log a deprecated-path hit at most once an hour per path, so a display
-    polling every minute leaves one line instead of sixty."""
+    """Log a deprecated-path hit at most once an hour per (path, caller), so a
+    display polling every minute leaves one line instead of sixty. Keyed by
+    caller as well as path on purpose: the point of this log is to find out
+    *who* still needs migrating, and a single throttle per path would let one
+    chatty client hide every other one for the hour."""
     now = time.time()
-    if now - _deprecated_logged.get(path, 0) < _DEPRECATED_LOG_INTERVAL:
+    key = (path, client)
+    if now - _deprecated_logged.get(key, 0) < _DEPRECATED_LOG_INTERVAL:
         return
-    _deprecated_logged[path] = now
+    _deprecated_logged[key] = now
     _log_proxy_event("deprecated path {} used by {} — use {}".format(
         path, client, replacement))
 
