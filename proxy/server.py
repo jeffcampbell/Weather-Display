@@ -1287,10 +1287,20 @@ def handle_tides(params):
     device's display never has to fall back to N/A. Fetching a full month
     at once and caching it for a day also means an extended NOAA outage
     (like the one that prompted this) has to last nearly a month before
-    the device runs out of valid cached predictions."""
+    the device runs out of valid cached predictions.
+
+    The station comes from an explicit ?station=, else the station configured
+    on ?loc=<name>, else the global noaa_station. Caching is keyed on the
+    station itself rather than the location, so two locations sharing a station
+    share one cached month."""
     import datetime
 
-    station = params.get("station", [NOAA_STATION])[0]
+    station = params.get("station", [""])[0].strip()
+    if not station:
+        _lat, _lon, _bbox, loc = resolve_location(params)
+        if _lat is None:
+            return 400, loc
+        station = station_for(loc)
     cache_key = f"tides:{station}"
     cached = cache_get(cache_key, max_age_sec=TIDE_CACHE_SEC)
     if cached:
@@ -1739,6 +1749,14 @@ def ship_locations():
     if not out:
         out.append((DEFAULT_LOC_NAME, LATITUDE, LONGITUDE, float(SHIP_MAX_MILES)))
     return out
+
+
+def station_for(loc):
+    """NOAA station for a location — its own `station`, else the global
+    noaa_station. Tide stations are per-coastline, so a second display on a
+    different shore needs its own or it shows the wrong water."""
+    entry = LOCATIONS.get(loc) or {}
+    return str(entry.get("station") or NOAA_STATION)
 
 
 def ship_radius_for(loc):

@@ -236,6 +236,9 @@ station, in the shape NOAA's own `datagetter` returns. The device fetches this
 instead of calling NOAA directly, so a slow or hung NOAA connection only ties
 up one Pi thread instead of tripping the device's watchdog.
 
+
+Takes an optional `?loc=<name>`, whose entry may set its own `station` — tide stations are per-coastline, so a display on a different shore needs its own or it shows the wrong water. Precedence: explicit `?station=` > the location's `station` > the global `noaa_station`. The cache is keyed on the station itself, so two locations sharing one station share a cached month.
+
 **Query parameters:**
 
 | Param | Required | Description |
