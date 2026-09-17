@@ -63,7 +63,7 @@ LATITUDE = float(_config.get("latitude", 42.36))
 LONGITUDE = float(_config.get("longitude", -71.06))
 BBOX = float(_config.get("bbox", 0.1))
 
-# Named locations for the v2 API. v1 endpoints ignore this and continue using
+# Named locations, selected per request with ?loc=<name>. Omitting loc yields
 # the LATITUDE/LONGITUDE/BBOX globals above — leaving v1 behavior untouched.
 LOCATIONS = _config.get("locations") or {}
 
@@ -84,16 +84,24 @@ _DEFAULT_STATUS_PROVIDERS = [
 STATUS_PROVIDERS = _config.get("status_providers") or _DEFAULT_STATUS_PROVIDERS
 
 
+# Name reported for the proxy's own latitude/longitude/bbox — the location a
+# request gets when it doesn't name one.
+DEFAULT_LOC_NAME = "default"
+
+
 def resolve_location(params):
     """Resolve ?loc=<name> against the LOCATIONS config block. Returns
     (lat, lon, bbox, name) on success or (None, None, None, error_body) on
-    failure, where error_body is a bytes JSON payload ready to return."""
+    failure, where error_body is a bytes JSON payload ready to return.
+    Omitting loc is valid and yields the proxy's default location."""
     loc = params.get("loc", [""])[0].strip()
     if not loc:
-        return None, None, None, json.dumps({
-            "error": "missing loc",
-            "available": sorted(LOCATIONS.keys()),
-        }).encode()
+        # No loc given: the proxy's own latitude/longitude/bbox, under the name
+        # "default". This is what the endpoints have always done when asked
+        # without a location, so a caller that doesn't care about locations
+        # never has to learn they exist. An *unknown* name is still an error —
+        # quietly serving a different coastline would be worse than a 400.
+        return LATITUDE, LONGITUDE, BBOX, DEFAULT_LOC_NAME
     entry = LOCATIONS.get(loc)
     if not entry:
         return None, None, None, json.dumps({
@@ -152,6 +160,18 @@ _started_at = time.time()
 # Consecutive OpenSky 429s; reset on the next successful upstream fetch.
 # Used by handle_planes to escalate the back-off window from 1h → 2h.
 _opensky_429_streak = 0
+
+
+# One cache window for every location. At 90s a display polling each minute
+# sees a cached answer every other poll, which is the trade that keeps two
+# locations on one OpenSky account from drawing 429s.
+PLANES_CACHE_TTL = 90
+
+
+def _opensky_backoff_secs():
+    """How long to sit out after a 429: 1h for the first in a streak, 2h once
+    the next attempt is throttled too."""
+    return 7200 if _opensky_429_streak >= 2 else 3600
 
 
 def cache_get(key, max_age_sec):
@@ -446,21 +466,43 @@ def opensky_headers():
 # Register new handlers in the ROUTES dict at the bottom.
 
 def handle_planes(params):
-    """Fetch aircraft in bounding box from OpenSky and return a slim
-    device-friendly response — only the fields the device actually uses,
-    with on-ground / no-callsign rows already filtered out. Cached 30s.
+    """Fetch aircraft in a bounding box from OpenSky and return a slim
+    device-friendly response — only the fields the device actually uses, with
+    on-ground / no-callsign rows already filtered out.
 
-    Cuts the JSON payload roughly in half vs. raw OpenSky, which matters
-    a lot to the SAMD51 device: smaller parse = less heap fragmentation."""
+    Cuts the JSON payload roughly in half vs. raw OpenSky, which matters a lot
+    to the SAMD51 device: smaller parse = less heap fragmentation.
 
-    cache_key = "planes"
-    cached = cache_get(cache_key, max_age_sec=55)
+    The box comes from ?loc=<name>, or the proxy's own location when none is
+    given. Raw ?lat=/?lon=/?bbox= still override both, and are cached under
+    their coordinates so one caller's ad-hoc box can't be served to another.
+    This is the single implementation behind both /api/planes and the
+    deprecated /api/v2/planes."""
+    global _opensky_429_streak
+
+    lat, lon, bbox, loc = resolve_location(params)
+    if lat is None:
+        return 400, loc
+
+    if any(k in params for k in ("lat", "lon", "bbox")):
+        lat = float(params.get("lat", [lat])[0])
+        lon = float(params.get("lon", [lon])[0])
+        bbox = float(params.get("bbox", [bbox])[0])
+        cache_key = f"planes:{lat},{lon},{bbox}"
+    else:
+        cache_key = f"planes:{loc}"
+
+    cached = cache_get(cache_key, max_age_sec=PLANES_CACHE_TTL)
     if cached:
         return 200, cached
 
-    lat = float(params.get("lat", [LATITUDE])[0])
-    lon = float(params.get("lon", [LONGITUDE])[0])
-    bbox = float(params.get("bbox", [BBOX])[0])
+    # A 429 throttles the whole OpenSky account, not one bounding box, so once
+    # a streak is running don't let a second location go ask again — it would
+    # only burn the remaining credits and deepen the backoff.
+    if _opensky_429_streak > 0:
+        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
+        cache_set(cache_key, empty, age_override=_opensky_backoff_secs())
+        return 200, empty
 
     url = (
         f"https://opensky-network.org/api/states/all"
@@ -469,18 +511,15 @@ def handle_planes(params):
     )
     status, data = fetch(url, headers=opensky_headers())
 
-    global _opensky_429_streak
-
     if status == 429:
         _opensky_429_streak += 1
-        # First 429 in a streak: back off 1h. Successive 429s (when the
-        # next upstream attempt also gets throttled) escalate to 2h to be
-        # a better citizen to the OpenSky API.
-        backoff_secs = 7200 if _opensky_429_streak >= 2 else 3600
+        # First 429 in a streak backs off 1h; successive ones escalate to 2h,
+        # to be a better citizen to the OpenSky API.
+        backoff_secs = _opensky_backoff_secs()
         empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
         cache_set(cache_key, empty, age_override=backoff_secs)
-        _log_proxy_event("OpenSky 429 #{} — backing off {}h".format(
-            _opensky_429_streak, backoff_secs // 3600))
+        _log_proxy_event("OpenSky 429 #{} (loc={}) — backing off {}h".format(
+            _opensky_429_streak, loc, backoff_secs // 3600))
         return 200, empty
 
     if status != 200:
@@ -519,25 +558,15 @@ def handle_planes(params):
                 ]
                 planes.append(entry)
                 log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4],
-                          p_lat, p_lon, loc="default")
+                          p_lat, p_lon, loc=loc, obs_lat=lat, obs_lon=lon)
             except Exception:
                 continue                                 # skip malformed rows, keep the rest
         body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
-        cache_set(cache_key, body, age_override=55)
+        cache_set(cache_key, body, age_override=PLANES_CACHE_TTL)
         return 200, body
     except Exception as e:
         return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
 
-
-ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
-ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
-
-# Airport-code aliases applied to resolved routes just before they're cached
-# and returned. An exact code from any upstream source (OpenSky/adsbdb/
-# FlightAware) is rewritten to its alias, so the substitution is uniform
-# regardless of which source resolved the leg. Keyed by the code as the source
-# reports it. Default rewrites DJT -> PBI; override with "route_code_aliases".
-ROUTE_CODE_ALIASES = _config.get("route_code_aliases", {"DJT": "PBI"})
 
 # --- FlightAware AeroAPI monthly spend cap ---------------------------------
 # AeroAPI bills per successful /flights/{ident} query (~1¢ each). Free sources
@@ -1041,16 +1070,24 @@ def handle_aircraft(params):
 
 def handle_forecast(params):
     """Fetch 3-day weather forecast from OpenWeatherMap 5-day forecast.
-    Returns today, tomorrow, and day-after with hi/lo/condition/wind.
-    Cached for 1 hour per (lat,lon)."""
+    Returns today, tomorrow, and day-after with hi/lo/condition/wind. Cached
+    for an hour per location. Takes ?loc=<name>, the proxy's own location when
+    none is given, or raw ?lat=/?lon= overrides. Single implementation behind
+    both /api/forecast and the deprecated /api/v2/forecast."""
 
     if not OWM_KEY:
         return 500, json.dumps({"error": "no openweather_key configured"}).encode()
 
-    lat = float(params.get("lat", [LATITUDE])[0])
-    lon = float(params.get("lon", [LONGITUDE])[0])
+    lat, lon, _bbox, loc = resolve_location(params)
+    if lat is None:
+        return 400, loc
 
-    cache_key = f"forecast:{lat},{lon}"
+    if any(k in params for k in ("lat", "lon")):
+        lat = float(params.get("lat", [lat])[0])
+        lon = float(params.get("lon", [lon])[0])
+        cache_key = f"forecast:{lat},{lon}"
+    else:
+        cache_key = f"forecast:{loc}"
     cached = cache_get(cache_key, max_age_sec=3600)
     if cached:
         return 200, cached
@@ -1306,123 +1343,16 @@ def handle_tides(params):
 
 
 # ---------------------------------------------------------------------------
-# v2 API handlers
+# Location-aware handlers
 # ---------------------------------------------------------------------------
-# v2 adds per-location support for planes + forecast, keyed by named entries
-# in the "locations" config block. v1 handlers above are untouched so existing
-# devices keep working unchanged. Ships and route/aircraft/time/health/devicelog
-# are not duplicated in v2 — devices using v2 still hit the v1 versions for
-# those (location-independent or single-bbox by design).
-
-V2_PLANES_CACHE_TTL = 90  # vs. 55s in v1 — halves OpenSky burn per location
-
-
-def handle_v2_planes(params):
-    """Per-location aircraft fetch. Same response shape as /api/planes."""
-
-    lat, lon, bbox, loc_or_err = resolve_location(params)
-    if lat is None:
-        return 400, loc_or_err
-
-    cache_key = f"v2:planes:{loc_or_err}"
-    cached = cache_get(cache_key, max_age_sec=V2_PLANES_CACHE_TTL)
-    if cached:
-        return 200, cached
-
-    # Respect the v1 OpenSky backoff streak — if the home location is being
-    # throttled, the second location is on the same OAuth2 quota and will hit
-    # 429s too. Cache an empty rate_limited body per loc so we don't burn the
-    # account's remaining credits hammering upstream.
-    if _opensky_429_streak > 0:
-        backoff_secs = 7200 if _opensky_429_streak >= 2 else 3600
-        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
-        cache_set(cache_key, empty, age_override=backoff_secs)
-        return 200, empty
-
-    url = (
-        f"https://opensky-network.org/api/states/all"
-        f"?lamin={lat-bbox}&lomin={lon-bbox}"
-        f"&lamax={lat+bbox}&lomax={lon+bbox}"
-    )
-    status, data = fetch(url, headers=opensky_headers())
-
-    if status == 429:
-        # Mirror v1's backoff: empty rate_limited body, 1h floor. We don't
-        # mutate _opensky_429_streak from v2 — v1 owns that counter.
-        empty = json.dumps({"time": 0, "planes": [], "rate_limited": True}).encode()
-        cache_set(cache_key, empty, age_override=3600)
-        _log_proxy_event(f"OpenSky 429 on v2 planes (loc={loc_or_err}) — backing off 1h")
-        return 200, empty
-
-    if status != 200:
-        return 200, json.dumps({"time": 0, "planes": [], "upstream_error": status}).encode()
-
-    try:
-        raw = json.loads(data)
-        states = raw.get("states") or []
-        planes = []
-        for s in states:
-            try:
-                if s[8]:
-                    continue
-                callsign = (s[1] or "").strip()
-                if not callsign:
-                    continue
-                alt_m = s[7] or s[13] or 0
-                entry = [
-                    callsign[:8],
-                    s[0] or "",
-                    int(alt_m * 3.281),
-                    int((s[9] or 0) * 1.944),
-                    int(s[10] or 0),
-                    int(s[11] or 0),
-                ]
-                planes.append(entry)
-                # The v1 path has always logged sightings; this one never did,
-                # so every named-location display was invisible in the planes
-                # table. Distances are measured from this location, not the
-                # proxy's globals. OpenSky state vector: s[5]=lon, s[6]=lat.
-                log_plane(callsign[:8], s[0] or "", entry[2], entry[3], entry[4],
-                          s[6] or 0, s[5] or 0, loc=loc_or_err,
-                          obs_lat=lat, obs_lon=lon)
-            except Exception:
-                continue
-        body = json.dumps({"time": raw.get("time", 0), "planes": planes}).encode()
-        cache_set(cache_key, body, age_override=V2_PLANES_CACHE_TTL)
-        return 200, body
-    except Exception as e:
-        return 200, json.dumps({"time": 0, "planes": [], "error": str(e)}).encode()
-
-
-def handle_v2_forecast(params):
-    """Per-location 3-day forecast. Same response shape as /api/forecast."""
-
-    if not OWM_KEY:
-        return 500, json.dumps({"error": "no openweather_key configured"}).encode()
-
-    lat, lon, _bbox, loc_or_err = resolve_location(params)
-    if lat is None:
-        return 400, loc_or_err
-
-    cache_key = f"v2:forecast:{loc_or_err}"
-    cached = cache_get(cache_key, max_age_sec=3600)
-    if cached:
-        return 200, cached
-
-    # Delegate to the v1 forecast handler by passing lat/lon overrides — it
-    # already accepts those and keys its own cache on (lat,lon). We then
-    # mirror the result into the v2 cache so v2 callers don't have to wait
-    # on a v1 cache miss next time.
-    status, body = handle_forecast({"lat": [str(lat)], "lon": [str(lon)]})
-    if status == 200:
-        cache_set(cache_key, body, age_override=3600)
-    return status, body
-
-
+# Every endpoint below takes an optional ?loc=<name> resolved against the
+# `locations` config block; without one it serves the proxy's own coordinates.
+# The /api/v2/* paths are deprecated aliases for the same handlers, kept only
+# until the displays stop calling them — see DEPRECATED_ROUTES.
 # ---------------------------------------------------------------------------
-# v2 Sky — naked-eye planet visibility for the upcoming evening, with cloud
+# Sky — naked-eye planet visibility for the upcoming evening, with cloud
 # verdict from the location's forecast. Powered by JPL DE421 via skyfield.
-# Skyfield is lazy-loaded so a missing install only affects /api/v2/sky;
+# Skyfield is lazy-loaded so a missing install only affects /api/sky;
 # all other endpoints stay up.
 # ---------------------------------------------------------------------------
 
@@ -1550,7 +1480,7 @@ def _tonight_clouds(lat, lon):
         return 800, "Clear"
 
 
-def handle_v2_sky(params):
+def handle_sky(params):
     """Tonight's naked-eye planet visibility for a named location, bundled
     with a cloud verdict. Same response is good for the whole evening (6h
     cache) — planet altaz changes slowly and we never need sub-minute
@@ -1560,7 +1490,7 @@ def handle_v2_sky(params):
     if lat is None:
         return 400, loc_or_err
 
-    cache_key = f"v2:sky:{loc_or_err}"
+    cache_key = f"sky:{loc_or_err}"
     cached = cache_get(cache_key, max_age_sec=15 * 60)   # 15 min — sun/moon move
     if cached:
         return 200, cached
@@ -2952,15 +2882,14 @@ def handle_calendar(params):
     return 200, body
 
 
+# Canonical routes. Location-aware ones take an optional ?loc=<name>.
 ROUTES = {
     "/api/planes":      handle_planes,
     "/api/route":       handle_route,
     "/api/aircraft":    handle_aircraft,
     "/api/forecast":    handle_forecast,
     "/api/tides":       handle_tides,
-    "/api/v2/planes":   handle_v2_planes,
-    "/api/v2/forecast": handle_v2_forecast,
-    "/api/v2/sky":      handle_v2_sky,
+    "/api/sky":         handle_sky,
     "/api/ships":       handle_ships,
     "/api/ships/debug": handle_ships_debug,
     "/api/sightings":   handle_sightings,
@@ -2970,6 +2899,30 @@ ROUTES = {
     "/api/calendar":    handle_calendar,
     "/api/time":        handle_time,
 }
+
+
+# Deprecated path aliases. /api/v2/* meant nothing more than "accepts ?loc=",
+# which every canonical path above now does, so these exist only until the
+# displays stop calling them. Each hit is logged (throttled) so we can tell
+# when that has actually happened rather than guessing.
+DEPRECATED_ROUTES = {
+    "/api/v2/planes":   ("/api/planes",   handle_planes),
+    "/api/v2/forecast": ("/api/forecast", handle_forecast),
+    "/api/v2/sky":      ("/api/sky",      handle_sky),
+}
+_deprecated_logged = {}        # path -> last time we logged a hit
+_DEPRECATED_LOG_INTERVAL = 3600
+
+
+def note_deprecated_path(path, replacement, client):
+    """Log a deprecated-path hit at most once an hour per path, so a display
+    polling every minute leaves one line instead of sixty."""
+    now = time.time()
+    if now - _deprecated_logged.get(path, 0) < _DEPRECATED_LOG_INTERVAL:
+        return
+    _deprecated_logged[path] = now
+    _log_proxy_event("deprecated path {} used by {} — use {}".format(
+        path, client, replacement))
 
 
 # ---------------------------------------------------------------------------
@@ -3000,6 +2953,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         handler = ROUTES.get(path)
+        if not handler:
+            alias = DEPRECATED_ROUTES.get(path)
+            if alias:
+                replacement, handler = alias
+                note_deprecated_path(path, replacement, self.client_address[0])
         if handler:
             status, body = handler(params)
         else:

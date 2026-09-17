@@ -298,47 +298,23 @@ endpoint (which usually stays up even when the predictions engine is down).
 
 ---
 
-## v2 API — named locations (`GET /api/v2/...`)
+## Locations (`?loc=<name>`)
 
-The v2 endpoints add per-location support keyed by a `?loc=<name>` parameter that
-resolves against the `locations` block in `config.json`. Each entry supplies
-`lat`, `lon`, and `bbox` (omitted keys fall back to the top-level globals). The v1
-endpoints are untouched and keep using the single `latitude`/`longitude`/`bbox`
-config, so existing devices keep working unchanged. Only planes, forecast, and sky
-are offered in v2 — ships/route/aircraft/time/health/devicelog are
-location-independent (or single-bbox by design) and are not duplicated.
+Every location-aware endpoint — `/api/planes`, `/api/forecast`, `/api/sky`, `/api/tides`, `/api/ships`, `/api/route` — takes an optional `?loc=<name>`, resolved against the `locations` block in `config.json`.
 
-**Common query parameter:**
+| `loc` | Behavior |
+|-------|----------|
+| omitted | The proxy's own `latitude`/`longitude`/`bbox`, reported as the location name `default`. This is what these endpoints have always done, so a caller that doesn't use locations needs no changes. |
+| a configured name | That entry's `lat`/`lon`/`bbox`; any key it omits falls back to the global value. |
+| an unknown name | **400** with the list of available names. Serving a different coastline silently would be worse than failing. |
 
-| Param | Required | Description |
-|-------|----------|-------------|
-| `loc` | yes | Name of an entry in the `locations` config block, e.g. `beach` |
+`/api/planes` and `/api/forecast` also still accept raw `?lat=`/`?lon=`/`?bbox=` overrides, which win over `loc` and are cached under their coordinates so one caller's ad-hoc box is never served to another.
 
-An unknown or missing `loc` returns `400` with `{"error": ..., "available": [...]}`
-listing the configured location names.
+Responses are keyed and cached per location, and aircraft sightings are recorded with the location that saw them (see `flightaware_used_by_loc` on `/api/health`).
 
-### `GET /api/v2/planes`
+### Deprecated: `/api/v2/*`
 
-Per-location aircraft fetch. Same response shape as `/api/planes`. Cached 90 s per
-location (vs. 55 s in v1) to halve OpenSky burn across locations, and it honours the
-same OpenSky 429 backoff as v1 (empty `rate_limited` body while throttled).
-
-### `GET /api/v2/forecast`
-
-Per-location 3-day forecast. Same response shape as `/api/forecast`. Requires
-`openweather_key`.
-
-### `GET /api/v2/sky`
-
-Tonight's naked-eye planet visibility for the location, plus sun, moon, and cloud
-outlook, computed locally with `skyfield`. Returns `503` with
-`{"error": "skyfield unavailable", ...}` if the astronomy dependency isn't installed
-on the proxy. Response includes `tonight` (ISO date), `cond`/`cloud_score` (from the
-evening forecast), `sun`/`moon` (altitude, azimuth, illumination/phase), and a
-`planets` array with each visible planet's best altitude/azimuth/time, rise/set, and
-magnitude-based brightness label.
-
----
+`/api/v2/planes`, `/api/v2/forecast` and `/api/v2/sky` are aliases for the canonical paths above and will be removed. "v2" only ever meant "accepts `?loc=`", which every canonical path now does. Each hit is logged (at most once an hour per path) with the caller's address, so the aliases can be deleted once nothing is using them.
 
 ## `GET /api/ships`
 
