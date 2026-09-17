@@ -155,6 +155,8 @@ def notify_local(event, **fields):
 _cache = {}       # key -> {"data": bytes, "time": float}
 _cache_lock = Lock()
 ROUTE_CACHE_PREFIX = "route:"   # cache keys under this prefix persist to disk
+ROUTE_CACHE_TTL_HIT = 3600      # a resolved route is good for an hour
+ROUTE_CACHE_TTL_MISS = 21600    # a miss is sticky for 6h — see handle_route
 _started_at = time.time()
 
 # Consecutive OpenSky 429s; reset on the next successful upstream fetch.
