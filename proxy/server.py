@@ -113,6 +113,7 @@ def resolve_location(params):
 
 _cache = {}       # key -> {"data": bytes, "time": float}
 _cache_lock = Lock()
+ROUTE_CACHE_PREFIX = "route:"   # cache keys under this prefix persist to disk
 _started_at = time.time()
 
 # Consecutive OpenSky 429s; reset on the next successful upstream fetch.
@@ -134,8 +135,16 @@ def cache_get(key, max_age_sec):
 
 def cache_set(key, data, age_override=None):
     """Cache data. age_override pins the TTL regardless of what cache_get requests."""
+    entry = {"data": data, "time": time.time(), "age_override": age_override}
     with _cache_lock:
-        _cache[key] = {"data": data, "time": time.time(), "age_override": age_override}
+        _cache[key] = entry
+    # Route lookups are the only expensive entries — each one can cost a
+    # billable FlightAware call — so they're mirrored to SQLite and restored at
+    # startup (see _route_cache_load). Everything else (planes/weather/sky) is
+    # free to re-fetch and short-lived enough that persisting it is pointless.
+    # Deliberately outside _cache_lock: disk I/O must not block cache readers.
+    if key.startswith(ROUTE_CACHE_PREFIX):
+        _route_cache_persist(key, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +218,16 @@ def _db_init():
                 last_updated INTEGER
             )
         """)
+        # Persistent route cache — survives proxy restarts so a restart no
+        # longer discards routes we already paid FlightAware to resolve.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS route_cache (
+                key          TEXT PRIMARY KEY,
+                data         BLOB NOT NULL,
+                time         REAL NOT NULL,
+                age_override REAL
+            )
+        """)
         con.execute("CREATE INDEX IF NOT EXISTS ships_ts  ON ships(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS planes_ts ON planes(ts)")
         # planes.loc names which display's bounding box saw the aircraft, so
@@ -217,6 +236,48 @@ def _db_init():
         # than requiring a rebuild; PRAGMA check keeps it idempotent.
         if "loc" not in {r[1] for r in con.execute("PRAGMA table_info(planes)")}:
             con.execute("ALTER TABLE planes ADD COLUMN loc TEXT")
+
+
+def _route_cache_persist(key, entry):
+    """Mirror one route cache entry to SQLite. Best-effort — a failure to
+    persist must never break the request that produced the entry."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_PATH) as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO route_cache (key,data,time,age_override) "
+                    "VALUES (?,?,?,?)",
+                    (key, entry["data"], entry["time"], entry["age_override"])
+                )
+    except Exception as e:
+        print("route_cache persist failed:", e)
+
+
+def _route_cache_load():
+    """Restore still-fresh route entries into _cache at startup and drop the
+    expired rows. Original timestamps are preserved, so entries keep expiring
+    on their pre-restart schedule — a restart resumes the cache rather than
+    silently granting every entry a fresh TTL. A NULL age_override means the
+    entry was stored by the default-TTL path, so it expires at TTL_HIT."""
+    now = time.time()
+    loaded = 0
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_PATH) as con:
+                con.execute(
+                    "DELETE FROM route_cache "
+                    "WHERE ? - time >= COALESCE(age_override, ?)",
+                    (now, ROUTE_CACHE_TTL_HIT)
+                )
+                cur = con.execute(
+                    "SELECT key,data,time,age_override FROM route_cache")
+                for key, data, ts, age in cur:
+                    _cache[key] = {"data": bytes(data), "time": ts,
+                                   "age_override": age}
+                    loaded += 1
+    except Exception as e:
+        print("route_cache load failed:", e)
+    print("Route cache: {} entries restored".format(loaded))
 
 # Deduplicate: don't log the same vessel again within this window
 _SHIP_LOG_INTERVAL  = 300   # 5 minutes
@@ -2359,6 +2420,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     _db_init()
     _vessel_cache_load()
+    _route_cache_load()
     print(f"Matrix Portal Proxy — port {PORT}")
     print(f"Config: {CONFIG_FILE}")
     print(f"Routes: {', '.join(ROUTES.keys())}")
